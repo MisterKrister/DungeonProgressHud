@@ -1,0 +1,15 @@
+{
+  "required": true,
+  "package": "dev.krister.dungeonprogresshud.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": [
+    "ChatComponentMixin",
+    "DevonianMixin",
+    "GuiMixin",
+    "MultiPlayerGameModeMixin",
+    "ContainerScreenMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

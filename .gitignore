@@ -1,0 +1,17 @@
+.gradle/
+.kotlin/
+build/
+run/
+out/
+
+*.log
+*.tmp
+
+# Local mod runtime/config state
+config/
+runs.json
+debug.log
+
+# IDE metadata
+.idea/
+*.iml

@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "id": "dungeonprogresshud",
+  "version": "${version}",
+  "name": "DungeonProgressHud",
+  "description": "Catacombs progress and runs-left HUD for SkyBlock.",
+  "authors": ["krister"],
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      {
+        "value": "dev.krister.dungeonprogresshud.DungeonProgressHudAddon",
+        "adapter": "kotlin"
+      }
+    ]
+  },
+  "mixins": [
+    "dungeonprogresshud.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.18.4",
+    "minecraft": "~1.21.10",
+    "java": ">=21",
+    "fabric-api": "*",
+    "fabric-language-kotlin": "*",
+    "devonian": ">=1.15.8-1.21.10"
+  }
+}
