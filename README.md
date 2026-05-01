@@ -30,7 +30,6 @@ reward chest profit tracking.
 /dph reset
 /dph fake
 /dph profit toggle
-/dph apikey <key>
 ```
 
 `/dph profit toggle` switches the chest profit HUD between session and total

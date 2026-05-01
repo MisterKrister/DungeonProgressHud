@@ -12,9 +12,7 @@ import com.github.synnerz.devonian.hud.texthud.TextHudFeature
 import com.github.synnerz.devonian.utils.StringUtils
 import com.google.gson.GsonBuilder
 import com.google.gson.JsonParser
-import com.mojang.brigadier.arguments.StringArgumentType
 import net.fabricmc.api.ClientModInitializer
-import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager.argument
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager.literal
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback
 import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper
@@ -131,12 +129,6 @@ object DungeonProgressHudAddon : ClientModInitializer {
                         withFeature { it.fakeOpenCurrentScreen() }
                         1
                     })
-                    .then(literal("apikey").then(argument("key", StringArgumentType.greedyString()).executes {
-                        withFeature { feature ->
-                            feature.setApiKey(StringArgumentType.getString(it, "key"))
-                        }
-                        1
-                    }))
             )
         }
     }
@@ -342,13 +334,6 @@ class DungeonProgressHudFeature : TextHudFeature(
         saveState()
         log("Observed run samples reset")
         send("Observed runs reset.")
-    }
-
-    fun setApiKey(key: String) {
-        apiKey.set(key.trim())
-        log("API key updated length=${key.trim().length}")
-        refresh(true)
-        send("API key saved.")
     }
 
     fun setProfitMode(mode: String) {
