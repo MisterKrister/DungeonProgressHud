@@ -8,11 +8,15 @@ import com.github.synnerz.devonian.api.events.GuiKeyDownEvent
 import com.github.synnerz.devonian.api.events.ChatEvent
 import com.github.synnerz.devonian.api.events.TickEvent
 import com.github.synnerz.devonian.config.Categories
+import com.github.synnerz.devonian.config.Config
+import com.github.synnerz.devonian.config.ConfigData
 import com.github.synnerz.devonian.hud.texthud.TextHudFeature
 import com.github.synnerz.devonian.utils.StringUtils
 import com.google.gson.GsonBuilder
 import com.google.gson.JsonParser
+import com.mojang.brigadier.arguments.StringArgumentType
 import net.fabricmc.api.ClientModInitializer
+import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager.argument
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager.literal
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback
 import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper
@@ -22,6 +26,7 @@ import net.minecraft.client.Minecraft
 import net.minecraft.client.gui.GuiGraphics
 import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen
 import net.minecraft.client.input.KeyEvent
+import net.minecraft.network.chat.MessageSignature
 import net.minecraft.network.chat.Component
 import net.minecraft.resources.ResourceLocation
 import net.minecraft.world.inventory.ClickType
@@ -36,9 +41,13 @@ import java.net.HttpURLConnection
 import java.net.URI
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
 import java.time.LocalDateTime
+import java.time.LocalTime
+import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
+import java.util.zip.GZIPInputStream
 import kotlin.concurrent.thread
 import kotlin.math.ceil
 import kotlin.math.roundToInt
@@ -62,7 +71,9 @@ object DungeonProgressHudAddon : ClientModInitializer {
         if (registered) return
         debug("Registering DungeonProgressHud feature with Devonian")
         registerCommands()
-        val created = DungeonProgressHudFeature()
+        val category = Categories.GLOBAL
+        val subcategory = ensureDevonianSubcategory(category, "DPH") ?: "Mod"
+        val created = DungeonProgressHudFeature(category, subcategory)
         feature = created
         Devonian.addFeatureInstance(created)
         registered = true
@@ -119,9 +130,41 @@ object DungeonProgressHudAddon : ClientModInitializer {
                         withFeature { it.resetSamples() }
                         1
                     })
+                    .then(literal("session").executes {
+                        withFeature { it.sendRunSummary("session") }
+                        1
+                    })
+                    .then(literal("daily").executes {
+                        withFeature { it.sendRunSummary("daily") }
+                        1
+                    })
+                    .then(literal("weekly").executes {
+                        withFeature { it.sendRunSummary("weekly") }
+                        1
+                    })
+                    .then(literal("importlogs").executes {
+                        withFeature { it.importRecentLogs(true) }
+                        1
+                    })
                     .then(literal("profit")
+                        .executes {
+                            withFeature { it.sendProfitStatus() }
+                            1
+                        }
                         .then(literal("toggle").executes {
                             withFeature { it.toggleProfitMode() }
+                            1
+                        })
+                        .then(literal("session").executes {
+                            withFeature { it.setProfitMode("Session") }
+                            1
+                        })
+                        .then(literal("total").executes {
+                            withFeature { it.setProfitMode("Total") }
+                            1
+                        })
+                        .then(argument("window", StringArgumentType.word()).executes { context ->
+                            withFeature { it.setProfitWindow(StringArgumentType.getString(context, "window")) }
                             1
                         })
                     )
@@ -138,6 +181,28 @@ object DungeonProgressHudAddon : ClientModInitializer {
         action(current)
     }
 
+    @Suppress("UNCHECKED_CAST")
+    private fun ensureDevonianSubcategory(category: Categories, subcategory: String): String? {
+        return runCatching {
+            val categoryField = category.javaClass.getDeclaredField("subcategories")
+            categoryField.isAccessible = true
+            val existingSubcategories = categoryField.get(category) as List<String>
+            if (subcategory !in existingSubcategories) {
+                categoryField.set(category, existingSubcategories + subcategory)
+            }
+
+            val configClass = Class.forName("com.github.synnerz.devonian.config.Config")
+            val categoriesField = configClass.getDeclaredField("categories")
+            categoriesField.isAccessible = true
+            val categories = categoriesField.get(null) as MutableMap<Categories, MutableMap<String, MutableList<ConfigData<*>>>>
+            categories.getValue(category).getOrPut(subcategory) { mutableListOf() }
+            subcategory
+        }.getOrElse {
+            debug("Failed to register Devonian subcategory $subcategory, falling back to Mod: ${it::class.simpleName}: ${it.message}")
+            null
+        }
+    }
+
     fun debug(message: String) {
         val line = "[${LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))}] $message"
         logger.info(line)
@@ -148,52 +213,67 @@ object DungeonProgressHudAddon : ClientModInitializer {
     }
 }
 
-class DungeonProgressHudFeature : TextHudFeature(
+class DungeonProgressHudFeature(
+    configCategory: Categories,
+    private val configTab: String,
+) : TextHudFeature(
     "dungeonProgressHud",
     "Shows Catacombs XP progress and estimated runs left.",
-    Categories.DUNGEONS,
+    configCategory,
     "catacombs",
     displayName = "Dungeon Progress HUD",
-    subcategory = "HUD",
+    subcategory = configTab,
 ) {
+    private companion object {
+        private const val FEATURE_CONFIG = "dungeonProgressHud"
+        private const val DAY_MILLIS = 86_400_000L
+    }
+
     private val PREFIX = "&6[&bDPH&6]&r "
     private val gson = GsonBuilder().setPrettyPrinting().create()
     private val configDir = FabricLoader.getInstance().configDir.resolve("DungeonProgressHud").toFile()
     private val stateFile = File(configDir, "runs.json")
+    private val summarySignatures = (0 until 3).map { signature("dph-summary-$it") }
+    private val gameDir = FabricLoader.getInstance().gameDir.toFile()
     private val mc: Minecraft get() = Minecraft.getInstance()
 
-    private val renderHud = addSwitch("renderHud", true, "Draw the HUD during normal gameplay.", "Render HUD")
-    private val showEverywhere = addSwitch("showEverywhere", true, "Render everywhere instead of only Dungeon Hub/Catacombs.", "Show Everywhere")
-    private val apiKey = addTextInput("apiKey", "", "Hypixel API key.", "Hypixel API Key")
-    private val targetLevel = addTextInput("targetLevel", "50", "Target Catacombs level.", "Target Level")
-    private val floorLabel = addTextInput("floorLabel", "M7", "Floor label used for observed samples.", "Floor Label")
+    private val displayDivider = addDivider("10", "DISPLAY")
+    private val renderHud = addSwitch("11_renderHud", true, "Draw the HUD during normal gameplay.", "Render HUD", emptySet(), false, configTab)
+    private val showEverywhere = addSwitch("12_showEverywhere", true, "Render everywhere instead of only Dungeon Hub/Catacombs.", "Show Everywhere", emptySet(), false, configTab)
+    private val targetLevel = addTextInput("13_targetLevel", "50", "Target Catacombs level.", "Target Level", emptySet(), configTab)
+    private val floorLabel = addTextInput("14_floorLabel", "M7", "Floor label used for observed samples.", "Floor Label", emptySet(), configTab)
+    private val showCurrentLevel = addSwitch("15_showCurrentLevel", true, "Show current Catacombs level.", "Current Level", emptySet(), false, configTab)
+    private val showCurrentXp = addSwitch("16_showCurrentXp", true, "Show current Catacombs XP.", "Current XP", emptySet(), false, configTab)
+    private val showLevelProgress = addSwitch("17_showLevelProgress", true, "Show percentage progress toward the next Catacombs level.", "Level Progress", emptySet(), false, configTab)
+    private val showTarget = addSwitch("18_showTarget", true, "Show target Catacombs level.", "Target", emptySet(), false, configTab)
+    private val showRemaining = addSwitch("19_showRemaining", true, "Show XP remaining.", "XP Remaining", emptySet(), false, configTab)
+    private val showFloor = addSwitch("1a_showFloor", true, "Show floor label.", "Floor", emptySet(), false, configTab)
+    private val showXpPerRun = addSwitch("1b_showXpPerRun", true, "Show effective XP/run.", "XP/Run", emptySet(), false, configTab)
+    private val showRunsLeft = addSwitch("1c_showRunsLeft", true, "Show estimated runs left.", "Runs Left", emptySet(), false, configTab)
+    private val showProfile = addSwitch("1d_showProfile", false, "Show selected SkyBlock profile.", "Profile", emptySet(), false, configTab)
+    private val showLastRun = addSwitch("1e_showLastRun", true, "Show last observed normalized XP delta.", "Last Run XP", emptySet(), false, configTab)
+    private val showObservedCount = addSwitch("1f_showObservedCount", false, "Show observed sample count.", "Observed Count", emptySet(), false, configTab)
 
-    private val xpMode = addSelection("xpMode", 0, listOf("Observed Average", "Hardcoded"), "XP/run source.", "XP/Run Mode")
-    private val hardcodedXpPerRun = addTextInput("hardcodedXpPerRun", "450000", "Fallback XP per run.", "Hardcoded XP/Run")
-    private val scaleDailyRunXp = addSwitch("scaleDailyRunXp", true, "Divide high raw run XP by the daily multiplier.", "Scale Daily Run XP")
-    private val dailyThreshold = addTextInput("dailyThreshold", "600000", "Only scale raw run XP above this value.", "Daily XP Threshold")
-    private val dailyMultiplier = addTextInput("dailyMultiplier", "1.4", "Raw run XP is divided by this when daily scaling applies.", "Daily XP Multiplier")
+    private val xpDivider = addDivider("20", "XP")
+    private val xpMode = addSelection("21_xpMode", 0, listOf("Observed Average", "Hardcoded"), "XP/run source.", "XP/Run Mode", emptySet(), configTab)
+    private val hardcodedXpPerRun = addTextInput("22_hardcodedXpPerRun", "450000", "Fallback XP per run.", "Hardcoded XP/Run", emptySet(), configTab)
+    private val scaleDailyRunXp = addSwitch("23_scaleDailyRunXp", true, "Divide high raw run XP by the daily multiplier.", "Scale Daily Run XP", emptySet(), false, configTab)
+    private val dailyThreshold = addTextInput("24_dailyThreshold", "600000", "Only scale raw run XP above this value.", "Daily XP Threshold", emptySet(), configTab)
+    private val dailyMultiplier = addTextInput("25_dailyMultiplier", "1.4", "Raw run XP is divided by this when daily scaling applies.", "Daily XP Multiplier", emptySet(), configTab)
 
-    private val showCurrentLevel = addSwitch("showCurrentLevel", true, "Show current Catacombs level.", "Current Level")
-    private val showCurrentXp = addSwitch("showCurrentXp", true, "Show current Catacombs XP.", "Current XP")
-    private val showTarget = addSwitch("showTarget", true, "Show target Catacombs level.", "Target")
-    private val showRemaining = addSwitch("showRemaining", true, "Show XP remaining.", "XP Remaining")
-    private val showFloor = addSwitch("showFloor", true, "Show floor label.", "Floor")
-    private val showXpPerRun = addSwitch("showXpPerRun", true, "Show effective XP/run.", "XP/Run")
-    private val showRunsLeft = addSwitch("showRunsLeft", true, "Show estimated runs left.", "Runs Left")
-    private val showProfile = addSwitch("showProfile", false, "Show selected SkyBlock profile.", "Profile")
-    private val showLastRun = addSwitch("showLastRun", true, "Show last observed normalized XP delta.", "Last Run XP")
-    private val showObservedCount = addSwitch("showObservedCount", false, "Show observed sample count.", "Observed Count")
+    private val profitDivider = addDivider("30", "PROFIT")
+    private val trackChestProfit = addSwitch("31_trackChestProfit", true, "Track profit when claiming dungeon reward chests.", "Track Chest Profit", emptySet(), false, configTab)
+    private val showChestProfit = addSwitch("32_showChestProfit", true, "Show tracked dungeon chest profit.", "Chest Profit", emptySet(), false, configTab)
+    private val chestProfitMode = addSelection("33_chestProfitMode", 0, listOf("Session", "Total"), "Choose whether chest profit lines use this session or all tracked chests.", "Chest Profit Mode", emptySet(), configTab)
+    private val showChestCount = addSwitch("34_showChestCount", true, "Show tracked dungeon reward chest count.", "Chest Count", emptySet(), false, configTab)
+    private val showLastChest = addSwitch("35_showLastChest", true, "Show the last opened dungeon reward chest and its profit.", "Last Chest Opened", emptySet(), false, configTab)
+    private val includeEssenceProfit = addSwitch("36_includeEssenceProfit", true, "Include essence value in chest profit.", "Include Essence", emptySet(), false, configTab)
+    private val includeDungeonKeyCost = addSwitch("37_includeDungeonKeyCost", false, "Subtract Dungeon Chest Key value when a reward chest requires one.", "Count Dungeon Key Cost", emptySet(), false, configTab)
 
-    private val trackChestProfit = addSwitch("trackChestProfit", true, "Track profit when claiming dungeon reward chests.", "Track Chest Profit")
-    private val showChestProfit = addSwitch("showChestProfit", true, "Show tracked dungeon chest profit.", "Chest Profit")
-    private val chestProfitMode = addSelection("chestProfitMode", 0, listOf("Session", "Total"), "Choose whether chest profit lines use this session or all tracked chests.", "Chest Profit Mode")
-    private val showChestCount = addSwitch("showChestCount", true, "Show tracked dungeon reward chest count.", "Chest Count")
-    private val includeEssenceProfit = addSwitch("includeEssenceProfit", true, "Include essence value in chest profit.", "Include Essence")
-    private val includeDungeonKeyCost = addSwitch("includeDungeonKeyCost", false, "Subtract Dungeon Chest Key value when a reward chest requires one.", "Count Dungeon Key Cost")
-
-    private val refreshButton = addButton({ refresh(true) }, "Refresh", "Force API refresh.", "Refresh Now")
-    private val resetButton = addButton({ resetSamples() }, "Reset", "Clear observed XP samples.", "Reset Observed Runs")
+    private val actionsDivider = addDivider("40", "ACTIONS")
+    private val apiKey = addTextInput("41_apiKey", "", "Hypixel API key.", "Hypixel API Key", emptySet(), configTab)
+    private val refreshButton = addSortedButton("42", { refresh(true) }, "Refresh", "Force API refresh.", "Refresh Now")
+    private val resetButton = addSortedButton("43", { resetSamples() }, "Reset", "Clear observed XP samples.", "Reset Observed Runs")
     private val keybindCategory by lazy {
         KeyMapping.Category.register(ResourceLocation.fromNamespaceAndPath("dungeonprogresshud", "keybinds"))
     }
@@ -220,8 +300,43 @@ class DungeonProgressHudFeature : TextHudFeature(
     private var lastDungeonCompletionChatAt = 0L
     private var lastDungeonCompletionRawXp = 0L
     private var lastDungeonCompletionNormalizedXp = 0L
+    private var pendingCompletionAt = 0L
+    private var pendingCompletionFloor = ""
+    private var pendingCompletionTimeSeconds = 0
+    private var pendingCompletionScore = 0
+    private var pendingCompletionGrade = ""
     private var sessionChestProfit = 0L
     private var sessionChestsOpened = 0
+    private val sessionStartedAt = System.currentTimeMillis()
+
+    init {
+        Config.onAfterLoad {
+            migrateLegacyApiKey()
+        }
+    }
+
+    private fun addDivider(sortKey: String, label: String): ConfigData.Switch =
+        addSwitch("${sortKey}_divider$label", false, "", "__________ $label __________", emptySet(), false, configTab)
+
+    private fun addSortedButton(
+        sortKey: String,
+        action: () -> Unit,
+        buttonTitle: String,
+        description: String,
+        displayName: String,
+    ): ConfigData.Button {
+        val sortParent = ConfigData.FeatureSwitch("$FEATURE_CONFIG.$sortKey", true, "", "", configTab, emptySet(), true)
+        val button = ConfigData.Button(action, buttonTitle, sortParent, description, displayName, configTab, emptySet(), false)
+        Config.registerCategory(button, category, configTab)
+        configSwitch.subconfigs.add(button)
+        return button
+    }
+
+    private fun migrateLegacyApiKey() {
+        if (apiKey.get().isNotBlank()) return
+        val legacy = runCatching { Config.getConfig("$FEATURE_CONFIG.apiKey", "") }.getOrDefault("") ?: ""
+        if (legacy.isNotBlank()) apiKey.set(legacy)
+    }
 
     override fun getEditText(): List<String> = listOf(
         "&bCata Level: &fC49",
@@ -255,6 +370,7 @@ class DungeonProgressHudFeature : TextHudFeature(
         runtimeStarted = true
         log("Feature runtime started by $reason")
         loadState()
+        importRecentLogs(false)
     }
 
     private fun clientTick() {
@@ -338,13 +454,48 @@ class DungeonProgressHudFeature : TextHudFeature(
 
     fun setProfitMode(mode: String) {
         val normalized = if (mode.equals("Total", true)) "Total" else "Session"
+        state.chestProfitWindowMillis = 0L
+        saveState()
         chestProfitMode.set(if (normalized == "Total") 1 else 0)
         log("Chest profit mode set to $normalized")
-        send("$normalized view.")
+        send("Chest profit view: ${normalized.lowercase(Locale.ROOT)}.")
     }
 
     fun toggleProfitMode() {
+        if (state.chestProfitWindowMillis > 0L) {
+            setProfitMode(chestProfitMode.getCurrent())
+            return
+        }
         setProfitMode(if (chestProfitMode.getCurrent() == "Total") "Session" else "Total")
+    }
+
+    fun setProfitWindow(input: String) {
+        val parsedDays = parseProfitWindowDays(input)
+        if (parsedDays == null) {
+            send("Use /dph profit session, total, 7d, 14d, or 2w.")
+            return
+        }
+
+        state.chestProfitWindowMillis = parsedDays * DAY_MILLIS
+        saveState()
+        log("Chest profit window set to ${formatProfitWindow(state.chestProfitWindowMillis)}")
+        send("Chest profit view: ${formatProfitWindow(state.chestProfitWindowMillis)}.")
+    }
+
+    fun sendProfitStatus() {
+        val stats = chestProfitStats()
+        send("Chest profit view: ${stats.label}, ${stats.profit.formatCoins()} across ${stats.chests} chests.")
+    }
+
+    fun sendRunSummary(scope: String) {
+        val summary = runSummary(scope)
+        sendReplacingSummary(
+            listOf(
+                "${summary.label}: ${summary.runs} runs, ${summary.xp.format()} XP, ${summary.profit.formatCoins()} profit.",
+                "Profit/run ${summary.profitPerRun.formatCoins()}, chest ${summary.profitPerChest.formatCoins()}, hour ${summary.profitPerHour.formatCoins()}.",
+                "Avg time ${formatDuration(summary.averageRunTimeSeconds)}, XP/hour ${summary.xpPerHour.format()}.",
+            )
+        )
     }
 
     fun sendStatus() {
@@ -471,6 +622,7 @@ class DungeonProgressHudFeature : TextHudFeature(
 
         return buildList {
             if (showCurrentLevel.get()) add("&bCata Level: &fC$currentLevel")
+            if (showLevelProgress.get()) add("&bNext Level: &f${levelProgressPercent(profile.catacombsExperience)}%")
             if (showCurrentXp.get()) add("&bCata XP: &f${profile.catacombsExperience.format()}")
             if (showTarget.get()) add("&bTarget: &fC${targetLevelValue()}")
             if (showRemaining.get()) add("&bRemaining: &f${remaining.format()}")
@@ -484,7 +636,7 @@ class DungeonProgressHudFeature : TextHudFeature(
                 val stats = chestProfitStats()
                 add("&bProfit: &a${stats.profit.formatCoins()} &7(${stats.label})")
                 if (showChestCount.get()) add("&bChests Opened: &f${stats.chests}")
-                add("&bLast Chest: &f${state.lastChestName.ifBlank { "N/A" }} &a${state.lastChestProfit.formatCoins()}")
+                if (showLastChest.get()) add("&bLast Chest: &f${state.lastChestName.ifBlank { "N/A" }} &a${state.lastChestProfit.formatCoins()}")
                 add("&bAvg Chest: &a${stats.average.formatCoins()}")
             }
         }
@@ -901,13 +1053,31 @@ class DungeonProgressHudFeature : TextHudFeature(
     }
 
     fun parseDungeonCompletionMessage(message: String) {
-        val cleanMessage = message.cleanMc()
-        if (!cleanMessage.contains("Cata EXP") || !cleanMessage.contains("Defeated")) return
-        val normalizedMessage = cleanMessage.replace(Regex("\\s*\\(x\\d+\\)$"), "")
-        val now = System.currentTimeMillis()
-        if (normalizedMessage == lastDungeonCompletionChat && now - lastDungeonCompletionChatAt < 10_000) {
-            log("Duplicate dungeon completion chat ignored")
-            return
+        message.cleanMc().lines().forEach { parseDungeonCompletionLine(it) }
+    }
+
+    private fun parseDungeonCompletionLine(message: String, timestamp: Long = System.currentTimeMillis()): Boolean {
+        val normalizedMessage = message.trim().replace(Regex("\\s*\\(x\\d+\\)$"), "")
+        if (normalizedMessage.isBlank()) return false
+        if (timestamp - pendingCompletionAt > 30_000) {
+            pendingCompletionFloor = ""
+            pendingCompletionTimeSeconds = 0
+            pendingCompletionScore = 0
+            pendingCompletionGrade = ""
+        }
+
+        parseCompletionFloor(normalizedMessage)?.let {
+            pendingCompletionAt = timestamp
+            pendingCompletionFloor = it
+        }
+        if (normalizedMessage.contains("Defeated", true)) {
+            pendingCompletionAt = timestamp
+            pendingCompletionTimeSeconds = parseCompletionTimeSeconds(normalizedMessage)
+        }
+        parseCompletionScore(normalizedMessage)?.let {
+            pendingCompletionAt = timestamp
+            pendingCompletionScore = it.first
+            pendingCompletionGrade = it.second
         }
 
         val cataXp = dungeonCompletionCataXpRegex.find(normalizedMessage)
@@ -916,19 +1086,140 @@ class DungeonProgressHudFeature : TextHudFeature(
             ?.replace(",", "")
             ?.toLongOrNull()
             ?: run {
-                log("Dungeon completion chat matched but Cata EXP parse failed: $normalizedMessage")
-                return
+                return false
             }
 
-        lastDungeonCompletionChat = normalizedMessage
-        lastDungeonCompletionChatAt = now
+        val floor = pendingCompletionFloor.ifBlank { floorValue() }
+        val dedupeKey = "$floor:$cataXp:$pendingCompletionTimeSeconds:$pendingCompletionScore"
+        if (dedupeKey == lastDungeonCompletionChat && timestamp - lastDungeonCompletionChatAt < 10_000) {
+            log("Duplicate dungeon completion chat ignored")
+            return false
+        }
+        if (hasRunRecord(floor, cataXp, pendingCompletionTimeSeconds, pendingCompletionScore, timestamp)) {
+            log("Existing dungeon completion record ignored")
+            return false
+        }
+
+        lastDungeonCompletionChat = dedupeKey
+        lastDungeonCompletionChatAt = timestamp
         lastDungeonCompletionRawXp = cataXp
         lastDungeonCompletionNormalizedXp = normalizeRunXp(cataXp)
-        state.samples.add(RunSample(now, floorValue(), cataXp, lastDungeonCompletionNormalizedXp))
+        state.samples.add(RunSample(timestamp, floor, cataXp, lastDungeonCompletionNormalizedXp))
         while (state.samples.size > 100) state.samples.removeAt(0)
+        state.runs.add(
+            DungeonRunRecord(
+                timestamp = timestamp,
+                floorLabel = floor,
+                runTimeSeconds = pendingCompletionTimeSeconds,
+                score = pendingCompletionScore,
+                grade = pendingCompletionGrade,
+                rawCataXp = cataXp,
+                normalizedCataXp = lastDungeonCompletionNormalizedXp,
+            )
+        )
+        while (state.runs.size > 500) state.runs.removeAt(0)
         saveState()
-        log("Recorded dungeon completion chat XP raw=$cataXp normalized=$lastDungeonCompletionNormalizedXp floor=${floorValue()}")
+        log("Recorded dungeon completion chat XP raw=$cataXp normalized=$lastDungeonCompletionNormalizedXp floor=$floor time=$pendingCompletionTimeSeconds score=$pendingCompletionScore")
+        return true
     }
+
+    private fun hasRunRecord(floor: String, rawXp: Long, runTimeSeconds: Int, score: Int, timestamp: Long): Boolean =
+        state.runs.any {
+            it.floorLabel.equals(floor, true) &&
+                it.rawCataXp == rawXp &&
+                it.runTimeSeconds == runTimeSeconds &&
+                it.score == score &&
+                kotlin.math.abs(it.timestamp - timestamp) < 20 * 60 * 1000
+        }
+
+    private fun parseCompletionFloor(message: String): String? =
+        dungeonCompletionFloorRegex.find(message)?.groupValues?.getOrNull(2)?.uppercase(Locale.ROOT)
+
+    private fun parseCompletionTimeSeconds(message: String): Int {
+        val match = dungeonCompletionTimeRegex.find(message) ?: return 0
+        val minutes = match.groupValues.getOrNull(1)?.toIntOrNull() ?: return 0
+        val seconds = match.groupValues.getOrNull(2)?.toIntOrNull() ?: return 0
+        return minutes * 60 + seconds
+    }
+
+    private fun parseCompletionScore(message: String): Pair<Int, String>? {
+        val match = dungeonCompletionScoreRegex.find(message) ?: return null
+        val score = match.groupValues.getOrNull(1)?.toIntOrNull() ?: return null
+        val grade = match.groupValues.getOrNull(2).orEmpty()
+        return score to grade
+    }
+
+    fun importRecentLogs(manual: Boolean) {
+        val logsDir = File(gameDir, "logs")
+        if (!logsDir.isDirectory) {
+            if (manual) send("No Minecraft logs folder found.")
+            return
+        }
+        val cutoff = System.currentTimeMillis() - 8L * DAY_MILLIS
+        val files = logsDir.listFiles()
+            ?.filter { it.isFile && it.lastModified() >= cutoff && (it.extension == "log" || it.name.endsWith(".log.gz")) }
+            ?.sortedWith(compareBy<File> { it.lastModified() }.thenBy { it.name })
+            ?: emptyList()
+        if (!manual && files.none { it.lastModified() > state.lastLogImportAt }) return
+
+        thread(name = "DPH Log Import", isDaemon = true) {
+            var imported = 0
+            val previousPending = PendingCompletionState(pendingCompletionAt, pendingCompletionFloor, pendingCompletionTimeSeconds, pendingCompletionScore, pendingCompletionGrade)
+            pendingCompletionAt = 0L
+            pendingCompletionFloor = ""
+            pendingCompletionTimeSeconds = 0
+            pendingCompletionScore = 0
+            pendingCompletionGrade = ""
+
+            for (file in files) {
+                runCatching {
+                    file.forEachLogLine { line ->
+                        val chat = extractLogChat(line)
+                        if (chat != null) {
+                            val timestamp = parseLogTimestamp(line, file)
+                            if (parseDungeonCompletionLine(chat, timestamp)) imported++
+                        }
+                    }
+                }.onFailure {
+                    log("Log import failed file=${file.name}: ${it.javaClass.simpleName}: ${it.message}")
+                }
+            }
+
+            pendingCompletionAt = previousPending.timestamp
+            pendingCompletionFloor = previousPending.floor
+            pendingCompletionTimeSeconds = previousPending.runTimeSeconds
+            pendingCompletionScore = previousPending.score
+            pendingCompletionGrade = previousPending.grade
+            state.lastLogImportAt = System.currentTimeMillis()
+            saveState()
+            log("Log import complete files=${files.size} importedRuns=$imported")
+            if (manual) mc.execute { send("Imported $imported dungeon runs from recent logs.") }
+        }
+    }
+
+    private inline fun File.forEachLogLine(action: (String) -> Unit) {
+        val input = if (name.endsWith(".gz")) GZIPInputStream(inputStream()) else inputStream()
+        input.bufferedReader(Charsets.UTF_8).useLines { lines ->
+            lines.forEach(action)
+        }
+    }
+
+    private fun extractLogChat(line: String): String? {
+        val marker = "[CHAT]"
+        val index = line.indexOf(marker)
+        if (index < 0) return null
+        return line.substring(index + marker.length).trim()
+    }
+
+    private fun parseLogTimestamp(line: String, file: File): Long {
+        val time = Regex("^\\[(\\d{2}):(\\d{2}):(\\d{2})]").find(line)?.let {
+            LocalTime.of(it.groupValues[1].toInt(), it.groupValues[2].toInt(), it.groupValues[3].toInt())
+        } ?: return file.lastModified()
+        return file.lastModifiedDate().atTime(time).atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
+    }
+
+    private fun File.lastModifiedDate() =
+        java.time.Instant.ofEpochMilli(lastModified()).atZone(ZoneId.systemDefault()).toLocalDate()
 
     private fun isRecentChatRunSample(raw: Long, normalized: Long): Boolean {
         val now = System.currentTimeMillis()
@@ -955,6 +1246,19 @@ class DungeonProgressHudFeature : TextHudFeature(
     }
 
     private fun chestProfitStats(): ChestProfitStats {
+        if (state.chestProfitWindowMillis > 0L) {
+            val cutoff = System.currentTimeMillis() - state.chestProfitWindowMillis
+            val samples = state.chestProfits.filter { it.timestamp >= cutoff }
+            val profit = samples.sumOf { it.profit }
+            val chests = samples.size
+            val average = if (chests > 0) {
+                (profit.toDouble() / chests.toDouble()).roundToLong()
+            } else {
+                0L
+            }
+            return ChestProfitStats(formatProfitWindow(state.chestProfitWindowMillis), profit, chests, average)
+        }
+
         if (chestProfitMode.getCurrent() == "Total") {
             val average = if (state.totalChestsOpened > 0) {
                 (state.totalChestProfit.toDouble() / state.totalChestsOpened.toDouble()).roundToLong()
@@ -970,6 +1274,65 @@ class DungeonProgressHudFeature : TextHudFeature(
             0L
         }
         return ChestProfitStats("session", sessionChestProfit, sessionChestsOpened, average)
+    }
+
+    private fun runSummary(scope: String): RunSummary {
+        val now = System.currentTimeMillis()
+        val cutoff = when (scope.lowercase(Locale.ROOT)) {
+            "session" -> sessionStartedAt
+            "weekly" -> now - 7L * DAY_MILLIS
+            else -> now - DAY_MILLIS
+        }
+        val label = when (scope.lowercase(Locale.ROOT)) {
+            "session" -> "Session"
+            "weekly" -> "Last 7 days"
+            else -> "Last 24 hours"
+        }
+        val runs = state.runs.filter { it.timestamp >= cutoff }
+        val chests = state.chestProfits.filter { it.timestamp >= cutoff }
+        val runCount = runs.size
+        val chestCount = chests.size
+        val xp = runs.sumOf { it.normalizedCataXp }
+        val profit = chests.sumOf { it.profit }
+        val runSeconds = runs.sumOf { it.runTimeSeconds.coerceAtLeast(0) }
+        val elapsedSeconds = when {
+            runSeconds > 0 -> runSeconds
+            scope.equals("session", true) -> ((now - sessionStartedAt) / 1000L).coerceAtLeast(1L).toInt()
+            else -> ((now - cutoff) / 1000L).coerceAtLeast(1L).toInt()
+        }
+        val hours = elapsedSeconds.toDouble() / 3600.0
+        return RunSummary(
+            label = label,
+            runs = runCount,
+            xp = xp,
+            profit = profit,
+            chests = chestCount,
+            averageRunTimeSeconds = runs.map { it.runTimeSeconds }.filter { it > 0 }.averageOrZero().roundToInt(),
+            profitPerRun = if (runCount > 0) (profit.toDouble() / runCount).roundToLong() else 0L,
+            profitPerChest = if (chestCount > 0) (profit.toDouble() / chestCount).roundToLong() else 0L,
+            profitPerHour = if (hours > 0.0) (profit.toDouble() / hours).roundToLong() else 0L,
+            xpPerHour = if (hours > 0.0) (xp.toDouble() / hours).roundToLong() else 0L,
+        )
+    }
+
+    private fun parseProfitWindowDays(input: String): Long? {
+        val match = Regex("^(\\d+)(d|day|days|w|week|weeks)?$", RegexOption.IGNORE_CASE).matchEntire(input.trim())
+            ?: return null
+        val amount = match.groupValues[1].toLongOrNull() ?: return null
+        if (amount <= 0L) return null
+        val unit = match.groupValues.getOrNull(2)?.lowercase(Locale.ROOT).orEmpty()
+        val days = if (unit.startsWith("w")) amount * 7L else amount
+        return days.coerceAtMost(365L)
+    }
+
+    private fun formatProfitWindow(windowMillis: Long): String {
+        val days = (windowMillis / DAY_MILLIS).coerceAtLeast(1L)
+        return if (days % 7L == 0L && days >= 14L) {
+            val weeks = days / 7L
+            "last $weeks ${if (weeks == 1L) "week" else "weeks"}"
+        } else {
+            "last $days ${if (days == 1L) "day" else "days"}"
+        }
     }
 
     private fun shouldRender(): Boolean = isEnabled() && (showEverywhere.get() || isDungeonArea())
@@ -1030,6 +1393,23 @@ class DungeonProgressHudFeature : TextHudFeature(
         mc.player?.displayClientMessage(Component.literal((PREFIX + message).colorize()), false)
     }
 
+    private fun sendReplacingSummary(lines: List<String>) {
+        val chat = mc.gui.chat
+        summarySignatures.forEach { chat.deleteMessage(it) }
+        lines.take(summarySignatures.size).forEachIndexed { index, line ->
+            chat.addMessage(Component.literal((PREFIX + line).colorize()), summarySignatures[index], null)
+        }
+    }
+
+    private fun signature(seed: String): MessageSignature {
+        val digest = MessageDigest.getInstance("SHA-256").digest(seed.toByteArray(StandardCharsets.UTF_8))
+        val bytes = ByteArray(MessageSignature.BYTES)
+        for (idx in bytes.indices) {
+            bytes[idx] = digest[idx % digest.size]
+        }
+        return MessageSignature(bytes)
+    }
+
     private fun loadState() {
         state = runCatching {
             if (!stateFile.exists()) return
@@ -1057,6 +1437,15 @@ class DungeonProgressHudFeature : TextHudFeature(
 
     private fun currentCataLevel(xp: Long): Int = cumulativeCatacombsXp.indexOfLast { xp >= it }.let { (it + 1).coerceIn(0, 50) }
 
+    private fun levelProgressPercent(xp: Long): String {
+        val current = currentCataLevel(xp)
+        if (current >= 50) return "100.0"
+        val previousXp = if (current <= 0) 0L else targetXp(current)
+        val nextXp = targetXp(current + 1)
+        val progress = ((xp - previousXp).toDouble() / (nextXp - previousXp).toDouble()).coerceIn(0.0, 1.0)
+        return "%.1f".format(Locale.US, progress * 100.0)
+    }
+
     private fun floorValue(): String = floorLabel.get().ifBlank { "M7" }.uppercase(Locale.ROOT)
 
     private fun hardcodedXpPerRunValue(): Long = hardcodedXpPerRun.get().toLongOrNull()?.coerceAtLeast(1L) ?: 450_000L
@@ -1066,6 +1455,15 @@ class DungeonProgressHudFeature : TextHudFeature(
     private fun dailyMultiplierValue(): Double = dailyMultiplier.get().toDoubleOrNull()?.coerceAtLeast(1.0) ?: 1.4
 
     private fun Long.format(): String = "%,d".format(this)
+
+    private fun Iterable<Int>.averageOrZero(): Double = if (none()) 0.0 else average()
+
+    private fun formatDuration(seconds: Int): String {
+        val safe = seconds.coerceAtLeast(0)
+        val minutes = safe / 60
+        val remainder = safe % 60
+        return "%02dm %02ds".format(minutes, remainder)
+    }
 
     private fun Long.formatCoins(): String {
         val sign = if (this < 0) "-" else ""
@@ -1091,11 +1489,14 @@ class DungeonProgressHudFeature : TextHudFeature(
         var samples: MutableList<RunSample> = mutableListOf(),
         var lastCatacombsXp: Long = 0,
         var lastPlayerUuid: String = "",
+        var runs: MutableList<DungeonRunRecord> = mutableListOf(),
         var chestProfits: MutableList<ChestProfitSample> = mutableListOf(),
         var lastChestName: String = "",
         var lastChestProfit: Long = 0,
         var totalChestProfit: Long = 0,
         var totalChestsOpened: Int = 0,
+        var chestProfitWindowMillis: Long = 0,
+        var lastLogImportAt: Long = 0,
     )
 
     data class RunSample(
@@ -1103,6 +1504,16 @@ class DungeonProgressHudFeature : TextHudFeature(
         var floorLabel: String = "M7",
         var rawXpDelta: Long = 0,
         var normalizedXpDelta: Long = 0,
+    )
+
+    data class DungeonRunRecord(
+        var timestamp: Long = 0,
+        var floorLabel: String = "M7",
+        var runTimeSeconds: Int = 0,
+        var score: Int = 0,
+        var grade: String = "",
+        var rawCataXp: Long = 0,
+        var normalizedCataXp: Long = 0,
     )
 
     data class ChestProfitSample(
@@ -1146,6 +1557,27 @@ class DungeonProgressHudFeature : TextHudFeature(
         val average: Long,
     )
 
+    data class RunSummary(
+        val label: String,
+        val runs: Int,
+        val xp: Long,
+        val profit: Long,
+        val chests: Int,
+        val averageRunTimeSeconds: Int,
+        val profitPerRun: Long,
+        val profitPerChest: Long,
+        val profitPerHour: Long,
+        val xpPerHour: Long,
+    )
+
+    data class PendingCompletionState(
+        val timestamp: Long,
+        val floor: String,
+        val runTimeSeconds: Int,
+        val score: Int,
+        val grade: String,
+    )
+
     private val cumulativeCatacombsXp = listOf(
         50L, 125L, 235L, 395L, 625L, 955L, 1425L, 2095L, 3045L, 4385L,
         6275L, 8940L, 12700L, 17960L, 25340L, 35640L, 50040L, 70040L, 97640L, 135640L,
@@ -1160,6 +1592,9 @@ class DungeonProgressHudFeature : TextHudFeature(
     private val enchantedBookRegex = "^Enchanted Book \\(([\\w ]+) ([IV]+)\\)$".toRegex()
     private val essenceRegex = "^(Wither|Undead) Essence x(\\d+)$".toRegex()
     private val dungeonCompletionCataXpRegex = "\\+([\\d,]+)\\s+Cata EXP".toRegex()
+    private val dungeonCompletionFloorRegex = "(Master Mode|The Catacombs|Catacombs)\\s*-\\s*([MF]?\\d+)".toRegex(RegexOption.IGNORE_CASE)
+    private val dungeonCompletionTimeRegex = "\\bin\\s+(\\d{1,2})m\\s*(\\d{1,2})s\\b".toRegex(RegexOption.IGNORE_CASE)
+    private val dungeonCompletionScoreRegex = "Score:\\s*(\\d+)\\s*\\(([A-Z+]+)\\)".toRegex(RegexOption.IGNORE_CASE)
     private val specialIds = mapOf(
         "WITHER_SHARD" to "SHARD_WITHER",
         "THORN_SHARD" to "SHARD_THORN",

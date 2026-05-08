@@ -11,6 +11,7 @@ out/
 config/
 runs.json
 debug.log
+api-key.txt
 
 # IDE metadata
 .idea/
