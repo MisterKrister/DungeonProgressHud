@@ -54,13 +54,12 @@ GUI settings are managed through Devonian with `/devonian`.
 
 ## API Usage
 
-The mod can use a Hypixel API key to fetch the current player's selected
-SkyBlock profile and Catacombs experience. Do not commit API keys or local
-config files to the repository.
+Add your Hypixel API key in the HUD settings under `/devonian`. The mod uses it
+to read your selected SkyBlock profile and current Catacombs XP.
 
-When the HUD is visible, the mod attempts an automatic API refresh every five
-minutes. Manual refreshes are intentionally baseline-only so they do not skew
-Last Run XP or observed XP/run estimates.
+While the HUD is visible, it refreshes the API data about every five minutes.
+Using `/dph refresh` only updates the displayed API data and XP baseline; it
+does not count as a dungeon run or change Last Run XP.
 
 ## Building
 
