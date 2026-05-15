@@ -123,7 +123,7 @@ object DungeonProgressHudAddon : ClientModInitializer {
                         1
                     }
                     .then(literal("refresh").executes {
-                        withFeature { it.refresh(true) }
+                        withFeature { it.refresh(force = true, recordObservedSample = false) }
                         1
                     })
                     .then(literal("reset").executes {
@@ -227,6 +227,7 @@ class DungeonProgressHudFeature(
     private companion object {
         private const val FEATURE_CONFIG = "dungeonProgressHud"
         private const val DAY_MILLIS = 86_400_000L
+        private const val AUTO_REFRESH_INTERVAL_MILLIS = 300_000L
     }
 
     private val PREFIX = "&6[&bDPH&6]&r "
@@ -272,7 +273,7 @@ class DungeonProgressHudFeature(
 
     private val actionsDivider = addDivider("40", "ACTIONS")
     private val apiKey = addTextInput("41_apiKey", "", "Hypixel API key.", "Hypixel API Key", emptySet(), configTab)
-    private val refreshButton = addSortedButton("42", { refresh(true) }, "Refresh", "Force API refresh.", "Refresh Now")
+    private val refreshButton = addSortedButton("42", { refresh(force = true, recordObservedSample = false) }, "Refresh", "Force API refresh.", "Refresh Now")
     private val resetButton = addSortedButton("43", { resetSamples() }, "Reset", "Clear observed XP samples.", "Reset Observed Runs")
     private val keybindCategory by lazy {
         KeyMapping.Category.register(ResourceLocation.fromNamespaceAndPath("dungeonprogresshud", "keybinds"))
@@ -286,15 +287,20 @@ class DungeonProgressHudFeature(
     private var status = "API key missing"
     private var refreshing = false
     private var lastRefresh = 0L
+    private var lastAutoRefreshAttempt = 0L
     private var wasVisible = false
     private var startupRefreshAttempted = false
     private var runtimeStarted = false
     private var lastRenderStateLog = 0L
     private var renderedOnce = false
     private var pendingChestProfit: ChestProfitCandidate? = null
+    private var lastChestScanKey = ""
+    private var lastChestScanCandidate: ChestProfitCandidate? = null
     private var lastCroesusCandidates: Map<String, ChestProfitCandidate> = emptyMap()
     private var selectedCroesusCandidate: ChestProfitCandidate? = null
     private var lastChestScreenLog = 0L
+    private var lastVisibilityCheckAt = 0L
+    private var lastVisibilityResult = false
     private var lastRecordedChestAt = 0L
     private var lastDungeonCompletionChat = ""
     private var lastDungeonCompletionChatAt = 0L
@@ -376,22 +382,38 @@ class DungeonProgressHudFeature(
     private fun clientTick() {
         if (!startupRefreshAttempted && sessionReady()) {
             startupRefreshAttempted = true
+            lastAutoRefreshAttempt = System.currentTimeMillis()
             log("Startup refresh triggered for user=${mc.user.name} uuid=${mc.user.profileId}")
             refresh(false)
         }
 
         scanCurrentChestScreen()
-        val visible = shouldRender()
-        if (visible && !wasVisible) refresh(false)
+        val visible = shouldRenderCached()
+        if (visible && !wasVisible) {
+            lastAutoRefreshAttempt = System.currentTimeMillis()
+            refresh(false)
+        } else if (visible) {
+            maybeAutoRefresh()
+        }
         wasVisible = visible
         setLines(buildLines())
+    }
+
+    private fun maybeAutoRefresh() {
+        val now = System.currentTimeMillis()
+        if (now - lastAutoRefreshAttempt < AUTO_REFRESH_INTERVAL_MILLIS) return
+        lastAutoRefreshAttempt = now
+        log("Periodic auto refresh triggered")
+        refresh(false)
     }
 
     fun renderHud(graphics: GuiGraphics) {
         startRuntime("gui render")
 
-        if (!renderHud.get() || !shouldRender()) {
-            logRenderState("Render blocked renderHud=${renderHud.get()} enabled=${isEnabled()} shouldRender=${shouldRender()} showEverywhere=${showEverywhere.get()}")
+        val enabled = isEnabled()
+        val visible = shouldRenderCached()
+        if (!renderHud.get() || !visible) {
+            logRenderState("Render blocked renderHud=${renderHud.get()} enabled=$enabled shouldRender=$visible showEverywhere=${showEverywhere.get()}")
             return
         }
 
@@ -408,14 +430,14 @@ class DungeonProgressHudFeature(
         }
     }
 
-    fun refresh(force: Boolean) {
+    fun refresh(force: Boolean, recordObservedSample: Boolean = true) {
         if (refreshing) return
         if (!sessionReady()) {
             status = "Waiting for session"
             log("Refresh skipped: session not ready")
             return
         }
-        if (!force && System.currentTimeMillis() - lastRefresh < 300_000 && data != null) return
+        if (!force && System.currentTimeMillis() - lastRefresh < AUTO_REFRESH_INTERVAL_MILLIS && data != null) return
         if (apiKey.get().isBlank()) {
             status = "API key missing"
             log("Refresh skipped: missing API key")
@@ -424,22 +446,28 @@ class DungeonProgressHudFeature(
 
         refreshing = true
         status = "Refreshing..."
-        log("Refresh started force=$force user=${mc.user.name} uuid=${mc.user.profileId}")
+        log("Refresh started force=$force recordObservedSample=$recordObservedSample user=${mc.user.name} uuid=${mc.user.profileId}")
 
         thread(name = "DungeonProgressHud-API", isDaemon = true) {
-            runCatching { fetchProfile() }
-                .onSuccess {
-                    data = it
-                    status = "Loaded ${it.profileName}"
-                    lastRefresh = System.currentTimeMillis()
-                    log("Refresh success profile=${it.profileName} xp=${it.catacombsExperience} level=${currentCataLevel(it.catacombsExperience)}")
-                    recordSample(it)
+            val result = runCatching { fetchProfile() }
+            mc.execute {
+                try {
+                    result
+                        .onSuccess {
+                            data = it
+                            status = "Loaded ${it.profileName}"
+                            lastRefresh = System.currentTimeMillis()
+                            log("Refresh success profile=${it.profileName} xp=${it.catacombsExperience} level=${currentCataLevel(it.catacombsExperience)}")
+                            recordSample(it, recordObservedSample)
+                        }
+                        .onFailure {
+                            status = it.message ?: "Refresh failed"
+                            log("Refresh failed: ${it.stackTraceToString()}")
+                        }
+                } finally {
+                    refreshing = false
                 }
-                .onFailure {
-                    status = it.message ?: "Refresh failed"
-                    log("Refresh failed: ${it.stackTraceToString()}")
-                }
-            refreshing = false
+            }
         }
     }
 
@@ -647,18 +675,30 @@ class DungeonProgressHudFeature(
         val screen = currentChestScreen()
         if (screen == null) {
             pendingChestProfit = null
+            lastChestScanKey = ""
+            lastChestScanCandidate = null
             return
         }
 
         val title = screen.title.string
         if (!chestNames.contains(title)) {
             pendingChestProfit = null
+            lastChestScanKey = ""
+            lastChestScanCandidate = null
+            return
+        }
+
+        val scanKey = chestScreenScanKey(screen)
+        if (scanKey == lastChestScanKey) {
+            pendingChestProfit = lastChestScanCandidate
             return
         }
 
         val candidate = runCatching { parseChestProfit(screen) }
             .onFailure { log("Chest screen parse failed: ${it.stackTraceToString()}") }
             .getOrNull()
+        lastChestScanKey = scanKey
+        lastChestScanCandidate = candidate
         pendingChestProfit = candidate
         val now = System.currentTimeMillis()
         if (candidate != null && now - lastChestScreenLog >= 2_000) {
@@ -693,6 +733,40 @@ class DungeonProgressHudFeature(
         }
 
         return ChestProfitCandidate(title, itemValue - cost, cost, itemCount, containerSlotCount)
+    }
+
+    private fun chestScreenScanKey(screen: AbstractContainerScreen<*>): String {
+        val items = screen.menu.items
+        val containerSlotCount = chestContainerSlotCount(items.size)
+        return buildString {
+            append(screen.menu.containerId)
+            append('|')
+            append(screen.title.string)
+            append('|')
+            append(includeEssenceProfit.get())
+            append('|')
+            append(includeDungeonKeyCost.get())
+            for (index in 0 until containerSlotCount) {
+                val stack = items.getOrNull(index) ?: continue
+                append('|')
+                append(index)
+                append(':')
+                append(stack.count)
+                append(':')
+                append(stack.hoverName.string.cleanMc())
+                append(':')
+                append(ItemUtils.skyblockId(stack).orEmpty())
+            }
+            val reward = items.getOrNull(31)
+            if (reward != null) {
+                append("|reward:")
+                append(reward.count)
+                append(':')
+                append(reward.hoverName.string.cleanMc())
+                append(':')
+                append(plainLore(reward).joinToString("\u0001"))
+            }
+        }
     }
 
     private fun parseBestCroesusChest(screen: AbstractContainerScreen<*>): ChestProfitCandidate? {
@@ -1028,7 +1102,7 @@ class DungeonProgressHudFeature(
         )
     }
 
-    private fun recordSample(profile: ProfileData) {
+    private fun recordSample(profile: ProfileData, recordObservedSample: Boolean) {
         if (state.lastPlayerUuid != profile.playerUuid) {
             state.lastPlayerUuid = profile.playerUuid
             state.lastCatacombsXp = profile.catacombsExperience
@@ -1038,6 +1112,12 @@ class DungeonProgressHudFeature(
 
         val delta = profile.catacombsExperience - state.lastCatacombsXp
         state.lastCatacombsXp = profile.catacombsExperience
+        if (!recordObservedSample) {
+            log("API XP baseline updated without observed sample rawDelta=$delta floor=${floorValue()}")
+            saveState()
+            return
+        }
+
         val normalized = normalizeRunXp(delta)
         log("Recorded sample rawDelta=$delta normalized=$normalized floor=${floorValue()}")
         if (isRecentChatRunSample(delta, normalized)) {
@@ -1132,6 +1212,24 @@ class DungeonProgressHudFeature(
                 kotlin.math.abs(it.timestamp - timestamp) < 20 * 60 * 1000
         }
 
+    private fun hasRunRecord(records: List<DungeonRunRecord>, floor: String, rawXp: Long, runTimeSeconds: Int, score: Int, timestamp: Long): Boolean =
+        records.any {
+            it.floorLabel.equals(floor, true) &&
+                it.rawCataXp == rawXp &&
+                it.runTimeSeconds == runTimeSeconds &&
+                it.score == score &&
+                kotlin.math.abs(it.timestamp - timestamp) < 20 * 60 * 1000
+        }
+
+    private fun hasImportedRunRecord(records: List<ImportedDungeonRun>, floor: String, rawXp: Long, runTimeSeconds: Int, score: Int, timestamp: Long): Boolean =
+        records.any {
+            it.floorLabel.equals(floor, true) &&
+                it.rawCataXp == rawXp &&
+                it.runTimeSeconds == runTimeSeconds &&
+                it.score == score &&
+                kotlin.math.abs(it.timestamp - timestamp) < 20 * 60 * 1000
+        }
+
     private fun parseCompletionFloor(message: String): String? =
         dungeonCompletionFloorRegex.find(message)?.groupValues?.getOrNull(2)?.uppercase(Locale.ROOT)
 
@@ -1162,14 +1260,17 @@ class DungeonProgressHudFeature(
             ?: emptyList()
         if (!manual && files.none { it.lastModified() > state.lastLogImportAt }) return
 
+        val existingRuns = state.runs.toList()
+        val fallbackFloor = floorValue()
         thread(name = "DPH Log Import", isDaemon = true) {
-            var imported = 0
-            val previousPending = PendingCompletionState(pendingCompletionAt, pendingCompletionFloor, pendingCompletionTimeSeconds, pendingCompletionScore, pendingCompletionGrade)
-            pendingCompletionAt = 0L
-            pendingCompletionFloor = ""
-            pendingCompletionTimeSeconds = 0
-            pendingCompletionScore = 0
-            pendingCompletionGrade = ""
+            val importedRuns = mutableListOf<ImportedDungeonRun>()
+            var pendingAt = 0L
+            var pendingFloor = ""
+            var pendingTimeSeconds = 0
+            var pendingScore = 0
+            var pendingGrade = ""
+            var lastDedupeKey = ""
+            var lastDedupeAt = 0L
 
             for (file in files) {
                 runCatching {
@@ -1177,7 +1278,28 @@ class DungeonProgressHudFeature(
                         val chat = extractLogChat(line)
                         if (chat != null) {
                             val timestamp = parseLogTimestamp(line, file)
-                            if (parseDungeonCompletionLine(chat, timestamp)) imported++
+                            val parsed = parseImportedDungeonCompletionLine(
+                                chat,
+                                timestamp,
+                                fallbackFloor,
+                                existingRuns,
+                                importedRuns,
+                                pendingAt,
+                                pendingFloor,
+                                pendingTimeSeconds,
+                                pendingScore,
+                                pendingGrade,
+                                lastDedupeKey,
+                                lastDedupeAt,
+                            )
+                            pendingAt = parsed.pending.timestamp
+                            pendingFloor = parsed.pending.floor
+                            pendingTimeSeconds = parsed.pending.runTimeSeconds
+                            pendingScore = parsed.pending.score
+                            pendingGrade = parsed.pending.grade
+                            lastDedupeKey = parsed.lastDedupeKey
+                            lastDedupeAt = parsed.lastDedupeAt
+                            parsed.run?.let { importedRuns.add(it) }
                         }
                     }
                 }.onFailure {
@@ -1185,16 +1307,112 @@ class DungeonProgressHudFeature(
                 }
             }
 
-            pendingCompletionAt = previousPending.timestamp
-            pendingCompletionFloor = previousPending.floor
-            pendingCompletionTimeSeconds = previousPending.runTimeSeconds
-            pendingCompletionScore = previousPending.score
-            pendingCompletionGrade = previousPending.grade
-            state.lastLogImportAt = System.currentTimeMillis()
-            saveState()
-            log("Log import complete files=${files.size} importedRuns=$imported")
-            if (manual) mc.execute { send("Imported $imported dungeon runs from recent logs.") }
+            mc.execute { mergeImportedLogRuns(importedRuns, files.size, manual) }
         }
+    }
+
+    private fun parseImportedDungeonCompletionLine(
+        message: String,
+        timestamp: Long,
+        fallbackFloor: String,
+        existingRuns: List<DungeonRunRecord>,
+        importedRuns: List<ImportedDungeonRun>,
+        previousPendingAt: Long,
+        previousPendingFloor: String,
+        previousPendingTimeSeconds: Int,
+        previousPendingScore: Int,
+        previousPendingGrade: String,
+        previousDedupeKey: String,
+        previousDedupeAt: Long,
+    ): ImportedParseResult {
+        val normalizedMessage = message.cleanMc().trim().replace(Regex("\\s*\\(x\\d+\\)$"), "")
+        if (normalizedMessage.isBlank()) {
+            return ImportedParseResult(
+                PendingCompletionState(previousPendingAt, previousPendingFloor, previousPendingTimeSeconds, previousPendingScore, previousPendingGrade),
+                previousDedupeKey,
+                previousDedupeAt,
+                null,
+            )
+        }
+
+        var pendingAt = previousPendingAt
+        var pendingFloor = previousPendingFloor
+        var pendingTimeSeconds = previousPendingTimeSeconds
+        var pendingScore = previousPendingScore
+        var pendingGrade = previousPendingGrade
+        if (timestamp - pendingAt > 30_000) {
+            pendingFloor = ""
+            pendingTimeSeconds = 0
+            pendingScore = 0
+            pendingGrade = ""
+        }
+
+        parseCompletionFloor(normalizedMessage)?.let {
+            pendingAt = timestamp
+            pendingFloor = it
+        }
+        if (normalizedMessage.contains("Defeated", true)) {
+            pendingAt = timestamp
+            pendingTimeSeconds = parseCompletionTimeSeconds(normalizedMessage)
+        }
+        parseCompletionScore(normalizedMessage)?.let {
+            pendingAt = timestamp
+            pendingScore = it.first
+            pendingGrade = it.second
+        }
+
+        val cataXp = dungeonCompletionCataXpRegex.find(normalizedMessage)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.replace(",", "")
+            ?.toLongOrNull()
+        val pending = PendingCompletionState(pendingAt, pendingFloor, pendingTimeSeconds, pendingScore, pendingGrade)
+        if (cataXp == null) return ImportedParseResult(pending, previousDedupeKey, previousDedupeAt, null)
+
+        val floor = pendingFloor.ifBlank { fallbackFloor }
+        val dedupeKey = "$floor:$cataXp:$pendingTimeSeconds:$pendingScore"
+        if (dedupeKey == previousDedupeKey && timestamp - previousDedupeAt < 10_000) {
+            return ImportedParseResult(pending, previousDedupeKey, previousDedupeAt, null)
+        }
+        if (hasRunRecord(existingRuns, floor, cataXp, pendingTimeSeconds, pendingScore, timestamp) ||
+            hasImportedRunRecord(importedRuns, floor, cataXp, pendingTimeSeconds, pendingScore, timestamp)
+        ) {
+            return ImportedParseResult(pending, previousDedupeKey, previousDedupeAt, null)
+        }
+
+        return ImportedParseResult(
+            pending,
+            dedupeKey,
+            timestamp,
+            ImportedDungeonRun(timestamp, floor, pendingTimeSeconds, pendingScore, pendingGrade, cataXp),
+        )
+    }
+
+    private fun mergeImportedLogRuns(importedRuns: List<ImportedDungeonRun>, fileCount: Int, manual: Boolean) {
+        var imported = 0
+        for (run in importedRuns) {
+            if (hasRunRecord(run.floorLabel, run.rawCataXp, run.runTimeSeconds, run.score, run.timestamp)) continue
+            val normalized = normalizeRunXp(run.rawCataXp)
+            state.samples.add(RunSample(run.timestamp, run.floorLabel, run.rawCataXp, normalized))
+            state.runs.add(
+                DungeonRunRecord(
+                    timestamp = run.timestamp,
+                    floorLabel = run.floorLabel,
+                    runTimeSeconds = run.runTimeSeconds,
+                    score = run.score,
+                    grade = run.grade,
+                    rawCataXp = run.rawCataXp,
+                    normalizedCataXp = normalized,
+                )
+            )
+            imported++
+        }
+        while (state.samples.size > 100) state.samples.removeAt(0)
+        while (state.runs.size > 500) state.runs.removeAt(0)
+        state.lastLogImportAt = System.currentTimeMillis()
+        saveState()
+        log("Log import complete files=$fileCount parsedRuns=${importedRuns.size} importedRuns=$imported")
+        if (manual) send("Imported $imported dungeon runs from recent logs.")
     }
 
     private inline fun File.forEachLogLine(action: (String) -> Unit) {
@@ -1335,7 +1553,13 @@ class DungeonProgressHudFeature(
         }
     }
 
-    private fun shouldRender(): Boolean = isEnabled() && (showEverywhere.get() || isDungeonArea())
+    private fun shouldRenderCached(): Boolean {
+        val now = System.currentTimeMillis()
+        if (now - lastVisibilityCheckAt <= 50L) return lastVisibilityResult
+        lastVisibilityCheckAt = now
+        lastVisibilityResult = isEnabled() && (showEverywhere.get() || isDungeonArea())
+        return lastVisibilityResult
+    }
 
     private fun drawDirect(graphics: GuiGraphics, lines: List<String>) {
         graphics.pose().pushMatrix()
@@ -1576,6 +1800,22 @@ class DungeonProgressHudFeature(
         val runTimeSeconds: Int,
         val score: Int,
         val grade: String,
+    )
+
+    data class ImportedDungeonRun(
+        val timestamp: Long,
+        val floorLabel: String,
+        val runTimeSeconds: Int,
+        val score: Int,
+        val grade: String,
+        val rawCataXp: Long,
+    )
+
+    data class ImportedParseResult(
+        val pending: PendingCompletionState,
+        val lastDedupeKey: String,
+        val lastDedupeAt: Long,
+        val run: ImportedDungeonRun?,
     )
 
     private val cumulativeCatacombsXp = listOf(
