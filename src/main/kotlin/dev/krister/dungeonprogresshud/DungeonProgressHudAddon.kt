@@ -28,7 +28,7 @@ import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen
 import net.minecraft.client.input.KeyEvent
 import net.minecraft.network.chat.MessageSignature
 import net.minecraft.network.chat.Component
-import net.minecraft.resources.ResourceLocation
+import net.minecraft.resources.Identifier
 import net.minecraft.world.inventory.ClickType
 import net.minecraft.world.item.ItemStack
 import net.minecraft.world.item.Items
@@ -241,7 +241,7 @@ class DungeonProgressHudFeature(
     private val displayDivider = addDivider("10", "DISPLAY")
     private val renderHud = addSwitch("11_renderHud", true, "Draw the HUD during normal gameplay.", "Render HUD", emptySet(), false, configTab)
     private val showEverywhere = addSwitch("12_showEverywhere", true, "Render everywhere instead of only Dungeon Hub/Catacombs.", "Show Everywhere", emptySet(), false, configTab)
-    private val targetLevel = addTextInput("13_targetLevel", "50", "Target Catacombs level.", "Target Level", emptySet(), configTab)
+    private val targetLevel = addTextInput("13_targetLevel", "50", "Target Catacombs level. Cosmetic levels above 50 add 200m XP each.", "Target Level", emptySet(), configTab)
     private val floorLabel = addTextInput("14_floorLabel", "M7", "Floor label used for observed samples.", "Floor Label", emptySet(), configTab)
     private val showCurrentLevel = addSwitch("15_showCurrentLevel", true, "Show current Catacombs level.", "Current Level", emptySet(), false, configTab)
     private val showCurrentXp = addSwitch("16_showCurrentXp", true, "Show current Catacombs XP.", "Current XP", emptySet(), false, configTab)
@@ -276,7 +276,7 @@ class DungeonProgressHudFeature(
     private val refreshButton = addSortedButton("42", { refresh(force = true, recordObservedSample = false) }, "Refresh", "Force API refresh.", "Refresh Now")
     private val resetButton = addSortedButton("43", { resetSamples() }, "Reset", "Clear observed XP samples.", "Reset Observed Runs")
     private val keybindCategory by lazy {
-        KeyMapping.Category.register(ResourceLocation.fromNamespaceAndPath("dungeonprogresshud", "keybinds"))
+        KeyMapping.Category.register(Identifier.fromNamespaceAndPath("dungeonprogresshud", "keybinds"))
     }
     private val fakeOpenKey = KeyBindingHelper.registerKeyBinding(
         KeyMapping("key.dungeonprogresshud.fakeOpenChest", GLFW.GLFW_KEY_H, keybindCategory)
@@ -1655,15 +1655,27 @@ class DungeonProgressHudFeature(
 
     private fun xpRemaining(currentXp: Long, targetLevel: Int): Long = (targetXp(targetLevel) - currentXp).coerceAtLeast(0)
 
-    private fun targetXp(level: Int): Long = cumulativeCatacombsXp[(level.coerceIn(1, 50)) - 1]
+    private fun targetXp(level: Int): Long {
+        val boundedLevel = level.coerceAtLeast(1)
+        if (boundedLevel <= maxStandardCatacombsLevel) return cumulativeCatacombsXp[boundedLevel - 1]
+        return cumulativeCatacombsXp.last() + (boundedLevel - maxStandardCatacombsLevel) * cosmeticCatacombsXpPerLevel
+    }
 
-    private fun targetLevelValue(): Int = targetLevel.get().toIntOrNull()?.coerceIn(1, 50) ?: 50
+    private fun targetLevelValue(): Int {
+        val raw = targetLevel.get().trim()
+        val normalized = raw.removePrefix("C").removePrefix("c").removeSuffix("C").removeSuffix("c")
+        return normalized.toIntOrNull()?.coerceAtLeast(1) ?: maxStandardCatacombsLevel
+    }
 
-    private fun currentCataLevel(xp: Long): Int = cumulativeCatacombsXp.indexOfLast { xp >= it }.let { (it + 1).coerceIn(0, 50) }
+    private fun currentCataLevel(xp: Long): Int {
+        if (xp < cumulativeCatacombsXp.last()) {
+            return cumulativeCatacombsXp.indexOfLast { xp >= it }.let { (it + 1).coerceAtLeast(0) }
+        }
+        return maxStandardCatacombsLevel + ((xp - cumulativeCatacombsXp.last()) / cosmeticCatacombsXpPerLevel).toInt()
+    }
 
     private fun levelProgressPercent(xp: Long): String {
         val current = currentCataLevel(xp)
-        if (current >= 50) return "100.0"
         val previousXp = if (current <= 0) 0L else targetXp(current)
         val nextXp = targetXp(current + 1)
         val progress = ((xp - previousXp).toDouble() / (nextXp - previousXp).toDouble()).coerceIn(0.0, 1.0)
@@ -1825,6 +1837,8 @@ class DungeonProgressHudFeature(
         4149640L, 5559640L, 7459640L, 9959640L, 13259640L, 17559640L, 23159640L, 30359640L, 39559640L, 51559640L,
         66559640L, 85559640L, 109559640L, 139559640L, 177559640L, 225559640L, 285559640L, 360559640L, 453559640L, 569809640L,
     )
+    private val maxStandardCatacombsLevel = cumulativeCatacombsXp.size
+    private val cosmeticCatacombsXpPerLevel = 200_000_000L
 
     private val chestNames = setOf("Wood", "Gold", "Diamond", "Emerald", "Obsidian", "Bedrock")
     private val runChestRegex = "^(?:Master )?Catacombs - Floor [IV]+$".toRegex()
