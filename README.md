@@ -61,9 +61,15 @@ While the HUD is visible, it refreshes the API data about every five minutes.
 Using `/dph refresh` only updates the displayed API data and XP baseline; it
 does not count as a dungeon run or change Last Run XP.
 
+## Saved Data
+
+DungeonProgressHud stores its run/profit data in the normal Fabric config
+folder, under `DungeonProgressHud/runs.json`. This uses Fabric's instance paths,
+so it works on Windows and Linux without hardcoded launcher folders.
+
 ## Building
 
-```powershell
+```sh
 gradle build
 ```
 

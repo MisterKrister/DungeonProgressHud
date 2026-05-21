@@ -21,7 +21,7 @@ public abstract class GuiMixin {
     @Inject(method = "render", at = @At(value = "INVOKE", target = "Lnet/minecraft/client/gui/Gui;renderSleepOverlay(Lnet/minecraft/client/gui/GuiGraphics;Lnet/minecraft/client/DeltaTracker;)V"))
     private void dungeonprogresshud$renderOverlay(GuiGraphics guiGraphics, DeltaTracker deltaTracker, CallbackInfo ci) {
         if (this.minecraft.options.hideGui) return;
-        if (this.minecraft.debugEntries.isOverlayVisible()) return;
+        if (this.minecraft.debugEntries.isF3Visible()) return;
         DungeonProgressHudAddon.INSTANCE.renderOverlay(guiGraphics);
     }
 }

@@ -20,10 +20,10 @@
   ],
   "depends": {
     "fabricloader": ">=0.18.4",
-    "minecraft": "~1.21.11",
+    "minecraft": "~1.21.10",
     "java": ">=21",
     "fabric-api": "*",
     "fabric-language-kotlin": "*",
-    "devonian": ">=1.15.8-1.21.11"
+    "devonian": ">=1.15.8-1.21.10"
   }
 }
