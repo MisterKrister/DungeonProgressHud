@@ -28,7 +28,7 @@ import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen
 import net.minecraft.client.input.KeyEvent
 import net.minecraft.network.chat.MessageSignature
 import net.minecraft.network.chat.Component
-import net.minecraft.resources.ResourceLocation
+import net.minecraft.resources.Identifier
 import net.minecraft.world.inventory.ClickType
 import net.minecraft.world.item.ItemStack
 import net.minecraft.world.item.Items
@@ -123,9 +123,15 @@ object DungeonProgressHudAddon : ClientModInitializer {
                         1
                     }
                     .then(literal("refresh").executes {
-                        withFeature { it.refresh(force = true, recordObservedSample = false) }
+                        withFeature { it.refresh(force = true, recordObservedSample = false, notify = true) }
                         1
                     })
+                    .then(literal("apikey")
+                        .then(argument("key", StringArgumentType.greedyString()).executes { context ->
+                            withFeature { it.setApiKey(StringArgumentType.getString(context, "key")) }
+                            1
+                        })
+                    )
                     .then(literal("reset").executes {
                         withFeature { it.resetSamples() }
                         1
@@ -226,6 +232,9 @@ class DungeonProgressHudFeature(
 ) {
     private companion object {
         private const val FEATURE_CONFIG = "dungeonProgressHud"
+        private const val API_KEY_CONFIG = "$FEATURE_CONFIG\$41_apiKey"
+        private const val LEGACY_API_KEY_CONFIG = "$FEATURE_CONFIG\$apiKey"
+        private val API_KEY_CONFIG_NAMES = listOf(API_KEY_CONFIG, LEGACY_API_KEY_CONFIG)
         private const val DAY_MILLIS = 86_400_000L
         private const val AUTO_REFRESH_INTERVAL_MILLIS = 300_000L
     }
@@ -273,10 +282,10 @@ class DungeonProgressHudFeature(
 
     private val actionsDivider = addDivider("40", "ACTIONS")
     private val apiKey = addTextInput("41_apiKey", "", "Hypixel API key.", "Hypixel API Key", emptySet(), configTab)
-    private val refreshButton = addSortedButton("42", { refresh(force = true, recordObservedSample = false) }, "Refresh", "Force API refresh.", "Refresh Now")
+    private val refreshButton = addSortedButton("42", { refresh(force = true, recordObservedSample = false, notify = true) }, "Refresh", "Force API refresh.", "Refresh Now")
     private val resetButton = addSortedButton("43", { resetSamples() }, "Reset", "Clear observed XP samples.", "Reset Observed Runs")
     private val keybindCategory by lazy {
-        KeyMapping.Category.register(ResourceLocation.fromNamespaceAndPath("dungeonprogresshud", "keybinds"))
+        KeyMapping.Category.register(Identifier.fromNamespaceAndPath("dungeonprogresshud", "keybinds"))
     }
     private val fakeOpenKey = KeyBindingHelper.registerKeyBinding(
         KeyMapping("key.dungeonprogresshud.fakeOpenChest", GLFW.GLFW_KEY_H, keybindCategory)
@@ -339,19 +348,23 @@ class DungeonProgressHudFeature(
     }
 
     private fun migrateLegacyApiKey() {
-        if (apiKey.get().isNotBlank()) return
-        val legacy = runCatching { Config.getConfig("$FEATURE_CONFIG.apiKey", "") }.getOrDefault("") ?: ""
-        if (legacy.isNotBlank()) apiKey.set(legacy)
+        val normalized = apiKey.get().trim()
+        if (normalized.isNotBlank()) {
+            if (normalized != apiKey.get()) apiKey.set(normalized)
+            return
+        }
+        val legacy = readConfiguredApiKeyValue(LEGACY_API_KEY_CONFIG)
+        if (legacy.isNotBlank()) apiKey.set(legacy.trim())
     }
 
     override fun getEditText(): List<String> = listOf(
         "&bCata Level: &fC49",
-        "&bCata XP: &f453,559,640",
         "&bTarget: &fC50",
+        "&bRuns Left: &a259",
+        "&bCata XP: &f453,559,640",
         "&bRemaining: &f116,250,000",
         "&bFloor: &fM7",
         "&bXP/Run: &f450,000 &7(fallback)",
-        "&bRuns Left: &a259",
     )
 
     override fun initialize() {
@@ -430,23 +443,29 @@ class DungeonProgressHudFeature(
         }
     }
 
-    fun refresh(force: Boolean, recordObservedSample: Boolean = true) {
-        if (refreshing) return
+    fun refresh(force: Boolean, recordObservedSample: Boolean = true, notify: Boolean = false) {
+        if (refreshing) {
+            if (notify) send("Refresh already running.")
+            return
+        }
         if (!sessionReady()) {
             status = "Waiting for session"
             log("Refresh skipped: session not ready")
+            if (notify) send("Refresh skipped: waiting for Minecraft session.")
             return
         }
         if (!force && System.currentTimeMillis() - lastRefresh < AUTO_REFRESH_INTERVAL_MILLIS && data != null) return
-        if (apiKey.get().isBlank()) {
+        if (configuredApiKey().isBlank()) {
             status = "API key missing"
             log("Refresh skipped: missing API key")
+            if (notify) send("Refresh skipped: API key missing. Use /dph apikey <key> if the GUI field did not save.")
             return
         }
 
         refreshing = true
         status = "Refreshing..."
         log("Refresh started force=$force recordObservedSample=$recordObservedSample user=${mc.user.name} uuid=${mc.user.profileId}")
+        if (notify) send("Refreshing API data...")
 
         thread(name = "DungeonProgressHud-API", isDaemon = true) {
             val result = runCatching { fetchProfile() }
@@ -458,11 +477,13 @@ class DungeonProgressHudFeature(
                             status = "Loaded ${it.profileName}"
                             lastRefresh = System.currentTimeMillis()
                             log("Refresh success profile=${it.profileName} xp=${it.catacombsExperience} level=${currentCataLevel(it.catacombsExperience)}")
+                            if (notify) send("Loaded ${it.profileName}: Cata ${currentCataLevel(it.catacombsExperience)}.")
                             recordSample(it, recordObservedSample)
                         }
                         .onFailure {
                             status = it.message ?: "Refresh failed"
                             log("Refresh failed: ${it.stackTraceToString()}")
+                            if (notify) send("Refresh failed: $status")
                         }
                 } finally {
                     refreshing = false
@@ -470,6 +491,46 @@ class DungeonProgressHudFeature(
             }
         }
     }
+
+    private fun configuredApiKey(): String {
+        val current = apiKey.get().trim()
+        if (current.isNotBlank()) {
+            if (current != apiKey.get()) apiKey.set(current)
+            return current
+        }
+
+        for (configName in API_KEY_CONFIG_NAMES) {
+            val value = readConfiguredApiKeyValue(configName)
+            if (value.isNotBlank()) {
+                apiKey.set(value)
+                return value
+            }
+        }
+
+        return ""
+    }
+
+    fun setApiKey(value: String) {
+        val normalized = value.trim()
+        if (normalized.isBlank()) {
+            status = "API key missing"
+            send("API key was empty.")
+            return
+        }
+
+        apiKey.set(normalized)
+        runCatching { Config.setConfig(LEGACY_API_KEY_CONFIG, normalized) }
+        runCatching { Config.save() }
+        status = "API key saved"
+        send("API key saved. Run /dph refresh or press Refresh Now.")
+        log("API key saved via command length=${normalized.length}")
+    }
+
+    private fun readConfiguredApiKeyValue(configName: String): String =
+        runCatching { Config.getConfig(configName, "") }
+            .getOrDefault("")
+            ?.trim()
+            ?: ""
 
     fun resetSamples() {
         state.samples.clear()
@@ -651,12 +712,12 @@ class DungeonProgressHudFeature(
         return buildList {
             if (showCurrentLevel.get()) add("&bCata Level: &fC$currentLevel")
             if (showLevelProgress.get()) add("&bNext Level: &f${levelProgressPercent(profile.catacombsExperience)}%")
-            if (showCurrentXp.get()) add("&bCata XP: &f${profile.catacombsExperience.format()}")
             if (showTarget.get()) add("&bTarget: &fC${targetLevelValue()}")
+            if (showRunsLeft.get()) add("&bRuns Left: &a${runs?.format() ?: "N/A"}")
+            if (showCurrentXp.get()) add("&bCata XP: &f${profile.catacombsExperience.format()}")
             if (showRemaining.get()) add("&bRemaining: &f${remaining.format()}")
             if (showFloor.get()) add("&bFloor: &f${floorValue()}")
             if (showXpPerRun.get()) add("&bXP/Run: &f${xpPerRun.format()} &7($source)")
-            if (showRunsLeft.get()) add("&bRuns Left: &a${runs?.format() ?: "N/A"}")
             if (showProfile.get()) add("&bProfile: &f${profile.profileName}")
             if (showLastRun.get()) add("&bLast Run: &f${last?.normalizedXpDelta?.format() ?: "N/A"}")
             if (showObservedCount.get()) add("&bObserved Runs: &f${samples.size}")
@@ -1074,7 +1135,7 @@ class DungeonProgressHudFeature(
         connection.connectTimeout = 10_000
         connection.readTimeout = 10_000
         connection.setRequestProperty("Accept", "application/json")
-        connection.setRequestProperty("API-Key", apiKey.get())
+        connection.setRequestProperty("API-Key", configuredApiKey())
         connection.setRequestProperty("User-Agent", "DungeonProgressHud/1.0.0")
 
         val code = connection.responseCode
@@ -1654,15 +1715,30 @@ class DungeonProgressHudFeature(
 
     private fun xpRemaining(currentXp: Long, targetLevel: Int): Long = (targetXp(targetLevel) - currentXp).coerceAtLeast(0)
 
-    private fun targetXp(level: Int): Long = cumulativeCatacombsXp[(level.coerceIn(1, 50)) - 1]
+    private fun targetXp(level: Int): Long {
+        val normalizedLevel = level.coerceAtLeast(1)
+        if (normalizedLevel <= CATACOMBS_LINEAR_LEVEL_START) {
+            return cumulativeCatacombsXp[normalizedLevel - 1]
+        }
 
-    private fun targetLevelValue(): Int = targetLevel.get().toIntOrNull()?.coerceIn(1, 50) ?: 50
+        return CATACOMBS_LEVEL_50_XP + (normalizedLevel - CATACOMBS_LINEAR_LEVEL_START) * CATACOMBS_POST_50_XP_PER_LEVEL
+    }
 
-    private fun currentCataLevel(xp: Long): Int = cumulativeCatacombsXp.indexOfLast { xp >= it }.let { (it + 1).coerceIn(0, 50) }
+    private fun targetLevelValue(): Int = targetLevel.get().toIntOrNull()?.coerceAtLeast(1) ?: 50
+
+    private fun currentCataLevel(xp: Long): Int {
+        if (xp >= CATACOMBS_LEVEL_50_XP) {
+            val post50Levels = ((xp - CATACOMBS_LEVEL_50_XP) / CATACOMBS_POST_50_XP_PER_LEVEL)
+                .coerceAtMost((Int.MAX_VALUE - CATACOMBS_LINEAR_LEVEL_START).toLong())
+                .toInt()
+            return CATACOMBS_LINEAR_LEVEL_START + post50Levels
+        }
+
+        return cumulativeCatacombsXp.indexOfLast { xp >= it }.let { it + 1 }
+    }
 
     private fun levelProgressPercent(xp: Long): String {
         val current = currentCataLevel(xp)
-        if (current >= 50) return "100.0"
         val previousXp = if (current <= 0) 0L else targetXp(current)
         val nextXp = targetXp(current + 1)
         val progress = ((xp - previousXp).toDouble() / (nextXp - previousXp).toDouble()).coerceIn(0.0, 1.0)
@@ -1824,6 +1900,9 @@ class DungeonProgressHudFeature(
         4149640L, 5559640L, 7459640L, 9959640L, 13259640L, 17559640L, 23159640L, 30359640L, 39559640L, 51559640L,
         66559640L, 85559640L, 109559640L, 139559640L, 177559640L, 225559640L, 285559640L, 360559640L, 453559640L, 569809640L,
     )
+    private val CATACOMBS_LINEAR_LEVEL_START = 50
+    private val CATACOMBS_POST_50_XP_PER_LEVEL = 200_000_000L
+    private val CATACOMBS_LEVEL_50_XP = cumulativeCatacombsXp[CATACOMBS_LINEAR_LEVEL_START - 1]
 
     private val chestNames = setOf("Wood", "Gold", "Diamond", "Emerald", "Obsidian", "Bedrock")
     private val runChestRegex = "^(?:Master )?Catacombs - Floor [IV]+$".toRegex()
