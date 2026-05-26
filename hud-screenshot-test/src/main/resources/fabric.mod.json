@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "hud_screenshot_test",
+  "version": "${version}",
+  "name": "HUD Screenshot Test",
+  "description": "One-shot local screenshot helper for DPH UI testing.",
+  "authors": ["krister"],
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "dev.krister.hudscreenshottest.HudScreenshotTestMod"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.18.4",
+    "minecraft": "1.21.11",
+    "fabric-api": "*"
+  }
+}

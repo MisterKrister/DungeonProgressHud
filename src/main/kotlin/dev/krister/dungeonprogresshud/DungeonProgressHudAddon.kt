@@ -335,6 +335,10 @@ class DungeonProgressHudFeature(
     private val gson = GsonBuilder().setPrettyPrinting().create()
     private val configDir = FabricLoader.getInstance().configDir.resolve("DungeonProgressHud").toFile()
     private val stateFile = File(configDir, "runs.json")
+    private val hudStyleFile = File(configDir, "hud-style.json")
+    private var hudStyle = HudStyle()
+    private var hudStyleLoadedAt = 0L
+    private var hudStyleModifiedAt = 0L
     private val summarySignatures = (0 until 3).map { signature("dph-summary-$it") }
     private val logsDir = FabricLoader.getInstance().gameDir.resolve("logs").toFile()
     private val mc: Minecraft get() = Minecraft.getInstance()
@@ -342,7 +346,7 @@ class DungeonProgressHudFeature(
     private val displayDivider = addDivider("10", "DISPLAY")
     private val renderHud = addSwitch("11_renderHud", true, "Draw the HUD during normal gameplay.", "Render HUD", emptySet(), false, configTab)
     private val showEverywhere = addSwitch("12_showEverywhere", true, "Render everywhere instead of only Dungeon Hub/Catacombs.", "Show Everywhere", emptySet(), false, configTab)
-    private val targetLevel = addTextInput("13_targetLevel", "50", "Target Catacombs level.", "Target Level", emptySet(), configTab)
+    private val targetLevel = addTextInput("13_targetLevel", "51", "Target Catacombs level.", "Target Level", emptySet(), configTab)
     private val floorLabel = addTextInput("14_floorLabel", "M7", "Floor label used for observed samples.", "Floor Label", emptySet(), configTab)
     private val showCurrentLevel = addSwitch("15_showCurrentLevel", true, "Show current Catacombs level.", "Current Level", emptySet(), false, configTab)
     private val showCurrentXp = addSwitch("16_showCurrentXp", true, "Show current Catacombs XP.", "Current XP", emptySet(), false, configTab)
@@ -354,7 +358,7 @@ class DungeonProgressHudFeature(
     private val showRunsLeft = addSwitch("1c_showRunsLeft", true, "Show estimated runs left.", "Runs Left", emptySet(), false, configTab)
     private val showProfile = addSwitch("1d_showProfile", false, "Show selected SkyBlock profile.", "Profile", emptySet(), false, configTab)
     private val showLastRun = addSwitch("1e_showLastRun", true, "Show last observed normalized XP delta.", "Last Run XP", emptySet(), false, configTab)
-    private val showObservedCount = addSwitch("1f_showObservedCount", false, "Show observed sample count.", "Observed Count", emptySet(), false, configTab)
+    private val showObservedCount = addSwitch("1f_showObservedCount", true, "Show observed sample count.", "Observed Count", emptySet(), false, configTab)
 
     private val xpDivider = addDivider("20", "XP")
     private val xpMode = addSelection("21_xpMode", 0, listOf("Observed Average", "Hardcoded"), "XP/run source.", "XP/Run Mode", emptySet(), configTab)
@@ -1998,6 +2002,13 @@ class DungeonProgressHudFeature(
         graphics.pose().translate(drawX, drawY)
         graphics.pose().scale(scale, scale)
 
+        val profile = data
+        if (profile != null) {
+            drawStyledHud(graphics, profile)
+            graphics.pose().popMatrix()
+            return
+        }
+
         val width = lines.maxOfOrNull { mc.font.width(it.colorize()) } ?: 90
         val height = lines.size * (mc.font.lineHeight + 2) + 2
         graphics.fill(-2, -2, width + 4, height, 0x80000000.toInt())
@@ -2009,6 +2020,287 @@ class DungeonProgressHudFeature(
         }
 
         graphics.pose().popMatrix()
+    }
+
+    private fun loadHudStyle(): HudStyle {
+        val now = System.currentTimeMillis()
+        if (now - hudStyleLoadedAt < 500L) return hudStyle
+        hudStyleLoadedAt = now
+
+        runCatching {
+            configDir.mkdirs()
+            if (!hudStyleFile.exists()) {
+                hudStyleFile.writer().use { gson.toJson(hudStyle, it) }
+                hudStyleModifiedAt = hudStyleFile.lastModified()
+                return hudStyle
+            }
+
+            val modified = hudStyleFile.lastModified()
+            if (modified == hudStyleModifiedAt) return hudStyle
+            hudStyleModifiedAt = modified
+            hudStyle = hudStyleFile.reader().use { gson.fromJson(it, HudStyle::class.java) } ?: HudStyle()
+            log("HUD style reloaded titleScale=${hudStyle.titleScale} metricScale=${hudStyle.metricShortScale} lootScale=${hudStyle.lootShortScale}")
+        }.onFailure {
+            log("HUD style reload failed: ${it.javaClass.simpleName}: ${it.message}")
+        }
+
+        return hudStyle
+    }
+
+    private fun drawStyledHud(graphics: GuiGraphics, profile: ProfileData) {
+        val style = loadHudStyle()
+        val panelWidth = 340
+        val panelHeight = if (showChestProfit.get()) 404 else 308
+        val cyan = 0xFF32E6F0.toInt()
+        val cyanDim = 0xAA159AA5.toInt()
+        val cyanDark = 0x5524D8E5
+        val white = 0xFFFFFFFF.toInt()
+        val gray = 0xFF9BA2AA.toInt()
+        val green = 0xFF66F05A.toInt()
+        val purple = 0xFFD07BFF.toInt()
+        val gold = 0xFFFFD45A.toInt()
+        val fill = style.argb(0x061014, 0x86)
+        val cardFill = style.argb(0x061016, 0xB0)
+
+        graphics.fill(0, 0, panelWidth, panelHeight, fill)
+        graphics.fill(4, 4, panelWidth - 4, 46, 0x66050B10)
+        graphics.fill(8, 44, panelWidth - 8, panelHeight - 8, 0x58030A0D)
+        graphics.fill(4, panelHeight - 104, panelWidth - 4, panelHeight - 4, 0x64181004)
+        drawPixelBorder(graphics, 0, 0, panelWidth, panelHeight, 0xDD1E2B36.toInt(), cyanDim)
+        drawPixelBorder(graphics, 4, 4, panelWidth - 4, panelHeight - 4, 0x80313D48.toInt(), cyanDark)
+        drawCornerStuds(graphics, panelWidth, panelHeight, cyan)
+        drawEdgeBrackets(graphics, panelWidth, panelHeight, cyanDim)
+        graphics.fill(12, 36, panelWidth - 12, 39, cyanDim)
+        graphics.fill(54, 6, panelWidth - 54, 34, 0xA4101822.toInt())
+        graphics.fill(68, 10, panelWidth - 68, 30, 0x7A050B10)
+        drawPixelBorder(graphics, 54, 6, panelWidth - 54, 34, 0x88101822.toInt(), 0xDD283642.toInt())
+        graphics.fill(66, 34, panelWidth - 66, 37, 0x8832E6F0.toInt())
+        drawScaledCenteredText(graphics, "CATACOMBS", 2, style.titleY + 3, panelWidth, 0xAA061014.toInt(), style.titleScale)
+        drawScaledCenteredText(graphics, "CATACOMBS", 0, style.titleY, panelWidth, cyan, style.titleScale)
+        drawSkull(graphics, 24, 13, cyan)
+        drawSkull(graphics, panelWidth - 38, 13, cyan)
+        drawHeaderCrystal(graphics, 58, 20, cyan)
+        drawHeaderCrystal(graphics, panelWidth - 58, 20, cyan)
+
+        val currentLevel = currentCataLevel(profile.catacombsExperience)
+        val targetLevel = targetLevelValue()
+        drawStatCard(graphics, 14, 50, 146, 88, "+ CATA LEVEL +", "C$currentLevel", cyan, white)
+        drawStatCard(graphics, 180, 50, 146, 88, "+ TARGET +", "C$targetLevel", cyan, white)
+        drawGem(graphics, panelWidth / 2, 93, cyan)
+
+        val progressText = levelProgressPercent(profile.catacombsExperience)
+        val progress = (progressText.toDoubleOrNull() ?: 0.0).coerceIn(0.0, 100.0) / 100.0
+        drawPanelBox(graphics, 14, 152, 312, 52, cardFill, cyanDim)
+        graphics.drawString(mc.font, Component.literal("NEXT LEVEL"), 70, 162, cyan, true)
+        drawIconBox(graphics, 24, 163, cyan, "")
+        drawPixelSpark(graphics, 38, 176, cyan)
+        graphics.fill(70, 181, 266, 193, 0xD205090C.toInt())
+        drawPixelBorder(graphics, 70, 181, 266, 193, 0xC205090C.toInt(), 0xFF1D2930.toInt())
+        val filled = (194 * progress).roundToInt()
+        if (filled > 0) {
+            graphics.fill(72, 183, 72 + filled, 191, 0xDD26EAF2.toInt())
+            graphics.fill(72, 183, 72 + filled, 185, 0xF0A6FFFF.toInt())
+            graphics.fill(72, 189, 72 + filled, 191, 0xBB108B96.toInt())
+        }
+        for (tick in 1 until 10) {
+            val tx = 72 + tick * 19
+            graphics.fill(tx, 182, tx + 1, 192, 0x66000000)
+        }
+        drawScaledText(graphics, "${progressText}%", 278, 171, green, style.progressPercentScale)
+
+        val xpPerRun = effectiveXpPerRun()
+        val remaining = xpRemaining(profile.catacombsExperience, targetLevel)
+        val runs = xpPerRun.takeIf { it > 0 }?.let { ceil(remaining.toDouble() / it.toDouble()).toLong() }
+        val samples = samplesForFloor()
+        val last = samples.lastOrNull()
+        val midTop = 220
+        val midHeight = 86
+        drawPanelBox(graphics, 14, midTop, 150, midHeight, cardFill, cyanDim)
+        drawPanelBox(graphics, 176, midTop, 150, midHeight, cardFill, cyanDim)
+        drawSectionTitle(graphics, "RUNS", 14, midTop + 8, 150, cyan)
+        drawSectionTitle(graphics, "XP & HISTORY", 176, midTop + 8, 150, cyan)
+        drawMetricRow(graphics, 28, midTop + 28, "RUNS LEFT", runs?.compact() ?: "N/A", green, "R", showRunsLeft.get(), style.metricShortScale)
+        drawDashedLine(graphics, 28, midTop + 55, 150, 0x7726DDE8)
+        drawMetricRow(graphics, 28, midTop + 60, "OBSERVED RUNS", samples.size.toString(), purple, "O", showObservedCount.get(), style.metricShortScale)
+        drawMetricRow(graphics, 190, midTop + 28, "CATA XP", profile.catacombsExperience.format(), white, "XP", showCurrentXp.get(), style.metricShortScale)
+        drawDashedLine(graphics, 190, midTop + 55, 312, 0x7726DDE8)
+        drawMetricRow(graphics, 190, midTop + 60, "LAST RUN", last?.normalizedXpDelta?.format() ?: "N/A", white, "L", showLastRun.get(), style.metricShortScale)
+
+        if (showChestProfit.get()) {
+            val stats = chestProfitStats()
+            val profitTop = 320
+            drawPanelBox(graphics, 14, profitTop, 312, 72, 0x72422E09, 0xCCB88725.toInt())
+            drawBox(graphics, 18, profitTop + 4, 304, 20, 0x7750390A, 0xDDC99A2E.toInt())
+            drawCenteredText(graphics, "LOOT & PROFIT", 18, profitTop + 10, 304, gold, true)
+            drawLootGem(graphics, panelWidth / 2, profitTop + 28, gold)
+            graphics.fill(114, profitTop + 28, 117, profitTop + 66, 0xCCB88725.toInt())
+            graphics.fill(220, profitTop + 28, 223, profitTop + 66, 0xCCB88725.toInt())
+            drawLootMetric(graphics, 20, profitTop + 36, "PROFIT", stats.profit.formatCoins(), green, "$", style.lootShortScale)
+            graphics.drawString(mc.font, Component.literal("(${stats.label})"), 42, profitTop + 61, gray, true)
+            drawLootMetric(graphics, 130, profitTop + 36, "CHESTS", stats.chests.toString(), white, "#", style.lootShortScale)
+            drawLootMetric(graphics, 236, profitTop + 36, "AVG CHEST", stats.average.formatCoins(), green, "D", style.lootShortScale)
+        }
+    }
+
+    private fun drawStatCard(graphics: GuiGraphics, x: Int, y: Int, width: Int, height: Int, label: String, value: String, labelColor: Int, valueColor: Int) {
+        drawBox(graphics, x, y, width, height, 0x7A081016, 0xAA26313B.toInt())
+        graphics.fill(x + 8, y + 8, x + width - 8, y + height - 8, 0x88050A0E.toInt())
+        graphics.fill(x + 14, y + 14, x + width - 14, y + 16, 0x3326DDE8)
+        graphics.fill(x + 14, y + height - 16, x + width - 14, y + height - 14, 0x44000000)
+        drawCenteredText(graphics, label, x, y + 12, width, labelColor, true)
+        drawScaledCenteredText(graphics, value, x, y + 42, width, valueColor, 4.0f)
+    }
+
+    private fun drawMetric(graphics: GuiGraphics, x: Int, y: Int, label: String, value: String, valueColor: Int, visible: Boolean) {
+        if (!visible) return
+        graphics.drawString(mc.font, Component.literal(label), x, y, 0xFF32E6F0.toInt(), true)
+        val compact = if (value.length > 12) value.replace(",", " ") else value
+        graphics.drawString(mc.font, Component.literal(compact), x, y + 11, valueColor, true)
+    }
+
+    private fun drawIconBox(graphics: GuiGraphics, x: Int, y: Int, color: Int, text: String) {
+        drawBox(graphics, x, y, 28, 26, 0x66101D23, color)
+        if (text.isNotBlank()) drawCenteredText(graphics, text, x, y + 9, 28, color, true)
+    }
+
+    private fun drawGem(graphics: GuiGraphics, centerX: Int, centerY: Int, color: Int) {
+        graphics.fill(centerX - 2, centerY - 8, centerX + 3, centerY - 3, color)
+        graphics.fill(centerX - 7, centerY - 3, centerX + 8, centerY + 3, 0xAA0FD6DE.toInt())
+        graphics.fill(centerX - 2, centerY + 3, centerX + 3, centerY + 8, color)
+    }
+
+    private fun drawSectionTitle(graphics: GuiGraphics, text: String, x: Int, y: Int, width: Int, color: Int) {
+        graphics.fill(x + 10, y + 4, x + 38, y + 6, 0x8826DDE8.toInt())
+        graphics.fill(x + width - 38, y + 4, x + width - 10, y + 6, 0x8826DDE8.toInt())
+        drawCenteredText(graphics, text, x, y, width, color, true)
+    }
+
+    private fun drawMetricRow(graphics: GuiGraphics, x: Int, y: Int, label: String, value: String, valueColor: Int, icon: String, visible: Boolean, shortScale: Float) {
+        if (!visible) return
+        drawBox(graphics, x, y, 20, 20, 0x55101D23, 0x7726DDE8)
+        drawCenteredText(graphics, icon, x, y + 6, 20, 0xFF32E6F0.toInt(), true)
+        graphics.drawString(mc.font, Component.literal(label), x + 27, y, 0xFF32E6F0.toInt(), true)
+        val body = if (value.length > 10) value.replace(",", " ") else value
+        if (body.length <= 6) {
+            drawScaledText(graphics, body, x + 27, y + 10, valueColor, shortScale)
+        } else {
+            graphics.drawString(mc.font, Component.literal(body), x + 27, y + 11, valueColor, true)
+        }
+    }
+
+    private fun drawLootMetric(graphics: GuiGraphics, x: Int, y: Int, label: String, value: String, valueColor: Int, icon: String, shortScale: Float) {
+        drawCenteredText(graphics, icon, x, y + 2, 20, 0xFFFFD45A.toInt(), true)
+        graphics.drawString(mc.font, Component.literal(label), x + 22, y, 0xFFFFD45A.toInt(), true)
+        if (value.length <= 6) {
+            drawScaledText(graphics, value, x + 22, y + 12, valueColor, shortScale)
+        } else {
+            graphics.drawString(mc.font, Component.literal(value), x + 22, y + 13, valueColor, true)
+        }
+    }
+
+    private fun drawLootGem(graphics: GuiGraphics, centerX: Int, centerY: Int, color: Int) {
+        graphics.fill(centerX - 8, centerY - 2, centerX + 9, centerY + 3, 0x88604008.toInt())
+        graphics.fill(centerX - 5, centerY - 5, centerX + 6, centerY + 6, 0xCCB88725.toInt())
+        graphics.fill(centerX - 2, centerY - 2, centerX + 3, centerY + 3, color)
+    }
+
+    private fun drawDashedLine(graphics: GuiGraphics, left: Int, y: Int, right: Int, color: Int) {
+        var x = left
+        while (x < right) {
+            graphics.fill(x, y, (x + 4).coerceAtMost(right), y + 1, color)
+            x += 7
+        }
+    }
+
+    private fun drawCornerStuds(graphics: GuiGraphics, width: Int, height: Int, color: Int) {
+        listOf(6 to 6, width - 12 to 6, 6 to height - 12, width - 12 to height - 12).forEach { (x, y) ->
+            graphics.fill(x, y, x + 6, y + 6, 0xAA0A1A1F.toInt())
+            graphics.fill(x + 2, y + 2, x + 4, y + 4, color)
+        }
+    }
+
+    private fun drawCornerTabs(graphics: GuiGraphics, x: Int, y: Int, width: Int, height: Int, color: Int) {
+        graphics.fill(x, y, x + 12, y + 3, color)
+        graphics.fill(x, y, x + 3, y + 12, color)
+        graphics.fill(x + width - 12, y, x + width, y + 3, color)
+        graphics.fill(x + width - 3, y, x + width, y + 12, color)
+        graphics.fill(x, y + height - 3, x + 12, y + height, color)
+        graphics.fill(x, y + height - 12, x + 3, y + height, color)
+        graphics.fill(x + width - 12, y + height - 3, x + width, y + height, color)
+        graphics.fill(x + width - 3, y + height - 12, x + width, y + height, color)
+    }
+
+    private fun drawEdgeBrackets(graphics: GuiGraphics, width: Int, height: Int, color: Int) {
+        graphics.fill(width / 2 - 12, 0, width / 2 + 12, 3, color)
+        graphics.fill(width / 2 - 12, height - 3, width / 2 + 12, height, color)
+        graphics.fill(0, height / 2 - 12, 3, height / 2 + 12, color)
+        graphics.fill(width - 3, height / 2 - 12, width, height / 2 + 12, color)
+    }
+
+    private fun drawPixelSpark(graphics: GuiGraphics, centerX: Int, centerY: Int, color: Int) {
+        graphics.fill(centerX - 2, centerY - 10, centerX + 2, centerY + 10, color)
+        graphics.fill(centerX - 10, centerY - 2, centerX + 10, centerY + 2, color)
+        graphics.fill(centerX - 5, centerY - 5, centerX + 5, centerY + 5, 0xAA0FD6DE.toInt())
+        graphics.fill(centerX - 2, centerY - 2, centerX + 2, centerY + 2, 0xEEA6FFFF.toInt())
+    }
+
+    private fun drawSkull(graphics: GuiGraphics, x: Int, y: Int, color: Int) {
+        graphics.fill(x + 3, y, x + 15, y + 12, 0x88404A54.toInt())
+        graphics.fill(x + 1, y + 4, x + 17, y + 14, 0x88515C66.toInt())
+        graphics.fill(x + 5, y + 6, x + 8, y + 9, color)
+        graphics.fill(x + 11, y + 6, x + 14, y + 9, color)
+        graphics.fill(x + 7, y + 12, x + 12, y + 15, 0x88313A43.toInt())
+    }
+
+    private fun drawHeaderCrystal(graphics: GuiGraphics, centerX: Int, centerY: Int, color: Int) {
+        graphics.fill(centerX - 2, centerY - 10, centerX + 3, centerY + 10, 0xAA0FD6DE.toInt())
+        graphics.fill(centerX - 6, centerY - 5, centerX + 7, centerY + 5, 0x8826DDE8.toInt())
+        graphics.fill(centerX - 1, centerY - 6, centerX + 2, centerY + 6, color)
+        graphics.fill(centerX - 12, centerY, centerX - 7, centerY + 2, color)
+        graphics.fill(centerX + 7, centerY, centerX + 12, centerY + 2, color)
+    }
+
+    private fun drawBox(graphics: GuiGraphics, x: Int, y: Int, width: Int, height: Int, fill: Int, border: Int) {
+        graphics.fill(x, y, x + width, y + height, fill)
+        drawPixelBorder(graphics, x, y, x + width, y + height, fill, border)
+    }
+
+    private fun drawPanelBox(graphics: GuiGraphics, x: Int, y: Int, width: Int, height: Int, fill: Int, border: Int) {
+        drawBox(graphics, x, y, width, height, fill, border)
+        graphics.fill(x + 4, y + 4, x + width - 4, y + 6, 0x3326DDE8)
+        graphics.fill(x + 4, y + height - 6, x + width - 4, y + height - 4, 0x44000000)
+        graphics.fill(x + 4, y + 4, x + 6, y + height - 4, 0x22000000)
+        graphics.fill(x + width - 6, y + 4, x + width - 4, y + height - 4, 0x22000000)
+        drawCornerTabs(graphics, x, y, width, height, border)
+    }
+
+    private fun drawPixelBorder(graphics: GuiGraphics, left: Int, top: Int, right: Int, bottom: Int, fill: Int, border: Int) {
+        graphics.fill(left, top, right, top + 2, border)
+        graphics.fill(left, bottom - 2, right, bottom, border)
+        graphics.fill(left, top, left + 2, bottom, border)
+        graphics.fill(right - 2, top, right, bottom, border)
+        graphics.fill(left, top, left + 4, top + 4, fill)
+        graphics.fill(right - 4, top, right, top + 4, fill)
+        graphics.fill(left, bottom - 4, left + 4, bottom, fill)
+        graphics.fill(right - 4, bottom - 4, right, bottom, fill)
+    }
+
+    private fun drawCenteredText(graphics: GuiGraphics, text: String, x: Int, y: Int, width: Int, color: Int, shadow: Boolean) {
+        graphics.drawString(mc.font, Component.literal(text), x + (width - mc.font.width(text)) / 2, y, color, shadow)
+    }
+
+    private fun drawScaledText(graphics: GuiGraphics, text: String, x: Int, y: Int, color: Int, textScale: Float) {
+        graphics.pose().pushMatrix()
+        graphics.pose().translate(x.toFloat(), y.toFloat())
+        graphics.pose().scale(textScale, textScale)
+        graphics.drawString(mc.font, Component.literal(text), 0, 0, color, true)
+        graphics.pose().popMatrix()
+    }
+
+    private fun drawScaledCenteredText(graphics: GuiGraphics, text: String, x: Int, y: Int, width: Int, color: Int, textScale: Float) {
+        val scaledWidth = (mc.font.width(text) * textScale).roundToInt()
+        val drawX = x + ((width - scaledWidth) / 2).coerceAtLeast(0)
+        drawScaledText(graphics, text, drawX, y, color, textScale)
     }
 
     private fun logRenderState(message: String) {
@@ -2104,7 +2396,7 @@ class DungeonProgressHudFeature(
         return CATACOMBS_LEVEL_50_XP + (normalizedLevel - CATACOMBS_LINEAR_LEVEL_START) * CATACOMBS_POST_50_XP_PER_LEVEL
     }
 
-    private fun targetLevelValue(): Int = targetLevel.get().toIntOrNull()?.coerceAtLeast(1) ?: 50
+    private fun targetLevelValue(): Int = targetLevel.get().toIntOrNull()?.coerceAtLeast(1) ?: 51
 
     private fun currentCataLevel(xp: Long): Int {
         if (xp >= CATACOMBS_LEVEL_50_XP) {
@@ -2134,6 +2426,18 @@ class DungeonProgressHudFeature(
     private fun dailyMultiplierValue(): Double = dailyMultiplier.get().toDoubleOrNull()?.coerceAtLeast(1.0) ?: 1.4
 
     private fun Long.format(): String = "%,d".format(this)
+
+    private fun Long.compact(): String {
+        val sign = if (this < 0) "-" else ""
+        val abs = kotlin.math.abs(this)
+        val body = when {
+            abs >= 1_000_000_000L -> "%.2fb".format(Locale.US, abs / 1_000_000_000.0)
+            abs >= 1_000_000L -> "%.2fm".format(Locale.US, abs / 1_000_000.0)
+            abs >= 1_000L -> "%.1fk".format(Locale.US, abs / 1_000.0)
+            else -> abs.toString()
+        }
+        return "$sign$body"
+    }
 
     private fun Iterable<Int>.averageOrZero(): Double = if (none()) 0.0 else average()
 
@@ -2178,6 +2482,19 @@ class DungeonProgressHudFeature(
         var lastLogImportAt: Long = 0,
         var hudLineOrder: MutableList<String>? = DEFAULT_HUD_LINE_ORDER.toMutableList(),
     )
+
+    data class HudStyle(
+        val titleScale: Float = 2.34f,
+        val titleY: Int = 8,
+        val progressPercentScale: Float = 1.58f,
+        val metricShortScale: Float = 1.70f,
+        val lootShortScale: Float = 1.74f,
+    ) {
+        fun argb(rgb: Int, fallbackAlpha: Int): Int {
+            val alpha = fallbackAlpha.coerceIn(0, 255)
+            return (alpha shl 24) or (rgb and 0x00FFFFFF)
+        }
+    }
 
     data class RunSample(
         var timestamp: Long = 0,
