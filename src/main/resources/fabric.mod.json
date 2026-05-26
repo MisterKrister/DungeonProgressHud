@@ -6,6 +6,7 @@
   "description": "Catacombs progress and runs-left HUD for SkyBlock.",
   "authors": ["krister"],
   "license": "MIT",
+  "icon": "assets/dungeonprogresshud/icon.png",
   "environment": "client",
   "entrypoints": {
     "client": [

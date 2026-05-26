@@ -16,16 +16,20 @@ import com.google.gson.GsonBuilder
 import com.google.gson.JsonParser
 import com.mojang.brigadier.arguments.StringArgumentType
 import net.fabricmc.api.ClientModInitializer
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager.argument
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager.literal
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback
 import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper
+import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents
 import net.fabricmc.loader.api.FabricLoader
 import net.minecraft.client.KeyMapping
 import net.minecraft.client.Minecraft
 import net.minecraft.client.gui.GuiGraphics
+import net.minecraft.client.gui.screens.Screen
 import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen
 import net.minecraft.client.input.KeyEvent
+import net.minecraft.client.input.MouseButtonEvent
 import net.minecraft.network.chat.MessageSignature
 import net.minecraft.network.chat.Component
 import net.minecraft.resources.Identifier
@@ -61,10 +65,51 @@ object DungeonProgressHudAddon : ClientModInitializer {
     private var feature: DungeonProgressHudFeature? = null
     private var renderHookSeen = false
     private var lastMissingFeatureLog = 0L
+    private var pendingServerJoinAt = 0L
+    private var lastTickDetectedServerKey = ""
 
     override fun onInitializeClient() {
         debug("Client entrypoint initializing")
         registerCommands()
+        ClientPlayConnectionEvents.JOIN.register { _, _, client ->
+            client.execute {
+                val current = feature
+                if (current != null) {
+                    current.onServerJoin()
+                } else {
+                    pendingServerJoinAt = System.currentTimeMillis()
+                    debug("Server join queued until feature registration")
+                }
+            }
+        }
+        ClientPlayConnectionEvents.DISCONNECT.register { _, client ->
+            client.execute {
+                pendingServerJoinAt = 0L
+                lastTickDetectedServerKey = ""
+                feature?.onServerDisconnect()
+            }
+        }
+        ClientTickEvents.END_CLIENT_TICK.register { client ->
+            val serverKey = detectedServerKey(client)
+            if (serverKey != lastTickDetectedServerKey) {
+                lastTickDetectedServerKey = serverKey
+                if (serverKey.isNotBlank()) {
+                    val current = feature
+                    if (current != null) {
+                        current.onServerJoin()
+                    } else {
+                        pendingServerJoinAt = System.currentTimeMillis()
+                        debug("Tick detected server join queued until feature registration server=$serverKey")
+                    }
+                }
+            }
+            feature?.onFabricClientTick()
+        }
+    }
+
+    private fun detectedServerKey(client: Minecraft): String {
+        if (client.player == null || client.connection == null) return ""
+        return client.currentServer?.ip ?: client.level?.dimension()?.toString().orEmpty()
     }
 
     fun registerWithDevonian() {
@@ -76,6 +121,10 @@ object DungeonProgressHudAddon : ClientModInitializer {
         val created = DungeonProgressHudFeature(category, subcategory)
         feature = created
         Devonian.addFeatureInstance(created)
+        if (pendingServerJoinAt > 0L) {
+            created.onServerJoin(pendingServerJoinAt)
+            pendingServerJoinAt = 0L
+        }
         registered = true
         debug("Devonian feature registration complete")
     }
@@ -97,9 +146,24 @@ object DungeonProgressHudAddon : ClientModInitializer {
         current.renderHud(graphics)
     }
 
+    fun renderScreenOverlay(graphics: GuiGraphics, screen: Screen, mouseX: Int, mouseY: Int) {
+        if (screen is AbstractContainerScreen<*>) {
+            feature?.renderHudOrderOverlay(graphics, mouseX.toDouble(), mouseY.toDouble())
+        }
+    }
+
     fun onInventoryClick(slotId: Int, button: Int, clickType: ClickType) {
         feature?.onInventoryClick(slotId, button, clickType)
     }
+
+    fun onHudOrderMouseClicked(screen: AbstractContainerScreen<*>, event: MouseButtonEvent, shiftDown: Boolean): Boolean =
+        feature?.onHudOrderMouseClicked(screen, event, shiftDown) ?: false
+
+    fun onHudOrderMouseDragged(screen: AbstractContainerScreen<*>, event: MouseButtonEvent, dragX: Double, dragY: Double): Boolean =
+        feature?.onHudOrderMouseDragged(screen, event, dragX, dragY) ?: false
+
+    fun onHudOrderMouseReleased(screen: AbstractContainerScreen<*>, event: MouseButtonEvent): Boolean =
+        feature?.onHudOrderMouseReleased(screen, event) ?: false
 
     fun onFakeOpenKey(screen: AbstractContainerScreen<*>): Boolean = feature?.onFakeOpenKey(screen) ?: false
 
@@ -178,6 +242,12 @@ object DungeonProgressHudAddon : ClientModInitializer {
                         withFeature { it.fakeOpenCurrentScreen() }
                         1
                     })
+                    .then(literal("order")
+                        .then(literal("reset").executes {
+                            withFeature { it.resetHudLineOrder() }
+                            1
+                        })
+                    )
             )
         }
     }
@@ -237,6 +307,28 @@ class DungeonProgressHudFeature(
         private val API_KEY_CONFIG_NAMES = listOf(API_KEY_CONFIG, LEGACY_API_KEY_CONFIG)
         private const val DAY_MILLIS = 86_400_000L
         private const val AUTO_REFRESH_INTERVAL_MILLIS = 300_000L
+        private const val HUD_LINE_GAP = 2
+        private const val HUD_ORDER_HINT = "&eHold Shift to drag HUD lines"
+        private const val STATUS_LINE_ID = "status"
+        private const val JOIN_SKYBLOCK_DETECTION_TIMEOUT_MILLIS = 300_000L
+        private val JOIN_REFRESH_RETRY_DELAYS = longArrayOf(10_000L, 30_000L, 90_000L, 180_000L)
+        private val DEFAULT_HUD_LINE_ORDER = listOf(
+            "currentLevel",
+            "levelProgress",
+            "target",
+            "runsLeft",
+            "currentXp",
+            "remaining",
+            "floor",
+            "xpPerRun",
+            "profile",
+            "lastRun",
+            "observedCount",
+            "profit",
+            "chestsOpened",
+            "lastChest",
+            "avgChest",
+        )
     }
 
     private val PREFIX = "&6[&bDPH&6]&r "
@@ -297,6 +389,13 @@ class DungeonProgressHudFeature(
     private var refreshing = false
     private var lastRefresh = 0L
     private var lastAutoRefreshAttempt = 0L
+    private var joinRefreshStartedAt = 0L
+    private var joinRefreshAttempts = 0
+    private var nextJoinRefreshAttemptAt = 0L
+    private var joinRefreshCompleted = false
+    private var lastServerJoinEventAt = 0L
+    private var skyBlockJoinRefreshAttempted = false
+    private var skyBlockJoinRefreshCompleted = false
     private var wasVisible = false
     private var startupRefreshAttempted = false
     private var runtimeStarted = false
@@ -323,11 +422,39 @@ class DungeonProgressHudFeature(
     private var sessionChestProfit = 0L
     private var sessionChestsOpened = 0
     private val sessionStartedAt = System.currentTimeMillis()
+    private var draggedHudLineId: String? = null
+    private var hoveredHudLineId: String? = null
 
     init {
         Config.onAfterLoad {
             migrateLegacyApiKey()
         }
+    }
+
+    fun onServerJoin(joinedAt: Long = System.currentTimeMillis()) {
+        startRuntime("server join")
+        if (joinedAt - lastServerJoinEventAt < 5_000L && (joinRefreshStartedAt > 0L || refreshing || joinRefreshAttempts > 0 || lastRefresh >= joinRefreshStartedAt)) {
+            log("Server join refresh ignored duplicate event")
+            return
+        }
+        lastServerJoinEventAt = joinedAt
+        joinRefreshStartedAt = joinedAt
+        joinRefreshAttempts = 0
+        nextJoinRefreshAttemptAt = 0L
+        joinRefreshCompleted = false
+        skyBlockJoinRefreshAttempted = false
+        skyBlockJoinRefreshCompleted = false
+        startupRefreshAttempted = true
+        log("Server join refresh scheduled user=${mc.user.name} uuid=${mc.user.profileId}")
+    }
+
+    fun onServerDisconnect() {
+        joinRefreshStartedAt = 0L
+        joinRefreshAttempts = 0
+        nextJoinRefreshAttemptAt = 0L
+        joinRefreshCompleted = false
+        skyBlockJoinRefreshAttempted = false
+        skyBlockJoinRefreshCompleted = false
     }
 
     private fun addDivider(sortKey: String, label: String): ConfigData.Switch =
@@ -384,6 +511,11 @@ class DungeonProgressHudFeature(
         }
     }
 
+    fun onFabricClientTick() {
+        startRuntime("fabric client tick")
+        clientTick()
+    }
+
     private fun startRuntime(reason: String) {
         if (runtimeStarted) return
         runtimeStarted = true
@@ -393,7 +525,9 @@ class DungeonProgressHudFeature(
     }
 
     private fun clientTick() {
-        if (!startupRefreshAttempted && sessionReady()) {
+        val refreshedForSkyBlockJoin = maybeRefreshAfterSkyBlockJoin()
+        val refreshedForJoin = maybeRefreshAfterServerJoin()
+        if (!startupRefreshAttempted && sessionReady() && !refreshedForJoin) {
             startupRefreshAttempted = true
             lastAutoRefreshAttempt = System.currentTimeMillis()
             log("Startup refresh triggered for user=${mc.user.name} uuid=${mc.user.profileId}")
@@ -412,6 +546,57 @@ class DungeonProgressHudFeature(
         setLines(buildLines())
     }
 
+    private fun maybeRefreshAfterSkyBlockJoin(): Boolean {
+        if (joinRefreshStartedAt == 0L || skyBlockJoinRefreshCompleted) return false
+        if (!sessionReady()) return false
+
+        val now = System.currentTimeMillis()
+        if (now - joinRefreshStartedAt > JOIN_SKYBLOCK_DETECTION_TIMEOUT_MILLIS) {
+            skyBlockJoinRefreshCompleted = true
+            log("SkyBlock join refresh timed out waiting for scoreboard")
+            return false
+        }
+        if (!isSkyBlockArea()) return false
+
+        if (data != null && lastRefresh >= joinRefreshStartedAt) {
+            skyBlockJoinRefreshCompleted = true
+            log("SkyBlock detected after server join; API already refreshed")
+            return false
+        }
+        if (refreshing) return true
+        if (skyBlockJoinRefreshAttempted) return false
+
+        skyBlockJoinRefreshAttempted = true
+        startupRefreshAttempted = true
+        lastAutoRefreshAttempt = now
+        log("SkyBlock detected after server join; forcing silent API refresh server=${mc.currentServer?.ip ?: "unknown"}")
+        refresh(force = true, recordObservedSample = false, notify = false)
+        return true
+    }
+
+    private fun maybeRefreshAfterServerJoin(): Boolean {
+        if (joinRefreshStartedAt == 0L) return false
+        val now = System.currentTimeMillis()
+        if (data != null && lastRefresh >= joinRefreshStartedAt) {
+            joinRefreshCompleted = true
+        }
+        if (joinRefreshCompleted || !sessionReady()) return false
+        if (refreshing) return true
+        if (joinRefreshAttempts >= 1 && now < nextJoinRefreshAttemptAt) return true
+        if (joinRefreshAttempts >= JOIN_REFRESH_RETRY_DELAYS.size + 1) {
+            log("Join refresh gave up after $joinRefreshAttempts attempts status=$status")
+            return false
+        }
+
+        joinRefreshAttempts++
+        nextJoinRefreshAttemptAt = now + JOIN_REFRESH_RETRY_DELAYS.getOrElse(joinRefreshAttempts - 1) { JOIN_REFRESH_RETRY_DELAYS.last() }
+        startupRefreshAttempted = true
+        lastAutoRefreshAttempt = now
+        log("Server join refresh attempt=$joinRefreshAttempts server=${mc.currentServer?.ip ?: "unknown"} user=${mc.user.name} uuid=${mc.user.profileId} lastRefresh=$lastRefresh joinStarted=$joinRefreshStartedAt")
+        refresh(force = true, recordObservedSample = false, notify = false)
+        return true
+    }
+
     private fun maybeAutoRefresh() {
         val now = System.currentTimeMillis()
         if (now - lastAutoRefreshAttempt < AUTO_REFRESH_INTERVAL_MILLIS) return
@@ -424,6 +609,9 @@ class DungeonProgressHudFeature(
         startRuntime("gui render")
 
         val enabled = isEnabled()
+        if (mc.screen is AbstractContainerScreen<*>) {
+            return
+        }
         val visible = shouldRenderCached()
         if (!renderHud.get() || !visible) {
             logRenderState("Render blocked renderHud=${renderHud.get()} enabled=$enabled shouldRender=$visible showEverywhere=${showEverywhere.get()}")
@@ -539,6 +727,15 @@ class DungeonProgressHudFeature(
         saveState()
         log("Observed run samples reset")
         send("Observed runs reset.")
+    }
+
+    fun resetHudLineOrder() {
+        state.hudLineOrder = DEFAULT_HUD_LINE_ORDER.toMutableList()
+        draggedHudLineId = null
+        hoveredHudLineId = null
+        saveState()
+        log("HUD line order reset")
+        send("HUD line order reset.")
     }
 
     fun setProfitMode(mode: String) {
@@ -699,8 +896,24 @@ class DungeonProgressHudFeature(
         log("Selected Croesus chest from click title=${screen.title.string} slot=$slotId ${candidate.summary()}")
     }
 
-    private fun buildLines(): List<String> {
-        val profile = data ?: return listOf("&bDungeon Progress: &7$status")
+    private data class HudLine(
+        val id: String,
+        val text: String,
+    )
+
+    private data class HudLineBounds(
+        val id: String,
+        val text: String,
+        val left: Double,
+        val top: Double,
+        val right: Double,
+        val bottom: Double,
+    )
+
+    private fun buildLines(): List<String> = orderedHudLines(buildHudLines()).map { it.text }
+
+    private fun buildHudLines(): List<HudLine> {
+        val profile = data ?: return listOf(HudLine(STATUS_LINE_ID, "&bDungeon Progress: &7$status"))
         val xpPerRun = effectiveXpPerRun()
         val remaining = xpRemaining(profile.catacombsExperience, targetLevelValue())
         val runs = xpPerRun.takeIf { it > 0 }?.let { ceil(remaining.toDouble() / it.toDouble()).toLong() }
@@ -710,25 +923,182 @@ class DungeonProgressHudFeature(
         val currentLevel = currentCataLevel(profile.catacombsExperience)
 
         return buildList {
-            if (showCurrentLevel.get()) add("&bCata Level: &fC$currentLevel")
-            if (showLevelProgress.get()) add("&bNext Level: &f${levelProgressPercent(profile.catacombsExperience)}%")
-            if (showTarget.get()) add("&bTarget: &fC${targetLevelValue()}")
-            if (showRunsLeft.get()) add("&bRuns Left: &a${runs?.format() ?: "N/A"}")
-            if (showCurrentXp.get()) add("&bCata XP: &f${profile.catacombsExperience.format()}")
-            if (showRemaining.get()) add("&bRemaining: &f${remaining.format()}")
-            if (showFloor.get()) add("&bFloor: &f${floorValue()}")
-            if (showXpPerRun.get()) add("&bXP/Run: &f${xpPerRun.format()} &7($source)")
-            if (showProfile.get()) add("&bProfile: &f${profile.profileName}")
-            if (showLastRun.get()) add("&bLast Run: &f${last?.normalizedXpDelta?.format() ?: "N/A"}")
-            if (showObservedCount.get()) add("&bObserved Runs: &f${samples.size}")
+            if (showCurrentLevel.get()) add(HudLine("currentLevel", "&bCata Level: &fC$currentLevel"))
+            if (showLevelProgress.get()) add(HudLine("levelProgress", "&bNext Level: &f${levelProgressPercent(profile.catacombsExperience)}%"))
+            if (showTarget.get()) add(HudLine("target", "&bTarget: &fC${targetLevelValue()}"))
+            if (showRunsLeft.get()) add(HudLine("runsLeft", "&bRuns Left: &a${runs?.format() ?: "N/A"}"))
+            if (showCurrentXp.get()) add(HudLine("currentXp", "&bCata XP: &f${profile.catacombsExperience.format()}"))
+            if (showRemaining.get()) add(HudLine("remaining", "&bRemaining: &f${remaining.format()}"))
+            if (showFloor.get()) add(HudLine("floor", "&bFloor: &f${floorValue()}"))
+            if (showXpPerRun.get()) add(HudLine("xpPerRun", "&bXP/Run: &f${xpPerRun.format()} &7($source)"))
+            if (showProfile.get()) add(HudLine("profile", "&bProfile: &f${profile.profileName}"))
+            if (showLastRun.get()) add(HudLine("lastRun", "&bLast Run: &f${last?.normalizedXpDelta?.format() ?: "N/A"}"))
+            if (showObservedCount.get()) add(HudLine("observedCount", "&bObserved Runs: &f${samples.size}"))
             if (showChestProfit.get()) {
                 val stats = chestProfitStats()
-                add("&bProfit: &a${stats.profit.formatCoins()} &7(${stats.label})")
-                if (showChestCount.get()) add("&bChests Opened: &f${stats.chests}")
-                if (showLastChest.get()) add("&bLast Chest: &f${state.lastChestName.ifBlank { "N/A" }} &a${state.lastChestProfit.formatCoins()}")
-                add("&bAvg Chest: &a${stats.average.formatCoins()}")
+                add(HudLine("profit", "&bProfit: &a${stats.profit.formatCoins()} &7(${stats.label})"))
+                if (showChestCount.get()) add(HudLine("chestsOpened", "&bChests Opened: &f${stats.chests}"))
+                if (showLastChest.get()) add(HudLine("lastChest", "&bLast Chest: &f${state.lastChestName.ifBlank { "N/A" }} &a${state.lastChestProfit.formatCoins()}"))
+                add(HudLine("avgChest", "&bAvg Chest: &a${stats.average.formatCoins()}"))
             }
         }
+    }
+
+    private fun orderedHudLines(lines: List<HudLine>): List<HudLine> {
+        if (lines.isEmpty()) return lines
+        val byId = lines.associateBy { it.id }
+        val orderedIds = normalizedHudLineOrder() + lines.map { it.id }.filter { it !in DEFAULT_HUD_LINE_ORDER }
+        return orderedIds.mapNotNull { byId[it] }
+    }
+
+    private fun normalizedHudLineOrder(): List<String> {
+        val normalized = state.hudLineOrder.orEmpty()
+            .filter { it in DEFAULT_HUD_LINE_ORDER }
+            .distinct()
+            .toMutableList()
+        DEFAULT_HUD_LINE_ORDER.filterTo(normalized) { it !in normalized }
+        return normalized
+    }
+
+    fun renderHudOrderOverlay(graphics: GuiGraphics, mouseX: Double, mouseY: Double) {
+        val dragging = draggedHudLineId != null
+        val lines = editableHudLines()
+        if (lines.isEmpty()) return
+
+        val shiftDown = isShiftDown()
+        val hoverId = if (shiftDown || dragging) hudLineAt(mouseX, mouseY, lines)?.id else null
+        if (dragging) hoveredHudLineId = hoverId
+        drawHudOrderOverlay(graphics, lines, hoverId)
+    }
+
+    fun onHudOrderMouseClicked(screen: AbstractContainerScreen<*>, event: MouseButtonEvent, shiftDown: Boolean): Boolean {
+        if (!shiftDown || event.button() != GLFW.GLFW_MOUSE_BUTTON_LEFT) return false
+        val hit = hudLineAt(event.x(), event.y(), editableHudLines()) ?: return false
+        draggedHudLineId = hit.id
+        hoveredHudLineId = hit.id
+        return true
+    }
+
+    fun onHudOrderMouseDragged(screen: AbstractContainerScreen<*>, event: MouseButtonEvent, dragX: Double, dragY: Double): Boolean {
+        if (draggedHudLineId == null) return false
+        hoveredHudLineId = hudLineAt(event.x(), event.y(), editableHudLines())?.id
+        return true
+    }
+
+    fun onHudOrderMouseReleased(screen: AbstractContainerScreen<*>, event: MouseButtonEvent): Boolean {
+        val draggedId = draggedHudLineId ?: return false
+        val targetId = hudLineAt(event.x(), event.y(), editableHudLines())?.id ?: hoveredHudLineId
+        draggedHudLineId = null
+        hoveredHudLineId = null
+
+        if (targetId != null && targetId != draggedId && moveHudLine(draggedId, targetId)) {
+            log("HUD line order changed dragged=$draggedId target=$targetId order=${normalizedHudLineOrder().joinToString(",")}")
+        }
+        return true
+    }
+
+    private fun editableHudLines(): List<HudLine> {
+        if (!renderHud.get() || !isEnabled()) return emptyList()
+        val lines = buildHudLines()
+            .filter { it.id in DEFAULT_HUD_LINE_ORDER }
+            .ifEmpty { buildEditPreviewHudLines() }
+        return orderedHudLines(lines)
+    }
+
+    private fun buildEditPreviewHudLines(): List<HudLine> = buildList {
+        if (showCurrentLevel.get()) add(HudLine("currentLevel", "&bCata Level: &fC49"))
+        if (showLevelProgress.get()) add(HudLine("levelProgress", "&bNext Level: &f73.4%"))
+        if (showTarget.get()) add(HudLine("target", "&bTarget: &fC50"))
+        if (showRunsLeft.get()) add(HudLine("runsLeft", "&bRuns Left: &a259"))
+        if (showCurrentXp.get()) add(HudLine("currentXp", "&bCata XP: &f453,559,640"))
+        if (showRemaining.get()) add(HudLine("remaining", "&bRemaining: &f116,250,000"))
+        if (showFloor.get()) add(HudLine("floor", "&bFloor: &fM7"))
+        if (showXpPerRun.get()) add(HudLine("xpPerRun", "&bXP/Run: &f450,000 &7(fallback)"))
+        if (showProfile.get()) add(HudLine("profile", "&bProfile: &fSelected"))
+        if (showLastRun.get()) add(HudLine("lastRun", "&bLast Run: &f450,000"))
+        if (showObservedCount.get()) add(HudLine("observedCount", "&bObserved Runs: &f12"))
+        if (showChestProfit.get()) {
+            add(HudLine("profit", "&bProfit: &a12.3M coins &7(session)"))
+            if (showChestCount.get()) add(HudLine("chestsOpened", "&bChests Opened: &f8"))
+            if (showLastChest.get()) add(HudLine("lastChest", "&bLast Chest: &fObsidian &a1.2M coins"))
+            add(HudLine("avgChest", "&bAvg Chest: &a1.5M coins"))
+        }
+    }
+
+    private fun hudLineAt(mouseX: Double, mouseY: Double, lines: List<HudLine>): HudLineBounds? =
+        hudLineBounds(lines).firstOrNull { mouseX >= it.left && mouseX <= it.right && mouseY >= it.top && mouseY <= it.bottom }
+
+    private fun hudLineBounds(lines: List<HudLine>): List<HudLineBounds> {
+        if (lines.isEmpty()) return emptyList()
+        val drawX = if (x.isFinite()) x else 10.0
+        val drawY = if (y.isFinite()) y else 10.0
+        val renderScale = scale.takeIf { it.isFinite() && it > 0f } ?: 1f
+        val lineHeight = mc.font.lineHeight + HUD_LINE_GAP
+        val width = lines.maxOfOrNull { mc.font.width(it.text.colorize()) } ?: 90
+        val left = drawX - 2.0 * renderScale
+        val right = drawX + (width + 4.0) * renderScale
+
+        return lines.mapIndexed { index, line ->
+            val top = drawY + (index * lineHeight - 2.0) * renderScale
+            val bottom = drawY + ((index + 1) * lineHeight).toDouble() * renderScale
+            HudLineBounds(line.id, line.text, left, top, right, bottom)
+        }
+    }
+
+    private fun drawHudOrderOverlay(graphics: GuiGraphics, lines: List<HudLine>, hoverId: String?) {
+        val drawX = if (x.isFinite()) x.toFloat() else 10f
+        val drawY = if (y.isFinite()) y.toFloat() else 10f
+        val renderScale = scale.takeIf { it.isFinite() && it > 0f } ?: 1f
+        val hintY = (drawY - (mc.font.lineHeight + HUD_LINE_GAP + 2) * renderScale).coerceAtLeast(2f)
+        graphics.drawString(mc.font, Component.literal(HUD_ORDER_HINT.colorize()), drawX.toInt(), hintY.toInt(), 0xFFFFFFFF.toInt(), true)
+
+        graphics.pose().pushMatrix()
+        graphics.pose().translate(drawX, drawY)
+        graphics.pose().scale(renderScale, renderScale)
+
+        val width = lines.maxOfOrNull { mc.font.width(it.text.colorize()) } ?: 90
+        val hintWidth = mc.font.width(HUD_ORDER_HINT.colorize())
+        val overlayWidth = width.coerceAtLeast(hintWidth)
+        val lineHeight = mc.font.lineHeight + HUD_LINE_GAP
+
+        val draggedId = draggedHudLineId
+        val targetId = if (draggedId != null) hoveredHudLineId ?: hoverId else hoverId
+        var yOffset = 0
+        for (line in lines) {
+            val highlight = when {
+                line.id == draggedId -> 0x663399FF
+                draggedId != null && line.id == targetId -> 0x6644CC66
+                draggedId == null && line.id == hoverId -> 0x33FFFFFF
+                else -> null
+            }
+            if (highlight != null) {
+                graphics.fill(-1, yOffset - 1, overlayWidth + 3, yOffset + mc.font.lineHeight + 1, highlight)
+            }
+            graphics.drawString(mc.font, Component.literal(line.text.colorize()), 0, yOffset, 0xFFFFFFFF.toInt(), true)
+            yOffset += lineHeight
+        }
+
+        graphics.pose().popMatrix()
+    }
+
+    private fun moveHudLine(draggedId: String, targetId: String): Boolean {
+        if (draggedId !in DEFAULT_HUD_LINE_ORDER || targetId !in DEFAULT_HUD_LINE_ORDER) return false
+        val order = normalizedHudLineOrder().toMutableList()
+        val targetIndex = order.indexOf(targetId)
+        if (targetIndex < 0) return false
+        if (!order.remove(draggedId)) return false
+        order.add(targetIndex.coerceAtMost(order.size), draggedId)
+        if (order == state.hudLineOrder) return false
+        state.hudLineOrder = order
+        saveState()
+        setLines(buildLines())
+        return true
+    }
+
+    private fun isShiftDown(): Boolean {
+        val handle = mc.window.handle()
+        return GLFW.glfwGetKey(handle, GLFW.GLFW_KEY_LEFT_SHIFT) == GLFW.GLFW_PRESS ||
+            GLFW.glfwGetKey(handle, GLFW.GLFW_KEY_RIGHT_SHIFT) == GLFW.GLFW_PRESS
     }
 
     private fun scanCurrentChestScreen() {
@@ -1127,7 +1497,7 @@ class DungeonProgressHudFeature(
 
     private fun fetchProfile(): ProfileData {
         val user = mc.user
-        val uuid = user.profileId?.toString()?.replace("-", "") ?: error("Session UUID unavailable")
+        val uuid = user.profileId.toString().replace("-", "")
         val encodedUuid = URLEncoder.encode(uuid, StandardCharsets.UTF_8)
         log("Fetching Hypixel profile user=${user.name} uuid=$uuid")
         val connection = URI("https://api.hypixel.net/v2/skyblock/profiles?uuid=$encodedUuid").toURL().openConnection() as HttpURLConnection
@@ -1658,6 +2028,15 @@ class DungeonProgressHudFeature(
         return text.contains("dungeon hub") || text.contains("the catacombs") || text.contains("catacombs")
     }
 
+    private fun isSkyBlockArea(): Boolean {
+        val area = (Location.area ?: "").lowercase(Locale.ROOT)
+        val subarea = (Location.subarea ?: "").lowercase(Locale.ROOT)
+        if (area.contains("skyblock") || subarea.contains("skyblock")) return true
+
+        val text = getScoreboardText().lowercase(Locale.ROOT)
+        return text.contains("skyblock") || text.contains("skyblock xp") || text.contains("purse:")
+    }
+
     private fun getScoreboardText(): String {
         val scoreboard = mc.level?.scoreboard ?: return ""
         val objective = scoreboard.getDisplayObjective(DisplaySlot.SIDEBAR) ?: return ""
@@ -1703,6 +2082,7 @@ class DungeonProgressHudFeature(
             state.totalChestsOpened = state.chestProfits.size
             state.totalChestProfit = state.chestProfits.sumOf { it.profit }
         }
+        state.hudLineOrder = normalizedHudLineOrder().toMutableList()
         saveState()
     }
 
@@ -1711,7 +2091,7 @@ class DungeonProgressHudFeature(
         stateFile.writer().use { gson.toJson(state, it) }
     }
 
-    private fun sessionReady(): Boolean = mc.user.name.isNotBlank() && mc.user.profileId != null
+    private fun sessionReady(): Boolean = mc.user.name.isNotBlank()
 
     private fun xpRemaining(currentXp: Long, targetLevel: Int): Long = (targetXp(targetLevel) - currentXp).coerceAtLeast(0)
 
@@ -1796,6 +2176,7 @@ class DungeonProgressHudFeature(
         var totalChestsOpened: Int = 0,
         var chestProfitWindowMillis: Long = 0,
         var lastLogImportAt: Long = 0,
+        var hudLineOrder: MutableList<String>? = DEFAULT_HUD_LINE_ORDER.toMutableList(),
     )
 
     data class RunSample(
