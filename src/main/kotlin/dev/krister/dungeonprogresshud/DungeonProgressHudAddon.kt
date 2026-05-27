@@ -54,6 +54,7 @@ import java.util.Locale
 import java.util.zip.GZIPInputStream
 import kotlin.concurrent.thread
 import kotlin.math.ceil
+import kotlin.math.max
 import kotlin.math.roundToInt
 import kotlin.math.roundToLong
 
@@ -308,14 +309,20 @@ class DungeonProgressHudFeature(
         private const val DAY_MILLIS = 86_400_000L
         private const val AUTO_REFRESH_INTERVAL_MILLIS = 300_000L
         private const val HUD_LINE_GAP = 2
+        private const val HUD_ROW_HEIGHT = 15
+        private const val HUD_TITLE_HEIGHT = 28
+        private const val HUD_TOP_PADDING = 10
+        private const val HUD_SIDE_PADDING = 13
+        private const val HUD_PROFIT_GAP = 10
         private const val HUD_ORDER_HINT = "&eHold Shift to drag HUD lines"
         private const val STATUS_LINE_ID = "status"
         private const val JOIN_SKYBLOCK_DETECTION_TIMEOUT_MILLIS = 300_000L
         private val JOIN_REFRESH_RETRY_DELAYS = longArrayOf(10_000L, 30_000L, 90_000L, 180_000L)
         private val DEFAULT_HUD_LINE_ORDER = listOf(
+            "sessionTime",
             "currentLevel",
-            "levelProgress",
             "target",
+            "levelProgress",
             "runsLeft",
             "currentXp",
             "remaining",
@@ -325,10 +332,25 @@ class DungeonProgressHudFeature(
             "lastRun",
             "observedCount",
             "profit",
-            "chestsOpened",
-            "lastChest",
             "avgChest",
+            "chestsOpened",
+            "croesus",
+            "lastChest",
         )
+        private val PROFIT_HUD_LINE_IDS = setOf("profit", "avgChest", "chestsOpened", "croesus", "lastChest")
+        private val ACCENT_VALUE_HUD_LINE_IDS = setOf("runsLeft", "profit", "lastChest", "avgChest")
+        private const val HUD_CYAN = 0xFF42F3FF.toInt()
+        private const val HUD_CYAN_DIM = 0xFF147B84.toInt()
+        private const val HUD_GREEN = 0xFF63FF57.toInt()
+        private const val HUD_WHITE = 0xFFFFFFFF.toInt()
+        private const val HUD_MUTED = 0xFFC8C8C8.toInt()
+        private const val HUD_LINE = 0x663DFAFF
+        private const val HUD_BLACK = 0xFF000000.toInt()
+        private const val HUD_OUTER_DARK = 0xFF061014.toInt()
+        private const val HUD_INNER_DARK = 0xFF020405.toInt()
+        private const val HUD_PANEL = 0xD00A0F11.toInt()
+        private const val HUD_PROFIT_PANEL = 0x88101010.toInt()
+        private const val HUD_SKETCH_WHITE = 0xFFE8E8E8.toInt()
     }
 
     private val PREFIX = "&6[&bDPH&6]&r "
@@ -421,7 +443,7 @@ class DungeonProgressHudFeature(
     private var pendingCompletionGrade = ""
     private var sessionChestProfit = 0L
     private var sessionChestsOpened = 0
-    private val sessionStartedAt = System.currentTimeMillis()
+    private var sessionStartedAt = 0L
     private var draggedHudLineId: String? = null
     private var hoveredHudLineId: String? = null
 
@@ -618,16 +640,16 @@ class DungeonProgressHudFeature(
             return
         }
 
-        val lines = buildLines()
-        if (lines.isEmpty()) {
+        val hudLines = orderedHudLines(buildHudLines())
+        if (hudLines.isEmpty()) {
             logRenderState("Render blocked: no lines")
             return
         }
 
-        drawDirect(graphics, lines)
+        drawDirect(graphics, hudLines)
         if (!renderedOnce) {
             renderedOnce = true
-            log("HUD rendered lines=${lines.size} x=$x y=$y scale=$scale status=$status")
+            log("HUD rendered lines=${hudLines.size} x=$x y=$y scale=$scale status=$status")
         }
     }
 
@@ -901,6 +923,22 @@ class DungeonProgressHudFeature(
         val text: String,
     )
 
+    private data class HudRow(
+        val id: String,
+        val label: String,
+        val value: String,
+        val icon: ItemStack,
+        val accentValue: Boolean,
+        val mutedSuffix: String = "",
+    )
+
+    private data class ProfitHudRow(
+        val id: String,
+        val label: String,
+        val value: String,
+        val suffix: String = "",
+    )
+
     private data class HudLineBounds(
         val id: String,
         val text: String,
@@ -933,11 +971,11 @@ class DungeonProgressHudFeature(
             if (showXpPerRun.get()) add(HudLine("xpPerRun", "&bXP/Run: &f${xpPerRun.format()} &7($source)"))
             if (showProfile.get()) add(HudLine("profile", "&bProfile: &f${profile.profileName}"))
             if (showLastRun.get()) add(HudLine("lastRun", "&bLast Run: &f${last?.normalizedXpDelta?.format() ?: "N/A"}"))
-            if (showObservedCount.get()) add(HudLine("observedCount", "&bObserved Runs: &f${samples.size}"))
+            if (showObservedCount.get()) add(HudLine("observedCount", "&bRuns: &f${samples.size}"))
             if (showChestProfit.get()) {
                 val stats = chestProfitStats()
                 add(HudLine("profit", "&bProfit: &a${stats.profit.formatCoins()} &7(${stats.label})"))
-                if (showChestCount.get()) add(HudLine("chestsOpened", "&bChests Opened: &f${stats.chests}"))
+                if (showChestCount.get()) add(HudLine("chestsOpened", "&bChest: &f${stats.chests}"))
                 if (showLastChest.get()) add(HudLine("lastChest", "&bLast Chest: &f${state.lastChestName.ifBlank { "N/A" }} &a${state.lastChestProfit.formatCoins()}"))
                 add(HudLine("avgChest", "&bAvg Chest: &a${stats.average.formatCoins()}"))
             }
@@ -999,10 +1037,7 @@ class DungeonProgressHudFeature(
 
     private fun editableHudLines(): List<HudLine> {
         if (!renderHud.get() || !isEnabled()) return emptyList()
-        val lines = buildHudLines()
-            .filter { it.id in DEFAULT_HUD_LINE_ORDER }
-            .ifEmpty { buildEditPreviewHudLines() }
-        return orderedHudLines(lines)
+        return (buildProfitHudTopRows() + buildProfitHudBottomRows()).map { HudLine(it.id, it.label) }
     }
 
     private fun buildEditPreviewHudLines(): List<HudLine> = buildList {
@@ -1016,10 +1051,10 @@ class DungeonProgressHudFeature(
         if (showXpPerRun.get()) add(HudLine("xpPerRun", "&bXP/Run: &f450,000 &7(fallback)"))
         if (showProfile.get()) add(HudLine("profile", "&bProfile: &fSelected"))
         if (showLastRun.get()) add(HudLine("lastRun", "&bLast Run: &f450,000"))
-        if (showObservedCount.get()) add(HudLine("observedCount", "&bObserved Runs: &f12"))
+        if (showObservedCount.get()) add(HudLine("observedCount", "&bRuns: &f12"))
         if (showChestProfit.get()) {
             add(HudLine("profit", "&bProfit: &a12.3M coins &7(session)"))
-            if (showChestCount.get()) add(HudLine("chestsOpened", "&bChests Opened: &f8"))
+            if (showChestCount.get()) add(HudLine("chestsOpened", "&bChest: &f8"))
             if (showLastChest.get()) add(HudLine("lastChest", "&bLast Chest: &fObsidian &a1.2M coins"))
             add(HudLine("avgChest", "&bAvg Chest: &a1.5M coins"))
         }
@@ -1033,16 +1068,33 @@ class DungeonProgressHudFeature(
         val drawX = if (x.isFinite()) x else 10.0
         val drawY = if (y.isFinite()) y else 10.0
         val renderScale = scale.takeIf { it.isFinite() && it > 0f } ?: 1f
-        val lineHeight = mc.font.lineHeight + HUD_LINE_GAP
-        val width = lines.maxOfOrNull { mc.font.width(it.text.colorize()) } ?: 90
-        val left = drawX - 2.0 * renderScale
-        val right = drawX + (width + 4.0) * renderScale
+        val topRows = buildProfitHudTopRows()
+        val bottomRows = buildProfitHudBottomRows()
+        val allRows = topRows + bottomRows
+        val labelWidth = allRows.maxOfOrNull { mc.font.width(it.label) } ?: 72
+        val valueWidth = allRows.maxOfOrNull { mc.font.width(it.value) + if (it.suffix.isBlank()) 0 else 10 + mc.font.width(it.suffix) } ?: 64
+        val separatorX = HUD_SIDE_PADDING + labelWidth + 8
+        val valueX = separatorX + 8
+        val panelWidth = max(valueX + valueWidth + HUD_SIDE_PADDING, mc.font.width("Dungeon Profit Hud") + HUD_SIDE_PADDING * 2 + 10)
+        val left = drawX
+        val right = drawX + panelWidth * renderScale
 
-        return lines.mapIndexed { index, line ->
-            val top = drawY + (index * lineHeight - 2.0) * renderScale
-            val bottom = drawY + ((index + 1) * lineHeight).toDouble() * renderScale
-            HudLineBounds(line.id, line.text, left, top, right, bottom)
+        val bounds = mutableListOf<HudLineBounds>()
+        var yOffset = HUD_TOP_PADDING + HUD_TITLE_HEIGHT
+        for (row in topRows) {
+            val top = drawY + yOffset * renderScale
+            val bottom = drawY + (yOffset + HUD_ROW_HEIGHT) * renderScale
+            bounds.add(HudLineBounds(row.id, row.label, left, top, right, bottom))
+            yOffset += HUD_ROW_HEIGHT
         }
+        yOffset += HUD_PROFIT_GAP + 1
+        for (row in bottomRows) {
+            val top = drawY + yOffset * renderScale
+            val bottom = drawY + (yOffset + HUD_ROW_HEIGHT) * renderScale
+            bounds.add(HudLineBounds(row.id, row.label, left, top, right, bottom))
+            yOffset += HUD_ROW_HEIGHT
+        }
+        return bounds
     }
 
     private fun drawHudOrderOverlay(graphics: GuiGraphics, lines: List<HudLine>, hoverId: String?) {
@@ -1052,31 +1104,41 @@ class DungeonProgressHudFeature(
         val hintY = (drawY - (mc.font.lineHeight + HUD_LINE_GAP + 2) * renderScale).coerceAtLeast(2f)
         graphics.drawString(mc.font, Component.literal(HUD_ORDER_HINT.colorize()), drawX.toInt(), hintY.toInt(), 0xFFFFFFFF.toInt(), true)
 
+        drawDirect(graphics, lines)
+
         graphics.pose().pushMatrix()
         graphics.pose().translate(drawX, drawY)
         graphics.pose().scale(renderScale, renderScale)
 
-        val width = lines.maxOfOrNull { mc.font.width(it.text.colorize()) } ?: 90
-        val hintWidth = mc.font.width(HUD_ORDER_HINT.colorize())
-        val overlayWidth = width.coerceAtLeast(hintWidth)
-        val lineHeight = mc.font.lineHeight + HUD_LINE_GAP
-
         val draggedId = draggedHudLineId
         val targetId = if (draggedId != null) hoveredHudLineId ?: hoverId else hoverId
-        var yOffset = 0
-        for (line in lines) {
-            val highlight = when {
-                line.id == draggedId -> 0x663399FF
-                draggedId != null && line.id == targetId -> 0x6644CC66
-                draggedId == null && line.id == hoverId -> 0x33FFFFFF
-                else -> null
+        val topRows = buildProfitHudTopRows()
+        val bottomRows = buildProfitHudBottomRows()
+        val allRows = topRows + bottomRows
+        val labelWidth = allRows.maxOfOrNull { mc.font.width(it.label) } ?: 72
+        val valueWidth = allRows.maxOfOrNull { mc.font.width(it.value) + if (it.suffix.isBlank()) 0 else 10 + mc.font.width(it.suffix) } ?: 64
+        val separatorX = HUD_SIDE_PADDING + labelWidth + 8
+        val valueX = separatorX + 8
+        val panelWidth = max(valueX + valueWidth + HUD_SIDE_PADDING, mc.font.width("Dungeon Profit Hud") + HUD_SIDE_PADDING * 2 + 10)
+
+        fun highlightRows(rows: List<ProfitHudRow>, startY: Int) {
+            var yOffset = startY
+            for (row in rows) {
+                val highlight = when {
+                    row.id == draggedId -> 0x663399FF
+                    draggedId != null && row.id == targetId -> 0x6644CC66
+                    draggedId == null && row.id == hoverId -> 0x33FFFFFF
+                    else -> null
+                }
+                if (highlight != null) {
+                    graphics.fill(8, yOffset, panelWidth - 8, yOffset + HUD_ROW_HEIGHT, highlight)
+                }
+                yOffset += HUD_ROW_HEIGHT
             }
-            if (highlight != null) {
-                graphics.fill(-1, yOffset - 1, overlayWidth + 3, yOffset + mc.font.lineHeight + 1, highlight)
-            }
-            graphics.drawString(mc.font, Component.literal(line.text.colorize()), 0, yOffset, 0xFFFFFFFF.toInt(), true)
-            yOffset += lineHeight
         }
+        highlightRows(topRows, HUD_TOP_PADDING + HUD_TITLE_HEIGHT)
+        val dividerY = HUD_TOP_PADDING + HUD_TITLE_HEIGHT + topRows.size * HUD_ROW_HEIGHT + HUD_PROFIT_GAP / 2
+        highlightRows(bottomRows, dividerY + 1 + HUD_PROFIT_GAP)
 
         graphics.pose().popMatrix()
     }
@@ -1474,6 +1536,7 @@ class DungeonProgressHudFeature(
             return
         }
 
+        ensureSessionStarted(now, "chest-profit-$source")
         lastRecordedChestAt = now
         state.lastChestName = candidate.chestName
         state.lastChestProfit = candidate.profit
@@ -1557,6 +1620,7 @@ class DungeonProgressHudFeature(
             return
         }
         if (normalized > 0) {
+            ensureSessionStarted(System.currentTimeMillis(), "api-xp-sample")
             state.samples.add(RunSample(System.currentTimeMillis(), floorValue(), delta, normalized))
             while (state.samples.size > 100) state.samples.removeAt(0)
         }
@@ -1615,6 +1679,12 @@ class DungeonProgressHudFeature(
         lastDungeonCompletionChatAt = timestamp
         lastDungeonCompletionRawXp = cataXp
         lastDungeonCompletionNormalizedXp = normalizeRunXp(cataXp)
+        val runStartedAt = if (pendingCompletionTimeSeconds > 0) {
+            timestamp - pendingCompletionTimeSeconds * 1000L
+        } else {
+            timestamp
+        }
+        ensureSessionStarted(runStartedAt, "dungeon-completion")
         state.samples.add(RunSample(timestamp, floor, cataXp, lastDungeonCompletionNormalizedXp))
         while (state.samples.size > 100) state.samples.removeAt(0)
         state.runs.add(
@@ -1936,6 +2006,9 @@ class DungeonProgressHudFeature(
             "weekly" -> "Last 7 days"
             else -> "Last 24 hours"
         }
+        if (scope.equals("session", true) && sessionStartedAt <= 0L) {
+            return RunSummary(label, 0, 0L, 0L, 0, 0, 0L, 0L, 0L, 0L)
+        }
         val runs = state.runs.filter { it.timestamp >= cutoff }
         val chests = state.chestProfits.filter { it.timestamp >= cutoff }
         val runCount = runs.size
@@ -1991,24 +2064,214 @@ class DungeonProgressHudFeature(
         return lastVisibilityResult
     }
 
-    private fun drawDirect(graphics: GuiGraphics, lines: List<String>) {
+    private fun drawDirect(graphics: GuiGraphics, lines: List<HudLine>) {
+        val xpRows = buildProfitHudTopRows()
+        val profitRows = buildProfitHudBottomRows()
+        if (xpRows.isEmpty() && profitRows.isEmpty()) return
+
         graphics.pose().pushMatrix()
         val drawX = if (x.isFinite()) x.toFloat() else 10f
         val drawY = if (y.isFinite()) y.toFloat() else 10f
+        val renderScale = scale.takeIf { it.isFinite() && it > 0f } ?: 1f
         graphics.pose().translate(drawX, drawY)
-        graphics.pose().scale(scale, scale)
+        graphics.pose().scale(renderScale, renderScale)
 
-        val width = lines.maxOfOrNull { mc.font.width(it.colorize()) } ?: 90
-        val height = lines.size * (mc.font.lineHeight + 2) + 2
-        graphics.fill(-2, -2, width + 4, height, 0x80000000.toInt())
+        val fontHeight = mc.font.lineHeight
+        val rowHeight = HUD_ROW_HEIGHT
+        val allRows = xpRows + profitRows
+        val labelWidth = allRows.maxOfOrNull { mc.font.width(it.label) } ?: 72
+        val valueWidth = allRows.maxOfOrNull { mc.font.width(it.value) + if (it.suffix.isBlank()) 0 else 10 + mc.font.width(it.suffix) } ?: 64
+        val separatorX = HUD_SIDE_PADDING + labelWidth + 8
+        val valueX = separatorX + 8
+        val panelWidth = max(valueX + valueWidth + HUD_SIDE_PADDING, mc.font.width("Dungeon Profit Hud") + HUD_SIDE_PADDING * 2 + 10)
+        val topRowsHeight = xpRows.size * rowHeight
+        val bottomRowsHeight = profitRows.size * rowHeight
+        val dividerY = HUD_TOP_PADDING + HUD_TITLE_HEIGHT + topRowsHeight + HUD_PROFIT_GAP / 2
+        val panelHeight = dividerY + 1 + HUD_PROFIT_GAP + bottomRowsHeight + HUD_TOP_PADDING
 
-        var yOffset = 0
-        for (line in lines) {
-            graphics.drawString(mc.font, Component.literal(line.colorize()), 0, yOffset, 0xFFFFFFFF.toInt(), true)
-            yOffset += mc.font.lineHeight + 2
-        }
+        drawProfitPanel(graphics, panelWidth, panelHeight, dividerY)
+
+        val titleX = (panelWidth - mc.font.width("Dungeon Profit Hud")) / 2
+        graphics.drawString(mc.font, Component.literal("Dungeon Profit Hud"), titleX, HUD_TOP_PADDING, HUD_SKETCH_WHITE, true)
+        var yOffset = HUD_TOP_PADDING + HUD_TITLE_HEIGHT
+        yOffset = drawProfitRows(graphics, xpRows, HUD_SIDE_PADDING, separatorX, valueX, yOffset, rowHeight, fontHeight)
+        yOffset = dividerY + 1 + HUD_PROFIT_GAP
+        drawProfitRows(graphics, profitRows, HUD_SIDE_PADDING, separatorX, valueX, yOffset, rowHeight, fontHeight)
 
         graphics.pose().popMatrix()
+    }
+
+    private fun buildProfitHudTopRows(): List<ProfitHudRow> {
+        val profile = data
+        val xpPerRun = effectiveXpPerRun()
+        val samples = samplesForFloor()
+        val last = samples.lastOrNull()
+        val remaining = profile?.let { xpRemaining(it.catacombsExperience, targetLevelValue()) } ?: 0L
+        val runs = xpPerRun.takeIf { it > 0 }?.let { ceil(remaining.toDouble() / it.toDouble()).toLong() }
+        val currentLevel = profile?.let { currentCataLevel(it.catacombsExperience) } ?: 0
+        return orderProfitRows(
+            listOf(
+                ProfitHudRow("sessionTime", "Session Time", sessionDurationText()),
+                ProfitHudRow("currentLevel", "Cata Level", currentLevel.toString()),
+                ProfitHudRow("target", "Target", targetLevelValue().toString()),
+                ProfitHudRow("levelProgress", "Next Level", profile?.let { "${levelProgressPercent(it.catacombsExperience)}%" } ?: "N/A"),
+                ProfitHudRow("runsLeft", "Runs Left", runs?.formatCompact() ?: "N/A"),
+                ProfitHudRow("currentXp", "Cata XP", profile?.catacombsExperience?.formatCompact() ?: "N/A"),
+                ProfitHudRow("lastRun", "Last Run", last?.normalizedXpDelta?.formatCompact() ?: "N/A", lastRunRateSuffix()),
+                ProfitHudRow("observedCount", "Runs", samples.size.toString()),
+            )
+        )
+    }
+
+    private fun buildProfitHudBottomRows(): List<ProfitHudRow> {
+        val stats = chestProfitStats()
+        return orderProfitRows(
+            listOf(
+                ProfitHudRow("profit", "Profit", stats.profit.formatCompactCoins(), "(${stats.label})"),
+                ProfitHudRow("avgChest", "Avg Chest", stats.average.formatCompactCoins()),
+                ProfitHudRow("chestsOpened", "Chests", stats.chests.toString()),
+                ProfitHudRow("croesus", "Croesus", lastCroesusCandidates.size.toString()),
+            )
+        )
+    }
+
+    private fun orderProfitRows(rows: List<ProfitHudRow>): List<ProfitHudRow> {
+        val byId = rows.associateBy { it.id }
+        return normalizedHudLineOrder().mapNotNull { byId[it] }
+    }
+
+    private fun drawProfitRows(
+        graphics: GuiGraphics,
+        rows: List<ProfitHudRow>,
+        labelX: Int,
+        separatorX: Int,
+        valueX: Int,
+        startY: Int,
+        rowHeight: Int,
+        fontHeight: Int,
+    ): Int {
+        var yOffset = startY
+        for (row in rows) {
+            val textY = yOffset + (rowHeight - fontHeight) / 2
+            graphics.drawString(mc.font, Component.literal(row.label), labelX, textY, HUD_SKETCH_WHITE, true)
+            graphics.drawString(mc.font, Component.literal("|"), separatorX, textY, HUD_SKETCH_WHITE, true)
+            graphics.drawString(mc.font, Component.literal(row.value), valueX, textY, HUD_SKETCH_WHITE, true)
+            if (row.suffix.isNotBlank()) {
+                graphics.drawString(mc.font, Component.literal(row.suffix), valueX + mc.font.width(row.value) + 10, textY, HUD_SKETCH_WHITE, true)
+            }
+            yOffset += rowHeight
+        }
+        return yOffset
+    }
+
+    private fun hudRow(line: HudLine): HudRow {
+        val plain = line.text.colorize().cleanMc()
+        val splitAt = plain.indexOf(':')
+        val label = if (splitAt >= 0) plain.substring(0, splitAt + 1) else plain
+        var value = if (splitAt >= 0) plain.substring(splitAt + 1).trim() else ""
+        var suffix = ""
+        val suffixStart = value.lastIndexOf(" (")
+        if (suffixStart > 0 && value.endsWith(")")) {
+            suffix = value.substring(suffixStart).trim()
+            value = value.substring(0, suffixStart).trim()
+        }
+        return HudRow(line.id, label, value.ifBlank { "..." }, hudIcon(line.id), line.id in ACCENT_VALUE_HUD_LINE_IDS, suffix)
+    }
+
+    private fun hudPanelWidth(rows: List<HudRow>): Int = hudContentWidth(rows) + 10
+
+    private fun hudContentWidth(rows: List<HudRow>): Int {
+        val labelX = 32
+        val labelWidth = rows.maxOfOrNull { mc.font.width(it.label) } ?: 88
+        val valueSepX = max(96, labelX + labelWidth + 6)
+        val valueX = valueSepX + 7
+        val valueWidth = rows.maxOfOrNull {
+            mc.font.width(it.value) + if (it.mutedSuffix.isBlank()) 0 else 5 + mc.font.width(it.mutedSuffix)
+        } ?: 72
+        return max(valueX + valueWidth + 7, 166)
+    }
+
+    private fun hudIcon(id: String): ItemStack = ItemStack(
+        when (id) {
+            "currentLevel" -> Items.SKELETON_SKULL
+            "target" -> Items.COMPASS
+            "levelProgress" -> Items.EXPERIENCE_BOTTLE
+            "runsLeft" -> Items.FEATHER
+            "currentXp" -> Items.NETHER_STAR
+            "remaining" -> Items.REDSTONE
+            "floor" -> Items.MAP
+            "xpPerRun" -> Items.WRITABLE_BOOK
+            "profile" -> Items.PLAYER_HEAD
+            "lastRun" -> Items.CLOCK
+            "observedCount" -> Items.ENDER_EYE
+            "profit" -> Items.GOLD_INGOT
+            "chestsOpened" -> Items.CHEST
+            "lastChest" -> Items.ENDER_CHEST
+            "avgChest" -> Items.EMERALD
+            else -> Items.PAPER
+        }
+    )
+
+    private fun drawProfitPanel(graphics: GuiGraphics, width: Int, height: Int, dividerY: Int) {
+        drawRoundedFill(graphics, 0, 0, width, height, HUD_PROFIT_PANEL)
+        drawRoundedBorder(graphics, 0, 0, width, height, HUD_SKETCH_WHITE)
+        graphics.fill(1, dividerY, width - 1, dividerY + 1, HUD_SKETCH_WHITE)
+    }
+
+    private fun drawRoundedFill(graphics: GuiGraphics, x: Int, y: Int, width: Int, height: Int, color: Int) {
+        graphics.fill(x + 4, y, x + width - 4, y + 1, color)
+        graphics.fill(x + 2, y + 1, x + width - 2, y + 2, color)
+        graphics.fill(x + 1, y + 2, x + width - 1, y + 4, color)
+        graphics.fill(x, y + 4, x + width, y + height - 4, color)
+        graphics.fill(x + 1, y + height - 4, x + width - 1, y + height - 2, color)
+        graphics.fill(x + 2, y + height - 2, x + width - 2, y + height - 1, color)
+        graphics.fill(x + 4, y + height - 1, x + width - 4, y + height, color)
+    }
+
+    private fun drawRoundedBorder(graphics: GuiGraphics, x: Int, y: Int, width: Int, height: Int, color: Int) {
+        graphics.fill(x + 4, y, x + width - 4, y + 1, color)
+        graphics.fill(x + 2, y + 1, x + 4, y + 2, color)
+        graphics.fill(x + width - 4, y + 1, x + width - 2, y + 2, color)
+        graphics.fill(x + 1, y + 2, x + 2, y + 4, color)
+        graphics.fill(x + width - 2, y + 2, x + width - 1, y + 4, color)
+        graphics.fill(x, y + 4, x + 1, y + height - 4, color)
+        graphics.fill(x + width - 1, y + 4, x + width, y + height - 4, color)
+        graphics.fill(x + 1, y + height - 4, x + 2, y + height - 2, color)
+        graphics.fill(x + width - 2, y + height - 4, x + width - 1, y + height - 2, color)
+        graphics.fill(x + 2, y + height - 2, x + 4, y + height - 1, color)
+        graphics.fill(x + width - 4, y + height - 2, x + width - 2, y + height - 1, color)
+        graphics.fill(x + 4, y + height - 1, x + width - 4, y + height, color)
+    }
+
+    private fun drawFramedPanel(graphics: GuiGraphics, width: Int, height: Int) {
+        graphics.fill(2, 3, width + 2, height + 3, 0x66000000)
+        graphics.fill(0, 0, width, height, HUD_OUTER_DARK)
+        graphics.fill(3, 3, width - 3, height - 3, HUD_CYAN_DIM)
+        graphics.fill(5, 5, width - 5, height - 5, HUD_INNER_DARK)
+        graphics.fill(9, 9, width - 9, height - 9, HUD_PANEL)
+
+        graphics.fill(0, 0, width, 2, HUD_BLACK)
+        graphics.fill(0, height - 2, width, height, HUD_BLACK)
+        graphics.fill(0, 0, 2, height, HUD_BLACK)
+        graphics.fill(width - 2, 0, width, height, HUD_BLACK)
+
+        val corner = 8
+        graphics.fill(2, 2, corner, 5, HUD_CYAN)
+        graphics.fill(2, 2, 5, corner, HUD_CYAN)
+        graphics.fill(width - corner, 2, width - 2, 5, HUD_CYAN)
+        graphics.fill(width - 5, 2, width - 2, corner, HUD_CYAN)
+        graphics.fill(2, height - 5, corner, height - 2, HUD_CYAN)
+        graphics.fill(2, height - corner, 5, height - 2, HUD_CYAN)
+        graphics.fill(width - corner, height - 5, width - 2, height - 2, HUD_CYAN)
+        graphics.fill(width - 5, height - corner, width - 2, height - 2, HUD_CYAN)
+    }
+
+    private fun drawDashedVertical(graphics: GuiGraphics, x: Int, top: Int, bottom: Int) {
+        var y = top
+        while (y < bottom) {
+            graphics.fill(x, y, x + 1, (y + 5).coerceAtMost(bottom), HUD_CYAN)
+            y += 8
+        }
     }
 
     private fun logRenderState(message: String) {
@@ -2143,6 +2406,51 @@ class DungeonProgressHudFeature(
         val remainder = safe % 60
         return "%02dm %02ds".format(minutes, remainder)
     }
+
+    private fun ensureSessionStarted(startedAt: Long, reason: String) {
+        if (sessionStartedAt > 0L) return
+        sessionStartedAt = startedAt.coerceAtMost(System.currentTimeMillis())
+        log("Dungeon profit session started reason=$reason startedAt=$sessionStartedAt")
+    }
+
+    private fun sessionDurationText(): String =
+        if (sessionStartedAt > 0L) {
+            formatSessionDuration(((System.currentTimeMillis() - sessionStartedAt) / 1000L).coerceAtLeast(0L))
+        } else {
+            "Not started"
+        }
+
+    private fun formatSessionDuration(seconds: Long): String {
+        val safe = seconds.coerceAtLeast(0L)
+        val hours = safe / 3600L
+        val minutes = (safe % 3600L) / 60L
+        val remainder = safe % 60L
+        return buildString {
+            if (hours > 0L) append("${hours}h ")
+            if (minutes > 0L || hours > 0L) append("${minutes}m ")
+            append("${remainder}s")
+        }.trim()
+    }
+
+    private fun lastRunRateSuffix(): String {
+        val lastRun = state.runs.lastOrNull { it.normalizedCataXp > 0 && it.runTimeSeconds > 0 } ?: return ""
+        val perHour = (lastRun.normalizedCataXp.toDouble() * 3600.0 / lastRun.runTimeSeconds.toDouble()).roundToLong()
+        return "(${perHour.formatCompact()}/h)"
+    }
+
+    private fun Long.formatCompact(): String {
+        val sign = if (this < 0) "-" else ""
+        val abs = kotlin.math.abs(this)
+        val body = when {
+            abs >= 1_000_000_000L -> "%.2fb".format(Locale.US, abs / 1_000_000_000.0)
+            abs >= 1_000_000L -> "%.2fm".format(Locale.US, abs / 1_000_000.0)
+            abs >= 1_000L -> "${abs / 1_000L}k"
+            else -> abs.toString()
+        }
+        return sign + body
+    }
+
+    private fun Long.formatCompactCoins(): String = formatCompact()
 
     private fun Long.formatCoins(): String {
         val sign = if (this < 0) "-" else ""
