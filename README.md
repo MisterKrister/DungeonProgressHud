@@ -13,11 +13,12 @@ reward chest profit tracking.
 - Dungeon completion chat/log tracking for last run XP and XP/run averages
 - Dungeon reward chest profit tracking
 - Session, total, or rolling-window chest profit view
+- Session, total, or rolling-window M7 item drop tracker
 - Optional chest count and average chest profit display
 
 ## Requirements
 
-- Minecraft 1.21.10
+- Minecraft 1.21.11
 - Fabric Loader 0.18.4 or newer
 - Fabric API
 - Fabric Language Kotlin
@@ -35,6 +36,12 @@ GUI settings are managed through Devonian with `/devonian`.
 /dph session
 /dph daily
 /dph weekly
+/dph total
+/dph <scope>
+/dph summary
+/dph summary session
+/dph summary daily
+/dph summary weekly
 /dph importlogs
 /dph profit
 /dph fake
@@ -42,15 +49,23 @@ GUI settings are managed through Devonian with `/devonian`.
 /dph profit session
 /dph profit total
 /dph profit <window>
+/dph items
+/dph items toggle
+/dph items session
+/dph items total
+/dph items <window>
+/dph items reset
 ```
 
 - `/dph` shows the current mod status.
 - `/dph refresh` forces an API refresh and updates the XP baseline without adding an observed run sample.
 - `/dph reset` clears observed XP samples and resets the API XP baseline.
-- `/dph session`, `/dph daily`, and `/dph weekly` print run and profit summaries.
+- `/dph session`, `/dph daily`, `/dph weekly`, `/dph total`, and `/dph <scope>` change the shared profit/item tracker view. Scopes accept values like `1`, `2`, `7`, `1w`, `2w`, or `1m`.
+- `/dph summary`, `/dph summary session`, `/dph summary daily`, and `/dph summary weekly` print run and profit summaries.
 - `/dph importlogs` imports recent dungeon completion messages from client logs.
 - `/dph fake` records the currently selected/open reward chest without clicking it.
-- `/dph profit toggle`, `session`, `total`, or `<window>` change the chest profit HUD view. Windows accept values like `7d`, `14d`, or `2w`.
+- `/dph profit ...` and `/dph items ...` remain aliases for changing or showing the same tracker scope.
+- Undated legacy/backfill item drops are only counted in total.
 
 ## API Usage
 

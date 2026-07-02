@@ -6,7 +6,6 @@ import com.github.synnerz.devonian.api.Location
 import com.github.synnerz.devonian.api.SkyblockPrices
 import com.github.synnerz.devonian.api.events.GuiKeyDownEvent
 import com.github.synnerz.devonian.api.events.ChatEvent
-import com.github.synnerz.devonian.api.events.TickEvent
 import com.github.synnerz.devonian.config.Categories
 import com.github.synnerz.devonian.config.Config
 import com.github.synnerz.devonian.config.ConfigData
@@ -45,6 +44,8 @@ import java.net.HttpURLConnection
 import java.net.URI
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 import java.time.LocalDateTime
 import java.time.LocalTime
@@ -160,6 +161,9 @@ object DungeonProgressHudAddon : ClientModInitializer {
     fun onHudOrderMouseClicked(screen: AbstractContainerScreen<*>, event: MouseButtonEvent, shiftDown: Boolean): Boolean =
         feature?.onHudOrderMouseClicked(screen, event, shiftDown) ?: false
 
+    fun onHudModeButtonPressed(): Boolean =
+        feature?.onHudModeButtonPressed() ?: false
+
     fun onHudOrderMouseDragged(screen: AbstractContainerScreen<*>, event: MouseButtonEvent, dragX: Double, dragY: Double): Boolean =
         feature?.onHudOrderMouseDragged(screen, event, dragX, dragY) ?: false
 
@@ -202,21 +206,43 @@ object DungeonProgressHudAddon : ClientModInitializer {
                         1
                     })
                     .then(literal("session").executes {
-                        withFeature { it.sendRunSummary("session") }
+                        withFeature { it.setTrackerScope("session") }
                         1
                     })
                     .then(literal("daily").executes {
-                        withFeature { it.sendRunSummary("daily") }
+                        withFeature { it.setTrackerScope("daily") }
                         1
                     })
                     .then(literal("weekly").executes {
-                        withFeature { it.sendRunSummary("weekly") }
+                        withFeature { it.setTrackerScope("weekly") }
+                        1
+                    })
+                    .then(literal("total").executes {
+                        withFeature { it.setTrackerScope("total") }
                         1
                     })
                     .then(literal("importlogs").executes {
                         withFeature { it.importRecentLogs(true) }
                         1
                     })
+                    .then(literal("summary")
+                        .executes {
+                            withFeature { it.sendRunSummary("daily") }
+                            1
+                        }
+                        .then(literal("session").executes {
+                            withFeature { it.sendRunSummary("session") }
+                            1
+                        })
+                        .then(literal("daily").executes {
+                            withFeature { it.sendRunSummary("daily") }
+                            1
+                        })
+                        .then(literal("weekly").executes {
+                            withFeature { it.sendRunSummary("weekly") }
+                            1
+                        })
+                    )
                     .then(literal("profit")
                         .executes {
                             withFeature { it.sendProfitStatus() }
@@ -239,6 +265,32 @@ object DungeonProgressHudAddon : ClientModInitializer {
                             1
                         })
                     )
+                    .then(literal("items")
+                        .executes {
+                            withFeature { it.sendTrackerStatus() }
+                            1
+                        }
+                        .then(literal("toggle").executes {
+                            withFeature { it.toggleTrackerMode() }
+                            1
+                        })
+                        .then(literal("session").executes {
+                            withFeature { it.setTrackerMode("Session") }
+                            1
+                        })
+                        .then(literal("total").executes {
+                            withFeature { it.setTrackerMode("Total") }
+                            1
+                        })
+                        .then(literal("reset").executes {
+                            withFeature { it.resetTrackedItems() }
+                            1
+                        })
+                        .then(argument("window", StringArgumentType.word()).executes { context ->
+                            withFeature { it.setTrackerWindow(StringArgumentType.getString(context, "window")) }
+                            1
+                        })
+                    )
                     .then(literal("fake").executes {
                         withFeature { it.fakeOpenCurrentScreen() }
                         1
@@ -249,6 +301,10 @@ object DungeonProgressHudAddon : ClientModInitializer {
                             1
                         })
                     )
+                    .then(argument("scope", StringArgumentType.word()).executes { context ->
+                        withFeature { it.setTrackerScope(StringArgumentType.getString(context, "scope")) }
+                        1
+                    })
             )
         }
     }
@@ -308,6 +364,11 @@ class DungeonProgressHudFeature(
         private val API_KEY_CONFIG_NAMES = listOf(API_KEY_CONFIG, LEGACY_API_KEY_CONFIG)
         private const val DAY_MILLIS = 86_400_000L
         private const val AUTO_REFRESH_INTERVAL_MILLIS = 300_000L
+        private const val API_KEY_REFRESH_DEBOUNCE_MILLIS = 1_000L
+        private const val API_KEY_REFRESH_RETRY_MILLIS = 1_000L
+        private const val MIN_REFRESHABLE_API_KEY_LENGTH = 32
+        private const val CROESUS_TAB_REFRESH_INTERVAL_MILLIS = 1_000L
+        private const val MAX_TRACKED_ITEM_DROPS = 5_000
         private const val HUD_LINE_GAP = 2
         private const val HUD_ROW_HEIGHT = 15
         private const val HUD_TITLE_HEIGHT = 28
@@ -334,6 +395,7 @@ class DungeonProgressHudFeature(
             "profit",
             "avgChest",
             "chestsOpened",
+            "kismets",
             "croesus",
             "lastChest",
         )
@@ -351,6 +413,40 @@ class DungeonProgressHudFeature(
         private const val HUD_PANEL = 0xD00A0F11.toInt()
         private const val HUD_PROFIT_PANEL = 0x88101010.toInt()
         private const val HUD_SKETCH_WHITE = 0xFFE8E8E8.toInt()
+        private const val HUD_MODE_PROFIT = "profit"
+        private const val HUD_MODE_ITEMS = "items"
+        private const val HUD_MODE_BUTTON_WIDTH = 46
+        private const val HUD_MODE_BUTTON_HEIGHT = 14
+        private const val HUD_MODE_BUTTON_MARGIN = 5
+        private val CROESUS_TAB_COUNT_REGEXES = listOf(
+            Regex("\\bunclaimed\\s+chests?\\s*:\\s*(\\d+)", RegexOption.IGNORE_CASE),
+            Regex("\\bunopened\\s+chests?\\s*:\\s*(\\d+)", RegexOption.IGNORE_CASE),
+            Regex("\\b(?:unclaimed|unopened)\\b.*\\bcroesus\\b.*?(\\d+)", RegexOption.IGNORE_CASE),
+            Regex("\\bcroesus\\b.*\\b(?:unclaimed|unopened)\\b.*?(\\d+)", RegexOption.IGNORE_CASE),
+            Regex("\\bcroesus\\b.*\\bchests?\\b.*?(\\d+)", RegexOption.IGNORE_CASE),
+            Regex("\\b(\\d+)\\b.*\\bcroesus\\b.*\\bchests?\\b", RegexOption.IGNORE_CASE),
+        )
+        private val TRACKED_DROPS = listOf(
+            TrackedDropDefinition("NECRON_HANDLE", "Handle", setOf("NECRON_HANDLE", "NECRON'S_HANDLE", "NECRONS_HANDLE")),
+            TrackedDropDefinition("IMPLOSION_SCROLL", "Implosion", setOf("IMPLOSION_SCROLL", "IMPLOSION")),
+            TrackedDropDefinition("WITHER_SHIELD_SCROLL", "Wither Shield", setOf("WITHER_SHIELD_SCROLL", "WITHER_SHIELD")),
+            TrackedDropDefinition("SHADOW_WARP_SCROLL", "Shadow Warp", setOf("SHADOW_WARP_SCROLL", "SHADOW_WARP")),
+            TrackedDropDefinition("RECOMBOBULATOR_3000", "Recomb", setOf("RECOMBOBULATOR_3000", "RECOMBOBULATOR")),
+            TrackedDropDefinition("AUTO_RECOMBOBULATOR", "Auto Recomb", setOf("AUTO_RECOMBOBULATOR", "AUTO_RECOMBOBULATOR_3000")),
+            TrackedDropDefinition("DARK_CLAYMORE", "Claymore", setOf("DARK_CLAYMORE")),
+            TrackedDropDefinition("FIFTH_MASTER_STAR", "5th Star", setOf("FIFTH_MASTER_STAR", "5TH_MASTER_STAR", "MASTER_STAR_TIER_5")),
+            TrackedDropDefinition("WITHER_CHESTPLATE", "Chestplate", setOf("WITHER_CHESTPLATE")),
+            TrackedDropDefinition("MASTER_SKULL_TIER_5", "Skull T5", setOf("MASTER_SKULL_TIER_5", "MASTER_SKULL_5")),
+            TrackedDropDefinition("NECRON_DYE", "Necron Dye", setOf("NECRON_DYE", "NECRONS_DYE", "NECRON'S_DYE")),
+        )
+        private val TRACKED_DROPS_BY_ALIAS = TRACKED_DROPS
+            .flatMap { drop -> drop.aliases.map { normalizeTrackedAlias(it) to drop } }
+            .toMap()
+
+        private fun normalizeTrackedAlias(value: String): String =
+            value.uppercase(Locale.ROOT)
+                .replace(Regex("[^A-Z0-9]+"), "_")
+                .trim('_')
     }
 
     private val PREFIX = "&6[&bDPH&6]&r "
@@ -388,7 +484,7 @@ class DungeonProgressHudFeature(
     private val profitDivider = addDivider("30", "PROFIT")
     private val trackChestProfit = addSwitch("31_trackChestProfit", true, "Track profit when claiming dungeon reward chests.", "Track Chest Profit", emptySet(), false, configTab)
     private val showChestProfit = addSwitch("32_showChestProfit", true, "Show tracked dungeon chest profit.", "Chest Profit", emptySet(), false, configTab)
-    private val chestProfitMode = addSelection("33_chestProfitMode", 0, listOf("Session", "Total"), "Choose whether chest profit lines use this session or all tracked chests.", "Chest Profit Mode", emptySet(), configTab)
+    private val chestProfitMode = addSelection("33_chestProfitMode", 0, listOf("Session", "Total"), "Choose whether profit and item tracker lines use this session or all tracked chests.", "Tracker Mode", emptySet(), configTab)
     private val showChestCount = addSwitch("34_showChestCount", true, "Show tracked dungeon reward chest count.", "Chest Count", emptySet(), false, configTab)
     private val showLastChest = addSwitch("35_showLastChest", true, "Show the last opened dungeon reward chest and its profit.", "Last Chest Opened", emptySet(), false, configTab)
     private val includeEssenceProfit = addSwitch("36_includeEssenceProfit", true, "Include essence value in chest profit.", "Include Essence", emptySet(), false, configTab)
@@ -411,6 +507,13 @@ class DungeonProgressHudFeature(
     private var refreshing = false
     private var lastRefresh = 0L
     private var lastAutoRefreshAttempt = 0L
+    private var suppressApiKeyChange = false
+    private var lastApiKeyValue = ""
+    private var pendingApiKeyRefreshValue = ""
+    private var pendingApiKeyRefreshAt = 0L
+    private var pendingApiKeyRefreshNotify = false
+    @Volatile private var devonianConfigSaveRunning = false
+    @Volatile private var devonianConfigSavePending = false
     private var joinRefreshStartedAt = 0L
     private var joinRefreshAttempts = 0
     private var nextJoinRefreshAttemptAt = 0L
@@ -431,7 +534,10 @@ class DungeonProgressHudFeature(
     private var lastChestScreenLog = 0L
     private var lastVisibilityCheckAt = 0L
     private var lastVisibilityResult = false
+    private var lastCroesusTabRefreshAt = 0L
     private var lastRecordedChestAt = 0L
+    private var lastRecordedKismetAt = 0L
+    private var lastRecordedKismetKey = ""
     private var lastDungeonCompletionChat = ""
     private var lastDungeonCompletionChatAt = 0L
     private var lastDungeonCompletionRawXp = 0L
@@ -448,8 +554,12 @@ class DungeonProgressHudFeature(
     private var hoveredHudLineId: String? = null
 
     init {
+        apiKey.onChange { onApiKeyInputChanged(it) }
         Config.onAfterLoad {
-            migrateLegacyApiKey()
+            withApiKeyChangeSuppressed {
+                migrateLegacyApiKey()
+            }
+            lastApiKeyValue = apiKey.get().trim()
         }
     }
 
@@ -499,29 +609,53 @@ class DungeonProgressHudFeature(
     private fun migrateLegacyApiKey() {
         val normalized = apiKey.get().trim()
         if (normalized.isNotBlank()) {
-            if (normalized != apiKey.get()) apiKey.set(normalized)
+            if (normalized != apiKey.get()) setApiKeyConfigValue(normalized)
             return
         }
         val legacy = readConfiguredApiKeyValue(LEGACY_API_KEY_CONFIG)
-        if (legacy.isNotBlank()) apiKey.set(legacy.trim())
+        if (legacy.isNotBlank()) setApiKeyConfigValue(legacy.trim())
     }
 
-    override fun getEditText(): List<String> = listOf(
-        "&bCata Level: &fC49",
-        "&bTarget: &fC50",
-        "&bRuns Left: &a259",
-        "&bCata XP: &f453,559,640",
-        "&bRemaining: &f116,250,000",
-        "&bFloor: &fM7",
-        "&bXP/Run: &f450,000 &7(fallback)",
-    )
+    override fun getEditText(): List<String> =
+        listOf(
+            "&fDungeon Profit Hud",
+            "&f"
+        ) +
+            orderProfitRows(
+                listOf(
+                    ProfitHudRow("sessionTime", "Time", "Not started"),
+                    ProfitHudRow("currentLevel", "Cata", "50"),
+                    ProfitHudRow("target", "Target", "51"),
+                    ProfitHudRow("levelProgress", "Next", "28.9%"),
+                    ProfitHudRow("runsLeft", "Left", "252"),
+                    ProfitHudRow("currentXp", "XP", "627.58m"),
+                    ProfitHudRow("lastRun", "Last", "491k", "(4.83m/h)"),
+                    ProfitHudRow("observedCount", "Runs", "100"),
+                )
+            ).map { editPreviewLine(it) } +
+            listOf(
+                "&f",
+                "&f----------------",
+                "&f"
+            ) +
+            orderProfitRows(
+                listOf(
+                    ProfitHudRow("chestsOpened", "Chests", "359"),
+                    ProfitHudRow("profit", "Profit", "2.79b"),
+                    ProfitHudRow("avgChest", "Avg Chest", "7.77m"),
+                    ProfitHudRow("kismets", "Kismets", "0"),
+                    ProfitHudRow("croesus", "Croesus", "0"),
+                )
+            ).map { editPreviewLine(it) }
+
+    private fun editPreviewLine(row: ProfitHudRow): String {
+        val paddedLabel = row.label.padEnd(7)
+        val suffix = if (row.suffix.isBlank()) "" else " ${row.suffix}"
+        return "&f$paddedLabel | ${row.value}$suffix"
+    }
 
     override fun initialize() {
         startRuntime("devonian initialize")
-
-        on<TickEvent> {
-            clientTick()
-        }
 
         on<GuiKeyDownEvent> { event ->
             if (!fakeOpenKey.matches(event.event)) return@on
@@ -543,13 +677,15 @@ class DungeonProgressHudFeature(
         runtimeStarted = true
         log("Feature runtime started by $reason")
         loadState()
+        lastApiKeyValue = configuredApiKey()
         importRecentLogs(false)
     }
 
     private fun clientTick() {
-        val refreshedForSkyBlockJoin = maybeRefreshAfterSkyBlockJoin()
-        val refreshedForJoin = maybeRefreshAfterServerJoin()
-        if (!startupRefreshAttempted && sessionReady() && !refreshedForJoin) {
+        val refreshedForApiKey = maybeRefreshAfterApiKeyChange()
+        val refreshedForSkyBlockJoin = if (!refreshedForApiKey) maybeRefreshAfterSkyBlockJoin() else false
+        val refreshedForJoin = if (!refreshedForApiKey && !refreshedForSkyBlockJoin) maybeRefreshAfterServerJoin() else false
+        if (!startupRefreshAttempted && sessionReady() && !refreshedForApiKey && !refreshedForJoin) {
             startupRefreshAttempted = true
             lastAutoRefreshAttempt = System.currentTimeMillis()
             log("Startup refresh triggered for user=${mc.user.name} uuid=${mc.user.profileId}")
@@ -557,6 +693,7 @@ class DungeonProgressHudFeature(
         }
 
         scanCurrentChestScreen()
+        maybeUpdateCroesusUnclaimedCountFromTab()
         val visible = shouldRenderCached()
         if (visible && !wasVisible) {
             lastAutoRefreshAttempt = System.currentTimeMillis()
@@ -628,8 +765,6 @@ class DungeonProgressHudFeature(
     }
 
     fun renderHud(graphics: GuiGraphics) {
-        startRuntime("gui render")
-
         val enabled = isEnabled()
         if (mc.screen is AbstractContainerScreen<*>) {
             return
@@ -665,20 +800,27 @@ class DungeonProgressHudFeature(
             return
         }
         if (!force && System.currentTimeMillis() - lastRefresh < AUTO_REFRESH_INTERVAL_MILLIS && data != null) return
-        if (configuredApiKey().isBlank()) {
+        val requestApiKey = configuredApiKey()
+        if (requestApiKey.isBlank()) {
             status = "API key missing"
             log("Refresh skipped: missing API key")
             if (notify) send("Refresh skipped: API key missing. Use /dph apikey <key> if the GUI field did not save.")
             return
         }
+        val user = mc.user
+        val request = ProfileRequest(
+            playerName = user.name,
+            playerUuid = user.profileId.toString().replace("-", ""),
+            apiKey = requestApiKey,
+        )
 
         refreshing = true
         status = "Refreshing..."
-        log("Refresh started force=$force recordObservedSample=$recordObservedSample user=${mc.user.name} uuid=${mc.user.profileId}")
+        log("Refresh started force=$force recordObservedSample=$recordObservedSample user=${request.playerName} uuid=${request.playerUuid}")
         if (notify) send("Refreshing API data...")
 
         thread(name = "DungeonProgressHud-API", isDaemon = true) {
-            val result = runCatching { fetchProfile() }
+            val result = runCatching { fetchProfile(request) }
             mc.execute {
                 try {
                     result
@@ -705,19 +847,121 @@ class DungeonProgressHudFeature(
     private fun configuredApiKey(): String {
         val current = apiKey.get().trim()
         if (current.isNotBlank()) {
-            if (current != apiKey.get()) apiKey.set(current)
+            if (current != apiKey.get()) setApiKeyConfigValue(current)
             return current
         }
 
         for (configName in API_KEY_CONFIG_NAMES) {
             val value = readConfiguredApiKeyValue(configName)
             if (value.isNotBlank()) {
-                apiKey.set(value)
+                setApiKeyConfigValue(value)
                 return value
             }
         }
 
         return ""
+    }
+
+    private fun setApiKeyConfigValue(value: String) {
+        withApiKeyChangeSuppressed {
+            apiKey.set(value)
+        }
+    }
+
+    private fun withApiKeyChangeSuppressed(block: () -> Unit) {
+        suppressApiKeyChange = true
+        try {
+            block()
+        } finally {
+            suppressApiKeyChange = false
+        }
+    }
+
+    private fun onApiKeyInputChanged(value: String) {
+        if (suppressApiKeyChange) return
+        val normalized = value.trim()
+        if (normalized == lastApiKeyValue) return
+
+        lastApiKeyValue = normalized
+        if (normalized.isBlank()) {
+            pendingApiKeyRefreshValue = ""
+            pendingApiKeyRefreshAt = 0L
+            pendingApiKeyRefreshNotify = false
+            status = "API key missing"
+            return
+        }
+        if (!isRefreshableApiKey(normalized)) {
+            pendingApiKeyRefreshValue = ""
+            pendingApiKeyRefreshAt = 0L
+            pendingApiKeyRefreshNotify = false
+            status = "API key changed"
+            return
+        }
+
+        queueApiKeyRefresh(normalized, notify = false, delayMillis = API_KEY_REFRESH_DEBOUNCE_MILLIS)
+    }
+
+    private fun isRefreshableApiKey(value: String): Boolean =
+        value.length >= MIN_REFRESHABLE_API_KEY_LENGTH && value.none { it.isWhitespace() }
+
+    private fun queueApiKeyRefresh(value: String, notify: Boolean, delayMillis: Long) {
+        val now = System.currentTimeMillis()
+        lastApiKeyValue = value
+        pendingApiKeyRefreshValue = value
+        pendingApiKeyRefreshAt = now + delayMillis
+        pendingApiKeyRefreshNotify = pendingApiKeyRefreshNotify || notify
+        status = if (delayMillis <= 0L) "API key saved; refreshing..." else "API key saved; refresh queued"
+    }
+
+    private fun maybeRefreshAfterApiKeyChange(): Boolean {
+        val queuedKey = pendingApiKeyRefreshValue
+        if (queuedKey.isBlank()) return false
+        if (!sessionReady()) return true
+
+        val now = System.currentTimeMillis()
+        if (now < pendingApiKeyRefreshAt) return true
+        if (refreshing) {
+            pendingApiKeyRefreshAt = now + API_KEY_REFRESH_RETRY_MILLIS
+            return true
+        }
+
+        val current = configuredApiKey()
+        if (current != queuedKey) {
+            if (current.isBlank() || !isRefreshableApiKey(current)) {
+                pendingApiKeyRefreshValue = ""
+                pendingApiKeyRefreshAt = 0L
+                pendingApiKeyRefreshNotify = false
+                return false
+            }
+            queueApiKeyRefresh(current, pendingApiKeyRefreshNotify, API_KEY_REFRESH_DEBOUNCE_MILLIS)
+            return true
+        }
+
+        val notify = pendingApiKeyRefreshNotify
+        pendingApiKeyRefreshValue = ""
+        pendingApiKeyRefreshAt = 0L
+        pendingApiKeyRefreshNotify = false
+        startupRefreshAttempted = true
+        lastAutoRefreshAttempt = now
+        log("API key change triggered forced refresh")
+        refresh(force = true, recordObservedSample = false, notify = notify)
+        return true
+    }
+
+    private fun saveDevonianConfigAsync(reason: String) {
+        if (devonianConfigSaveRunning) {
+            devonianConfigSavePending = true
+            return
+        }
+        devonianConfigSaveRunning = true
+        thread(name = "DungeonProgressHud-ConfigSave", isDaemon = true) {
+            do {
+                devonianConfigSavePending = false
+                runCatching { Config.save() }
+                    .onFailure { log("Devonian config save failed reason=$reason: ${it.javaClass.simpleName}: ${it.message}") }
+            } while (devonianConfigSavePending)
+            devonianConfigSaveRunning = false
+        }
     }
 
     fun setApiKey(value: String) {
@@ -730,9 +974,9 @@ class DungeonProgressHudFeature(
 
         apiKey.set(normalized)
         runCatching { Config.setConfig(LEGACY_API_KEY_CONFIG, normalized) }
-        runCatching { Config.save() }
-        status = "API key saved"
-        send("API key saved. Run /dph refresh or press Refresh Now.")
+        saveDevonianConfigAsync("api-key-command")
+        queueApiKeyRefresh(normalized, notify = true, delayMillis = 0L)
+        send("API key saved. Refreshing API data...")
         log("API key saved via command length=${normalized.length}")
     }
 
@@ -761,38 +1005,71 @@ class DungeonProgressHudFeature(
     }
 
     fun setProfitMode(mode: String) {
+        setTrackerMode(mode)
+    }
+
+    fun setTrackerScope(input: String) {
+        when (input.trim().lowercase(Locale.ROOT)) {
+            "session" -> setTrackerMode("Session")
+            "total" -> setTrackerMode("Total")
+            "daily", "24h" -> setTrackerWindow("1d")
+            "weekly" -> setTrackerWindow("1w")
+            else -> setTrackerWindow(input)
+        }
+    }
+
+    fun setTrackerMode(mode: String) {
         val normalized = if (mode.equals("Total", true)) "Total" else "Session"
         state.chestProfitWindowMillis = 0L
         saveState()
         chestProfitMode.set(if (normalized == "Total") 1 else 0)
-        log("Chest profit mode set to $normalized")
-        send("Chest profit view: ${normalized.lowercase(Locale.ROOT)}.")
+        log("Tracker mode set to $normalized")
+        send("Tracker view: ${normalized.lowercase(Locale.ROOT)}.")
     }
 
     fun toggleProfitMode() {
+        toggleTrackerMode()
+    }
+
+    fun toggleTrackerMode() {
         if (state.chestProfitWindowMillis > 0L) {
-            setProfitMode(chestProfitMode.getCurrent())
+            setTrackerMode(chestProfitMode.getCurrent())
             return
         }
-        setProfitMode(if (chestProfitMode.getCurrent() == "Total") "Session" else "Total")
+        setTrackerMode(if (chestProfitMode.getCurrent() == "Total") "Session" else "Total")
     }
 
     fun setProfitWindow(input: String) {
+        setTrackerWindow(input)
+    }
+
+    fun setTrackerWindow(input: String) {
         val parsedDays = parseProfitWindowDays(input)
         if (parsedDays == null) {
-            send("Use /dph profit session, total, 7d, 14d, or 2w.")
+            send("Use /dph session, daily, total, 1, 2, 7, 1w, 2w, or 1m.")
             return
         }
 
         state.chestProfitWindowMillis = parsedDays * DAY_MILLIS
         saveState()
-        log("Chest profit window set to ${formatProfitWindow(state.chestProfitWindowMillis)}")
-        send("Chest profit view: ${formatProfitWindow(state.chestProfitWindowMillis)}.")
+        log("Tracker window set to ${formatProfitWindow(state.chestProfitWindowMillis)}")
+        send("Tracker view: ${formatProfitWindow(state.chestProfitWindowMillis)}.")
     }
 
     fun sendProfitStatus() {
+        sendTrackerStatus()
+    }
+
+    fun sendTrackerStatus() {
         val stats = chestProfitStats()
-        send("Chest profit view: ${stats.label}, ${stats.profit.formatCoins()} across ${stats.chests} chests.")
+        send("Tracker view: ${stats.label}, ${stats.profit.formatCoins()} across ${stats.chests} chests.")
+    }
+
+    fun resetTrackedItems() {
+        state.trackedItemDrops.clear()
+        saveState()
+        send("Tracked M7 item drops reset.")
+        log("Tracked M7 item drops reset")
     }
 
     fun sendRunSummary(scope: String) {
@@ -821,22 +1098,48 @@ class DungeonProgressHudFeature(
         if (!chestNames.contains(title)) return
 
         log("Inventory click title=$title slot=$slotId button=$button type=$clickType pending=${pendingChestProfit?.summary()}")
+        if (recordKismetUseIfClicked(screen, slotId)) return
         if (slotId != 31) return
 
+        val parsedCandidate = runCatching { parseChestProfit(screen) }
+            .onFailure { log("Chest claim parse failed: ${it.stackTraceToString()}") }
+            .getOrNull()
         val devonianCandidates = devonianChestProfitCandidates()
         val candidate = selectedCroesusCandidate?.takeIf { it.chestName == title }
             ?: devonianCandidates[title]
             ?: lastCroesusCandidates[title]
             ?: pendingChestProfit?.takeIf { it.chestName == title }
-            ?: runCatching { parseChestProfit(screen) }
-                .onFailure { log("Chest claim parse failed: ${it.stackTraceToString()}") }
-                .getOrNull()
-        if (candidate == null) {
+            ?: parsedCandidate
+        val enrichedCandidate = candidate?.withTrackedDropsFrom(parsedCandidate)
+        if (enrichedCandidate == null) {
             log("Chest claim click ignored: no profit candidate for title=$title")
             return
         }
 
-        recordChestProfit(candidate, "claim-click")
+        recordChestProfit(enrichedCandidate, "claim-click")
+    }
+
+    private fun recordKismetUseIfClicked(screen: AbstractContainerScreen<*>, slotId: Int): Boolean {
+        val stack = screen.menu.slots.getOrNull(slotId)?.item ?: screen.menu.items.getOrNull(slotId) ?: return false
+        val name = stack.hoverName.string.cleanMc()
+        val lore = plainLore(stack)
+        val text = (listOf(name) + lore).joinToString(" ").lowercase(Locale.ROOT)
+        if (!text.contains("kismet")) return false
+
+        val now = System.currentTimeMillis()
+        val key = "${screen.menu.containerId}:${screen.title.string}:$slotId"
+        if (key == lastRecordedKismetKey && now - lastRecordedKismetAt < 2_000) {
+            log("Duplicate kismet use ignored key=$key")
+            return true
+        }
+        lastRecordedKismetKey = key
+        lastRecordedKismetAt = now
+        state.totalKismetsUsed++
+        state.kismetUses.add(KismetUseSample(now, screen.title.string, data?.profileName.orEmpty(), floorValue()))
+        while (state.kismetUses.size > 5000) state.kismetUses.removeAt(0)
+        saveState()
+        log("Recorded kismet use title=${screen.title.string} slot=$slotId total=${state.totalKismetsUsed}")
+        return true
     }
 
     fun onFakeOpenKey(screen: AbstractContainerScreen<*>): Boolean {
@@ -872,16 +1175,23 @@ class DungeonProgressHudFeature(
 
         val title = screen.title.string
         val devonianCandidates = devonianChestProfitCandidates()
+        val parsedDirectCandidate = if (chestNames.contains(title)) {
+            runCatching { parseChestProfit(screen, verbose = true) }
+                .onFailure { log("Fake open parse failed: ${it.stackTraceToString()}") }
+                .getOrNull()
+        } else {
+            null
+        }
         val candidate = runCatching {
             when {
                 chestNames.contains(title) -> selectedCroesusCandidate?.takeIf { it.chestName == title }
                     ?: devonianCandidates[title]
                     ?: lastCroesusCandidates[title]
                     ?: pendingChestProfit?.takeIf { it.chestName == title }
-                    ?: parseChestProfit(screen, verbose = true)
+                    ?: parsedDirectCandidate
                 title.matches(runChestRegex) -> selectedCroesusCandidate
-                    ?: devonianCandidates.values.maxByOrNull { it.profit }
                     ?: parseBestCroesusChest(screen)
+                    ?: devonianCandidates.values.maxByOrNull { it.profit }
                 else -> null
             }
         }.onFailure {
@@ -893,7 +1203,7 @@ class DungeonProgressHudFeature(
             return false
         }
 
-        recordChestProfit(candidate, "fake-open")
+        recordChestProfit(candidate.withTrackedDropsFrom(parsedDirectCandidate), "fake-open")
         return true
     }
 
@@ -903,14 +1213,10 @@ class DungeonProgressHudFeature(
         if (!chestNames.contains(chestName)) return
 
         val devonianCandidates = devonianChestProfitCandidates()
-        val parsedCandidates = if (devonianCandidates.isNotEmpty()) devonianCandidates else runCatching {
-            val items = screen.menu.items.take(chestContainerSlotCount(screen.menu.items.size))
-            items.mapIndexedNotNull { slot, stack ->
-                val name = stack.customName?.string ?: return@mapIndexedNotNull null
-                if (!chestNames.contains(name)) return@mapIndexedNotNull null
-                parseCroesusChestItem(name, stack, slot)
-            }.associateBy { it.chestName }
-        }.getOrDefault(emptyMap())
+        val parsedFromScreen = parseCroesusCandidatesFromScreen(screen)
+        val parsedCandidates = (parsedFromScreen + devonianCandidates.mapValues { (_, candidate) ->
+            candidate.withTrackedDropsFrom(parsedFromScreen[candidate.chestName])
+        })
 
         if (parsedCandidates.isNotEmpty()) lastCroesusCandidates = parsedCandidates
         val candidate = parsedCandidates[chestName] ?: return
@@ -937,6 +1243,25 @@ class DungeonProgressHudFeature(
         val label: String,
         val value: String,
         val suffix: String = "",
+    )
+
+    private data class TrackedDropDefinition(
+        val key: String,
+        val displayName: String,
+        val aliases: Set<String>,
+    )
+
+    data class TrackedDrop(
+        val key: String,
+        val displayName: String,
+    )
+
+    private data class HudPanelLayout(
+        val width: Int,
+        val dividerY: Int,
+        val height: Int,
+        val separatorX: Int,
+        val valueX: Int,
     )
 
     private data class HudLineBounds(
@@ -971,7 +1296,7 @@ class DungeonProgressHudFeature(
             if (showXpPerRun.get()) add(HudLine("xpPerRun", "&bXP/Run: &f${xpPerRun.format()} &7($source)"))
             if (showProfile.get()) add(HudLine("profile", "&bProfile: &f${profile.profileName}"))
             if (showLastRun.get()) add(HudLine("lastRun", "&bLast Run: &f${last?.normalizedXpDelta?.format() ?: "N/A"}"))
-            if (showObservedCount.get()) add(HudLine("observedCount", "&bRuns: &f${samples.size}"))
+            if (showObservedCount.get()) add(HudLine("observedCount", "&bRuns: &f${observedRunCountForFloor()}"))
             if (showChestProfit.get()) {
                 val stats = chestProfitStats()
                 add(HudLine("profit", "&bProfit: &a${stats.profit.formatCoins()} &7(${stats.label})"))
@@ -999,9 +1324,13 @@ class DungeonProgressHudFeature(
     }
 
     fun renderHudOrderOverlay(graphics: GuiGraphics, mouseX: Double, mouseY: Double) {
+        if (!renderHud.get() || !isEnabled()) return
         val dragging = draggedHudLineId != null
         val lines = editableHudLines()
-        if (lines.isEmpty()) return
+        if (lines.isEmpty()) {
+            drawDirect(graphics, lines)
+            return
+        }
 
         val shiftDown = isShiftDown()
         val hoverId = if (shiftDown || dragging) hudLineAt(mouseX, mouseY, lines)?.id else null
@@ -1010,10 +1339,26 @@ class DungeonProgressHudFeature(
     }
 
     fun onHudOrderMouseClicked(screen: AbstractContainerScreen<*>, event: MouseButtonEvent, shiftDown: Boolean): Boolean {
+        val liveMouse = currentScaledMousePosition()
+        if (event.button() == GLFW.GLFW_MOUSE_BUTTON_LEFT &&
+            (hudModeButtonContains(event.x(), event.y()) || hudModeButtonContains(liveMouse.first, liveMouse.second))
+        ) {
+            toggleHudViewMode()
+            return true
+        }
         if (!shiftDown || event.button() != GLFW.GLFW_MOUSE_BUTTON_LEFT) return false
         val hit = hudLineAt(event.x(), event.y(), editableHudLines()) ?: return false
         draggedHudLineId = hit.id
         hoveredHudLineId = hit.id
+        return true
+    }
+
+    fun onHudModeButtonPressed(): Boolean {
+        val screen = mc.screen
+        if (screen !is AbstractContainerScreen<*>) return false
+        val mouse = currentScaledMousePosition()
+        if (!hudModeButtonContains(mouse.first, mouse.second)) return false
+        toggleHudViewMode()
         return true
     }
 
@@ -1037,6 +1382,7 @@ class DungeonProgressHudFeature(
 
     private fun editableHudLines(): List<HudLine> {
         if (!renderHud.get() || !isEnabled()) return emptyList()
+        if (currentHudMode() == HUD_MODE_ITEMS) return emptyList()
         return (buildProfitHudTopRows() + buildProfitHudBottomRows()).map { HudLine(it.id, it.label) }
     }
 
@@ -1070,14 +1416,9 @@ class DungeonProgressHudFeature(
         val renderScale = scale.takeIf { it.isFinite() && it > 0f } ?: 1f
         val topRows = buildProfitHudTopRows()
         val bottomRows = buildProfitHudBottomRows()
-        val allRows = topRows + bottomRows
-        val labelWidth = allRows.maxOfOrNull { mc.font.width(it.label) } ?: 72
-        val valueWidth = allRows.maxOfOrNull { mc.font.width(it.value) + if (it.suffix.isBlank()) 0 else 10 + mc.font.width(it.suffix) } ?: 64
-        val separatorX = HUD_SIDE_PADDING + labelWidth + 8
-        val valueX = separatorX + 8
-        val panelWidth = max(valueX + valueWidth + HUD_SIDE_PADDING, mc.font.width("Dungeon Profit Hud") + HUD_SIDE_PADDING * 2 + 10)
+        val layout = hudPanelLayout("Dungeon Profit Hud", topRows, bottomRows)
         val left = drawX
-        val right = drawX + panelWidth * renderScale
+        val right = drawX + layout.width * renderScale
 
         val bounds = mutableListOf<HudLineBounds>()
         var yOffset = HUD_TOP_PADDING + HUD_TITLE_HEIGHT
@@ -1087,7 +1428,7 @@ class DungeonProgressHudFeature(
             bounds.add(HudLineBounds(row.id, row.label, left, top, right, bottom))
             yOffset += HUD_ROW_HEIGHT
         }
-        yOffset += HUD_PROFIT_GAP + 1
+        yOffset = layout.dividerY + 1 + HUD_PROFIT_GAP
         for (row in bottomRows) {
             val top = drawY + yOffset * renderScale
             val bottom = drawY + (yOffset + HUD_ROW_HEIGHT) * renderScale
@@ -1114,12 +1455,8 @@ class DungeonProgressHudFeature(
         val targetId = if (draggedId != null) hoveredHudLineId ?: hoverId else hoverId
         val topRows = buildProfitHudTopRows()
         val bottomRows = buildProfitHudBottomRows()
-        val allRows = topRows + bottomRows
-        val labelWidth = allRows.maxOfOrNull { mc.font.width(it.label) } ?: 72
-        val valueWidth = allRows.maxOfOrNull { mc.font.width(it.value) + if (it.suffix.isBlank()) 0 else 10 + mc.font.width(it.suffix) } ?: 64
-        val separatorX = HUD_SIDE_PADDING + labelWidth + 8
-        val valueX = separatorX + 8
-        val panelWidth = max(valueX + valueWidth + HUD_SIDE_PADDING, mc.font.width("Dungeon Profit Hud") + HUD_SIDE_PADDING * 2 + 10)
+        val layout = hudPanelLayout("Dungeon Profit Hud", topRows, bottomRows)
+        val panelWidth = layout.width
 
         fun highlightRows(rows: List<ProfitHudRow>, startY: Int) {
             var yOffset = startY
@@ -1210,6 +1547,7 @@ class DungeonProgressHudFeature(
         val cost = chestCost(plainLore)
         var itemValue = 0L
         var itemCount = 0
+        val trackedDrops = mutableListOf<TrackedDrop>()
         val containerSlotCount = chestContainerSlotCount(items.size)
 
         for (stack in items.take(containerSlotCount)) {
@@ -1219,13 +1557,14 @@ class DungeonProgressHudFeature(
                     itemValue += it.totalValue.toLong()
                 }
                 itemCount++
+                it.trackedDrop?.let(trackedDrops::add)
                 if (verbose) {
                     log("Chest screen item parsed chest=$title name=${stack.hoverName.string.cleanMc()} id=${it.itemId} unit=${it.unitValue} amount=${it.amount} essence=${it.essence} total=${it.totalValue}")
                 }
             }
         }
 
-        return ChestProfitCandidate(title, itemValue - cost, cost, itemCount, containerSlotCount)
+        return ChestProfitCandidate(title, itemValue - cost, cost, itemCount, containerSlotCount, trackedDrops)
     }
 
     private fun chestScreenScanKey(screen: AbstractContainerScreen<*>): String {
@@ -1263,25 +1602,35 @@ class DungeonProgressHudFeature(
     }
 
     private fun parseBestCroesusChest(screen: AbstractContainerScreen<*>): ChestProfitCandidate? {
+        val parsedFromScreen = parseCroesusCandidatesFromScreen(screen)
         val devonianCandidates = devonianChestProfitCandidates()
-        if (devonianCandidates.isNotEmpty()) {
-            lastCroesusCandidates = devonianCandidates
-            val best = devonianCandidates.values.maxByOrNull { it.profit }
-            log("Using Devonian Croesus candidates=${devonianCandidates.values.joinToString { "${it.chestName}:${it.profit}" }} best=${best?.summary()}")
+        val candidatesByName = parsedFromScreen + devonianCandidates.mapValues { (_, candidate) ->
+            candidate.withTrackedDropsFrom(parsedFromScreen[candidate.chestName])
+        }
+        if (candidatesByName.isNotEmpty()) {
+            lastCroesusCandidates = candidatesByName
+            val best = candidatesByName.values.maxByOrNull { it.profit }
+            log("Fake open Croesus candidates=${candidatesByName.values.joinToString { "${it.chestName}:${it.profit}" }} best=${best?.summary()}")
             return best
         }
 
+        return null
+    }
+
+    private fun parseCroesusCandidatesFromScreen(screen: AbstractContainerScreen<*>): Map<String, ChestProfitCandidate> = runCatching {
         val items = screen.menu.items.take(chestContainerSlotCount(screen.menu.items.size))
-        val candidates = items.mapIndexedNotNull { slot, stack ->
+        items.mapIndexedNotNull { slot, stack ->
             val name = stack.customName?.string ?: return@mapIndexedNotNull null
             if (!chestNames.contains(name)) return@mapIndexedNotNull null
             parseCroesusChestItem(name, stack, slot)
-        }.sortedByDescending { it.profit }
-        if (candidates.isNotEmpty()) lastCroesusCandidates = candidates.associateBy { it.chestName }
+        }.associateBy { it.chestName }
+    }.onFailure {
+        log("Croesus parse failed: ${it.stackTraceToString()}")
+    }.getOrDefault(emptyMap())
 
-        val best = candidates.firstOrNull()
-        log("Fake open parsed Croesus candidates=${candidates.joinToString { "${it.chestName}:${it.profit}" }} best=${best?.summary()}")
-        return best
+    private fun ChestProfitCandidate.withTrackedDropsFrom(other: ChestProfitCandidate?): ChestProfitCandidate {
+        if (trackedDrops.isNotEmpty() || other == null || other.trackedDrops.isEmpty()) return this
+        return copy(trackedDrops = other.trackedDrops)
     }
 
     private fun devonianChestProfitCandidates(): Map<String, ChestProfitCandidate> {
@@ -1291,9 +1640,6 @@ class DungeonProgressHudFeature(
         candidates.putAll(devonianCroesusListenerCandidates())
         candidates.putAll(devonianChestProfitFeatureCandidates())
         candidates.putAll(devonianCroesusProfitCandidates())
-        if (candidates.isNotEmpty()) {
-            log("Devonian chest profit candidates=${candidates.values.joinToString { "${it.chestName}:${it.profit}" }}")
-        }
         return candidates
     }
 
@@ -1397,6 +1743,7 @@ class DungeonProgressHudFeature(
         var cost = 0
         var itemValue = 0L
         var itemCount = 0
+        val trackedDrops = mutableListOf<TrackedDrop>()
 
         for (idx in plainLore.indices) {
             val line = plainLore[idx]
@@ -1411,12 +1758,12 @@ class DungeonProgressHudFeature(
             parseCroesusLoreItem(line, formattedLore.getOrNull(idx) ?: line)?.let {
                 if (!it.essence || includeEssenceProfit.get()) itemValue += it.totalValue.toLong()
                 itemCount++
-                log("Croesus item parsed chest=$chestName slot=$slot line=$line id=${it.itemId} unit=${it.unitValue} amount=${it.amount} essence=${it.essence} total=${it.totalValue}")
+                it.trackedDrop?.let(trackedDrops::add)
             }
         }
 
         if (itemCount == 0) return null
-        return ChestProfitCandidate(chestName, itemValue - cost, cost, itemCount, scannedSlots = slot)
+        return ChestProfitCandidate(chestName, itemValue - cost, cost, itemCount, scannedSlots = slot, trackedDrops = trackedDrops)
     }
 
     private fun parseCroesusLoreItem(line: String, formattedLine: String): ChestProfitItem? {
@@ -1447,11 +1794,13 @@ class DungeonProgressHudFeature(
         id = normalizeItemId(id)
 
         val price = itemPrice(id)
+        val trackedDrop = trackedDropFor(id, line)
         if (price <= 0) {
+            if (trackedDrop != null) return ChestProfitItem(id, 0, 1, essence = false, trackedDrop = trackedDrop)
             log("Croesus item price missing id=$id line=$line formatted=$formattedLine")
             return null
         }
-        return ChestProfitItem(id, price, 1, essence = false)
+        return ChestProfitItem(id, price, 1, essence = false, trackedDrop = trackedDrop)
     }
 
     private fun chestContainerSlotCount(totalSlots: Int): Int {
@@ -1499,11 +1848,22 @@ class DungeonProgressHudFeature(
         id = normalizeItemId(id)
 
         val price = itemPrice(id)
-        if (price <= 0) return null
-        return ChestProfitItem(id, price, 1, essence = false)
+        val trackedDrop = trackedDropFor(id, name)
+        if (price <= 0) {
+            if (trackedDrop != null) return ChestProfitItem(id, 0, 1, essence = false, trackedDrop = trackedDrop)
+            return null
+        }
+        return ChestProfitItem(id, price, 1, essence = false, trackedDrop = trackedDrop)
     }
 
     private fun normalizeItemId(id: String): String = specialIds[id] ?: id
+
+    private fun trackedDropFor(itemId: String, displayName: String): TrackedDrop? {
+        val definition = TRACKED_DROPS_BY_ALIAS[normalizeTrackedAlias(itemId)]
+            ?: TRACKED_DROPS_BY_ALIAS[normalizeTrackedAlias(displayName.cleanMc())]
+            ?: return null
+        return TrackedDrop(definition.key, definition.displayName)
+    }
 
     private fun itemPrice(id: String): Int {
         val direct = SkyblockPrices.buyPrice(id).roundToInt()
@@ -1536,6 +1896,7 @@ class DungeonProgressHudFeature(
             return
         }
 
+        val floor = floorValue()
         ensureSessionStarted(now, "chest-profit-$source")
         lastRecordedChestAt = now
         state.lastChestName = candidate.chestName
@@ -1550,50 +1911,70 @@ class DungeonProgressHudFeature(
                 chestName = candidate.chestName,
                 profit = candidate.profit,
                 profileName = data?.profileName.orEmpty(),
-                floorLabel = floorValue(),
+                floorLabel = floor,
             )
         )
+        if (shouldTrackM7Drops(floor)) {
+            candidate.trackedDrops.forEach { drop ->
+                state.trackedItemDrops.add(
+                    TrackedItemDropSample(
+                        timestamp = now,
+                        itemKey = drop.key,
+                        displayName = drop.displayName,
+                        chestName = candidate.chestName,
+                        floorLabel = floor,
+                        profileName = data?.profileName.orEmpty(),
+                    )
+                )
+            }
+        }
+        while (state.trackedItemDrops.size > MAX_TRACKED_ITEM_DROPS) state.trackedItemDrops.removeAt(0)
+        decrementCroesusUnclaimedCount("chest-profit-$source")
         while (state.chestProfits.size > 250) state.chestProfits.removeAt(0)
         saveState()
-        log("Recorded chest profit source=$source ${candidate.summary()} samples=${state.chestProfits.size} sessionProfit=$sessionChestProfit totalProfit=${state.totalChestProfit}")
+        log("Recorded chest profit source=$source ${candidate.summary()} tracked=${candidate.trackedDrops.joinToString { it.key }} samples=${state.chestProfits.size} sessionProfit=$sessionChestProfit totalProfit=${state.totalChestProfit}")
     }
 
-    private fun fetchProfile(): ProfileData {
-        val user = mc.user
-        val uuid = user.profileId.toString().replace("-", "")
-        val encodedUuid = URLEncoder.encode(uuid, StandardCharsets.UTF_8)
-        log("Fetching Hypixel profile user=${user.name} uuid=$uuid")
+    private fun fetchProfile(request: ProfileRequest): ProfileData {
+        val encodedUuid = URLEncoder.encode(request.playerUuid, StandardCharsets.UTF_8)
+        log("Fetching Hypixel profile user=${request.playerName} uuid=${request.playerUuid}")
         val connection = URI("https://api.hypixel.net/v2/skyblock/profiles?uuid=$encodedUuid").toURL().openConnection() as HttpURLConnection
-        connection.requestMethod = "GET"
-        connection.connectTimeout = 10_000
-        connection.readTimeout = 10_000
-        connection.setRequestProperty("Accept", "application/json")
-        connection.setRequestProperty("API-Key", configuredApiKey())
-        connection.setRequestProperty("User-Agent", "DungeonProgressHud/1.0.0")
+        try {
+            connection.requestMethod = "GET"
+            connection.connectTimeout = 10_000
+            connection.readTimeout = 10_000
+            connection.setRequestProperty("Accept", "application/json")
+            connection.setRequestProperty("API-Key", request.apiKey)
+            connection.setRequestProperty("User-Agent", "DungeonProgressHud/1.0.0")
 
-        val code = connection.responseCode
-        log("Hypixel response code=$code")
-        if (code == 403) error("Invalid API key")
-        if (code == 429) error("Rate limited")
-        if (code !in 200..299) error("Hypixel HTTP $code")
+            val code = connection.responseCode
+            log("Hypixel response code=$code")
+            if (code == 403) error("Invalid API key")
+            if (code == 429) error("Rate limited")
+            if (code !in 200..299) error("Hypixel HTTP $code")
 
-        val root = JsonParser.parseReader(connection.inputStream.reader()).asJsonObject
-        if (root.get("success")?.asBoolean != true) error(root.get("cause")?.asString ?: "Hypixel API failed")
-        val profiles = root.getAsJsonArray("profiles") ?: error("No SkyBlock profiles")
-        val selected = profiles.map { it.asJsonObject }.firstOrNull { it.get("selected")?.asBoolean == true }
-            ?: error("No selected SkyBlock profile")
-        val selectedProfileName = selected.get("cute_name")?.asString ?: "Unknown"
-        log("Selected profile cute_name=$selectedProfileName")
-        val member = selected.getAsJsonObject("members")?.getAsJsonObject(uuid) ?: error("Selected profile missing player")
-        val dungeons = member.getAsJsonObject("dungeons") ?: error("Dungeon API unavailable")
-        val catacombs = dungeons.getAsJsonObject("dungeon_types")?.getAsJsonObject("catacombs") ?: error("Catacombs data unavailable")
+            val root = connection.inputStream.reader(StandardCharsets.UTF_8).use { reader ->
+                JsonParser.parseReader(reader).asJsonObject
+            }
+            if (root.get("success")?.asBoolean != true) error(root.get("cause")?.asString ?: "Hypixel API failed")
+            val profiles = root.getAsJsonArray("profiles") ?: error("No SkyBlock profiles")
+            val selected = profiles.map { it.asJsonObject }.firstOrNull { it.get("selected")?.asBoolean == true }
+                ?: error("No selected SkyBlock profile")
+            val selectedProfileName = selected.get("cute_name")?.asString ?: "Unknown"
+            log("Selected profile cute_name=$selectedProfileName")
+            val member = selected.getAsJsonObject("members")?.getAsJsonObject(request.playerUuid) ?: error("Selected profile missing player")
+            val dungeons = member.getAsJsonObject("dungeons") ?: error("Dungeon API unavailable")
+            val catacombs = dungeons.getAsJsonObject("dungeon_types")?.getAsJsonObject("catacombs") ?: error("Catacombs data unavailable")
 
-        return ProfileData(
-            playerName = user.name,
-            playerUuid = uuid,
-            profileName = selectedProfileName,
-            catacombsExperience = catacombs.get("experience")?.asLong ?: 0L,
-        )
+            return ProfileData(
+                playerName = request.playerName,
+                playerUuid = request.playerUuid,
+                profileName = selectedProfileName,
+                catacombsExperience = catacombs.get("experience")?.asLong ?: 0L,
+            )
+        } finally {
+            connection.disconnect()
+        }
     }
 
     private fun recordSample(profile: ProfileData, recordObservedSample: Boolean) {
@@ -1698,6 +2079,7 @@ class DungeonProgressHudFeature(
                 normalizedCataXp = lastDungeonCompletionNormalizedXp,
             )
         )
+        incrementCroesusUnclaimedCount("dungeon-completion")
         while (state.runs.size > 500) state.runs.removeAt(0)
         saveState()
         log("Recorded dungeon completion chat XP raw=$cataXp normalized=$lastDungeonCompletionNormalizedXp floor=$floor time=$pendingCompletionTimeSeconds score=$pendingCompletionScore")
@@ -1753,16 +2135,18 @@ class DungeonProgressHudFeature(
             if (manual) send("No Minecraft logs folder found.")
             return
         }
-        val cutoff = System.currentTimeMillis() - 8L * DAY_MILLIS
-        val files = logsDir.listFiles()
-            ?.filter { it.isFile && it.lastModified() >= cutoff && (it.extension == "log" || it.name.endsWith(".log.gz")) }
-            ?.sortedWith(compareBy<File> { it.lastModified() }.thenBy { it.name })
-            ?: emptyList()
-        if (!manual && files.none { it.lastModified() > state.lastLogImportAt }) return
 
         val existingRuns = state.runs.toList()
         val fallbackFloor = floorValue()
+        val lastLogImportAt = state.lastLogImportAt
         thread(name = "DPH Log Import", isDaemon = true) {
+            val cutoff = System.currentTimeMillis() - 8L * DAY_MILLIS
+            val files = logsDir.listFiles()
+                ?.filter { it.isFile && it.lastModified() >= cutoff && (it.extension == "log" || it.name.endsWith(".log.gz")) }
+                ?.sortedWith(compareBy<File> { it.lastModified() }.thenBy { it.name })
+                ?: emptyList()
+            if (!manual && files.none { it.lastModified() > lastLogImportAt }) return@thread
+
             val importedRuns = mutableListOf<ImportedDungeonRun>()
             var pendingAt = 0L
             var pendingFloor = ""
@@ -1963,6 +2347,12 @@ class DungeonProgressHudFeature(
         return state.samples.filter { it.floorLabel.equals(floor, true) && it.normalizedXpDelta > 0 }
     }
 
+    private fun observedRunCountForFloor(): Int {
+        val floor = floorValue()
+        val runCount = state.runs.count { it.floorLabel.equals(floor, true) && it.normalizedCataXp > 0 }
+        return runCount.takeIf { it > 0 } ?: samplesForFloor().size
+    }
+
     private fun chestProfitStats(): ChestProfitStats {
         if (state.chestProfitWindowMillis > 0L) {
             val cutoff = System.currentTimeMillis() - state.chestProfitWindowMillis
@@ -2037,12 +2427,16 @@ class DungeonProgressHudFeature(
     }
 
     private fun parseProfitWindowDays(input: String): Long? {
-        val match = Regex("^(\\d+)(d|day|days|w|week|weeks)?$", RegexOption.IGNORE_CASE).matchEntire(input.trim())
+        val match = Regex("^(\\d+)(d|day|days|w|week|weeks|m|mo|month|months)?$", RegexOption.IGNORE_CASE).matchEntire(input.trim())
             ?: return null
         val amount = match.groupValues[1].toLongOrNull() ?: return null
         if (amount <= 0L) return null
         val unit = match.groupValues.getOrNull(2)?.lowercase(Locale.ROOT).orEmpty()
-        val days = if (unit.startsWith("w")) amount * 7L else amount
+        val days = when {
+            unit.startsWith("w") -> amount * 7L
+            unit == "m" || unit == "mo" || unit.startsWith("month") -> amount * 30L
+            else -> amount
+        }
         return days.coerceAtMost(365L)
     }
 
@@ -2065,9 +2459,8 @@ class DungeonProgressHudFeature(
     }
 
     private fun drawDirect(graphics: GuiGraphics, lines: List<HudLine>) {
-        val xpRows = buildProfitHudTopRows()
-        val profitRows = buildProfitHudBottomRows()
-        if (xpRows.isEmpty() && profitRows.isEmpty()) return
+        val (title, topRows, bottomRows) = currentHudContent()
+        if (topRows.isEmpty() && bottomRows.isEmpty()) return
 
         graphics.pose().pushMatrix()
         val drawX = if (x.isFinite()) x.toFloat() else 10f
@@ -2077,28 +2470,103 @@ class DungeonProgressHudFeature(
         graphics.pose().scale(renderScale, renderScale)
 
         val fontHeight = mc.font.lineHeight
-        val rowHeight = HUD_ROW_HEIGHT
-        val allRows = xpRows + profitRows
+        val layout = hudPanelLayout(title, topRows, bottomRows)
+
+        drawProfitPanel(graphics, layout.width, layout.height, layout.dividerY)
+
+        val buttonX = layout.width - HUD_MODE_BUTTON_WIDTH - HUD_MODE_BUTTON_MARGIN
+        val titleRight = if (mc.screen is AbstractContainerScreen<*>) buttonX - 4 else layout.width
+        val titleX = ((titleRight - mc.font.width(title)) / 2).coerceAtLeast(HUD_SIDE_PADDING)
+        graphics.drawString(mc.font, Component.literal(title), titleX, HUD_TOP_PADDING, HUD_SKETCH_WHITE, true)
+        if (mc.screen is AbstractContainerScreen<*>) {
+            drawHudModeButton(graphics, layout.width)
+        }
+        var yOffset = HUD_TOP_PADDING + HUD_TITLE_HEIGHT
+        yOffset = drawProfitRows(graphics, topRows, HUD_SIDE_PADDING, layout.separatorX, layout.valueX, yOffset, HUD_ROW_HEIGHT, fontHeight)
+        drawProfitScopeLabel(graphics, layout)
+        yOffset = layout.dividerY + 1 + HUD_PROFIT_GAP
+        drawProfitRows(graphics, bottomRows, HUD_SIDE_PADDING, layout.separatorX, layout.valueX, yOffset, HUD_ROW_HEIGHT, fontHeight)
+
+        graphics.pose().popMatrix()
+    }
+
+    private fun currentHudContent(): Triple<String, List<ProfitHudRow>, List<ProfitHudRow>> =
+        if (currentHudMode() == HUD_MODE_ITEMS) {
+            Triple("Dungeon Item Tracker", buildItemTrackerTopRows(), buildItemTrackerRows())
+        } else {
+            Triple("Dungeon Profit Hud", buildProfitHudTopRows(), buildProfitHudBottomRows())
+        }
+
+    private fun currentHudMode(): String =
+        if (state.hudViewMode == HUD_MODE_ITEMS) HUD_MODE_ITEMS else HUD_MODE_PROFIT
+
+    private fun toggleHudViewMode() {
+        state.hudViewMode = if (currentHudMode() == HUD_MODE_ITEMS) HUD_MODE_PROFIT else HUD_MODE_ITEMS
+        saveState()
+        log("HUD view mode toggled mode=${state.hudViewMode}")
+    }
+
+    private fun hudPanelLayout(title: String, topRows: List<ProfitHudRow>, bottomRows: List<ProfitHudRow>): HudPanelLayout {
+        val allRows = sharedHudLayoutRows()
         val labelWidth = allRows.maxOfOrNull { mc.font.width(it.label) } ?: 72
         val valueWidth = allRows.maxOfOrNull { mc.font.width(it.value) + if (it.suffix.isBlank()) 0 else 10 + mc.font.width(it.suffix) } ?: 64
         val separatorX = HUD_SIDE_PADDING + labelWidth + 8
         val valueX = separatorX + 8
-        val panelWidth = max(valueX + valueWidth + HUD_SIDE_PADDING, mc.font.width("Dungeon Profit Hud") + HUD_SIDE_PADDING * 2 + 10)
-        val topRowsHeight = xpRows.size * rowHeight
-        val bottomRowsHeight = profitRows.size * rowHeight
-        val dividerY = HUD_TOP_PADDING + HUD_TITLE_HEIGHT + topRowsHeight + HUD_PROFIT_GAP / 2
-        val panelHeight = dividerY + 1 + HUD_PROFIT_GAP + bottomRowsHeight + HUD_TOP_PADDING
+        val titleButtonSpace = if (mc.screen is AbstractContainerScreen<*>) {
+            HUD_MODE_BUTTON_WIDTH + HUD_MODE_BUTTON_MARGIN * 2
+        } else {
+            0
+        }
+        val sharedTitleWidth = max(mc.font.width("Dungeon Profit Hud"), mc.font.width("Dungeon Item Tracker"))
+        val width = max(valueX + valueWidth + HUD_SIDE_PADDING, sharedTitleWidth + HUD_SIDE_PADDING * 2 + titleButtonSpace)
+        val dividerY = HUD_TOP_PADDING + HUD_TITLE_HEIGHT + topRows.size * HUD_ROW_HEIGHT + HUD_PROFIT_GAP / 2
+        val height = dividerY + 1 + HUD_PROFIT_GAP + bottomRows.size * HUD_ROW_HEIGHT + HUD_TOP_PADDING
+        return HudPanelLayout(width, dividerY, height, separatorX, valueX)
+    }
 
-        drawProfitPanel(graphics, panelWidth, panelHeight, dividerY)
+    private fun sharedHudLayoutRows(): List<ProfitHudRow> =
+        buildProfitHudTopRows() + buildProfitHudBottomRows() + buildItemTrackerTopRows() + buildItemTrackerRows()
 
-        val titleX = (panelWidth - mc.font.width("Dungeon Profit Hud")) / 2
-        graphics.drawString(mc.font, Component.literal("Dungeon Profit Hud"), titleX, HUD_TOP_PADDING, HUD_SKETCH_WHITE, true)
-        var yOffset = HUD_TOP_PADDING + HUD_TITLE_HEIGHT
-        yOffset = drawProfitRows(graphics, xpRows, HUD_SIDE_PADDING, separatorX, valueX, yOffset, rowHeight, fontHeight)
-        yOffset = dividerY + 1 + HUD_PROFIT_GAP
-        drawProfitRows(graphics, profitRows, HUD_SIDE_PADDING, separatorX, valueX, yOffset, rowHeight, fontHeight)
+    private fun drawHudModeButton(graphics: GuiGraphics, panelWidth: Int) {
+        val label = if (currentHudMode() == HUD_MODE_ITEMS) "Profit" else "Items"
+        val x = panelWidth - HUD_MODE_BUTTON_WIDTH - HUD_MODE_BUTTON_MARGIN
+        val y = HUD_TOP_PADDING + (mc.font.lineHeight - HUD_MODE_BUTTON_HEIGHT) / 2
+        drawRoundedFill(graphics, x, y, HUD_MODE_BUTTON_WIDTH, HUD_MODE_BUTTON_HEIGHT, 0x99101010.toInt())
+        drawRoundedBorder(graphics, x, y, HUD_MODE_BUTTON_WIDTH, HUD_MODE_BUTTON_HEIGHT, HUD_SKETCH_WHITE)
+        val textX = x + (HUD_MODE_BUTTON_WIDTH - mc.font.width(label)) / 2
+        val textY = y + (HUD_MODE_BUTTON_HEIGHT - mc.font.lineHeight) / 2
+        graphics.drawString(mc.font, Component.literal(label), textX, textY, HUD_SKETCH_WHITE, true)
+    }
 
-        graphics.pose().popMatrix()
+    private fun drawProfitScopeLabel(graphics: GuiGraphics, layout: HudPanelLayout) {
+        val label = "(${chestProfitStats().label})"
+        val x = (layout.width - HUD_SIDE_PADDING - mc.font.width(label)).coerceAtLeast(layout.valueX)
+        val y = if (currentHudMode() == HUD_MODE_ITEMS) {
+            HUD_TOP_PADDING + HUD_TITLE_HEIGHT - 8
+        } else {
+            layout.dividerY + 4
+        }
+        graphics.drawString(mc.font, Component.literal(label), x, y, HUD_SKETCH_WHITE, true)
+    }
+
+    private fun hudModeButtonContains(mouseX: Double, mouseY: Double): Boolean {
+        if (mc.screen !is AbstractContainerScreen<*>) return false
+        if (!renderHud.get() || !isEnabled()) return false
+        val (title, topRows, bottomRows) = currentHudContent()
+        val layout = hudPanelLayout(title, topRows, bottomRows)
+        val drawX = if (x.isFinite()) x else 10.0
+        val drawY = if (y.isFinite()) y else 10.0
+        val renderScale = scale.takeIf { it.isFinite() && it > 0f } ?: 1f
+        val left = drawX + (layout.width - HUD_MODE_BUTTON_WIDTH - HUD_MODE_BUTTON_MARGIN - 6) * renderScale
+        val top = drawY + (HUD_TOP_PADDING - 3) * renderScale
+        val right = drawX + layout.width * renderScale
+        val bottom = drawY + (HUD_TOP_PADDING + HUD_MODE_BUTTON_HEIGHT + 3) * renderScale
+        return mouseX >= left && mouseX <= right && mouseY >= top && mouseY <= bottom
+    }
+
+    private fun currentScaledMousePosition(): Pair<Double, Double> {
+        val window = mc.window
+        return mc.mouseHandler.getScaledXPos(window) to mc.mouseHandler.getScaledYPos(window)
     }
 
     private fun buildProfitHudTopRows(): List<ProfitHudRow> {
@@ -2110,29 +2578,147 @@ class DungeonProgressHudFeature(
         val runs = xpPerRun.takeIf { it > 0 }?.let { ceil(remaining.toDouble() / it.toDouble()).toLong() }
         val currentLevel = profile?.let { currentCataLevel(it.catacombsExperience) } ?: 0
         return orderProfitRows(
-            listOf(
-                ProfitHudRow("sessionTime", "Session Time", sessionDurationText()),
-                ProfitHudRow("currentLevel", "Cata Level", currentLevel.toString()),
-                ProfitHudRow("target", "Target", targetLevelValue().toString()),
-                ProfitHudRow("levelProgress", "Next Level", profile?.let { "${levelProgressPercent(it.catacombsExperience)}%" } ?: "N/A"),
-                ProfitHudRow("runsLeft", "Runs Left", runs?.formatCompact() ?: "N/A"),
-                ProfitHudRow("currentXp", "Cata XP", profile?.catacombsExperience?.formatCompact() ?: "N/A"),
-                ProfitHudRow("lastRun", "Last Run", last?.normalizedXpDelta?.formatCompact() ?: "N/A", lastRunRateSuffix()),
-                ProfitHudRow("observedCount", "Runs", samples.size.toString()),
-            )
+            buildList {
+                add(ProfitHudRow("sessionTime", "Session Time", sessionDurationText()))
+                if (showCurrentLevel.get()) add(ProfitHudRow("currentLevel", "Cata Level", currentLevel.toString()))
+                if (showTarget.get()) add(ProfitHudRow("target", "Target", targetLevelValue().toString()))
+                if (showLevelProgress.get()) add(ProfitHudRow("levelProgress", "Next Level", profile?.let { "${levelProgressPercent(it.catacombsExperience)}%" } ?: "N/A"))
+                if (showRunsLeft.get()) add(ProfitHudRow("runsLeft", "Runs Left", runs?.formatCompact() ?: "N/A"))
+                if (showCurrentXp.get()) add(ProfitHudRow("currentXp", "Cata XP", profile?.catacombsExperience?.formatCompact() ?: "N/A"))
+                if (showRemaining.get()) add(ProfitHudRow("remaining", "Remaining", remaining.formatCompact()))
+                if (showFloor.get()) add(ProfitHudRow("floor", "Floor", floorValue()))
+                if (showXpPerRun.get()) add(ProfitHudRow("xpPerRun", "XP/Run", xpPerRun.formatCompact(), xpPerHourSuffix()))
+                if (showProfile.get()) add(ProfitHudRow("profile", "Profile", profile?.profileName ?: "N/A"))
+                if (showLastRun.get()) add(ProfitHudRow("lastRun", "Last Run", last?.normalizedXpDelta?.formatCompact() ?: "N/A"))
+                if (showObservedCount.get()) add(ProfitHudRow("observedCount", "Runs", observedRunCountForFloor().toString()))
+            }
         )
     }
 
     private fun buildProfitHudBottomRows(): List<ProfitHudRow> {
         val stats = chestProfitStats()
         return orderProfitRows(
-            listOf(
-                ProfitHudRow("profit", "Profit", stats.profit.formatCompactCoins(), "(${stats.label})"),
-                ProfitHudRow("avgChest", "Avg Chest", stats.average.formatCompactCoins()),
-                ProfitHudRow("chestsOpened", "Chests", stats.chests.toString()),
-                ProfitHudRow("croesus", "Croesus", lastCroesusCandidates.size.toString()),
-            )
+            buildList {
+                if (showChestProfit.get()) {
+                    add(ProfitHudRow("profit", "Profit", stats.profit.formatCompactCoins()))
+                    add(ProfitHudRow("avgChest", "Avg Chest", stats.average.formatCompactCoins()))
+                }
+                if (showChestCount.get()) add(ProfitHudRow("chestsOpened", "Chests", stats.chests.toString()))
+                add(ProfitHudRow("kismets", "Kismets", state.totalKismetsUsed.toString()))
+                add(ProfitHudRow("croesus", "Croesus", croesusUnopenedCountText()))
+                if (showLastChest.get()) {
+                    add(ProfitHudRow("lastChest", "Last Chest", state.lastChestName.ifBlank { "N/A" }, state.lastChestProfit.formatCompactCoins()))
+                }
+            }
         )
+    }
+
+    private fun buildItemTrackerTopRows(): List<ProfitHudRow> {
+        val stats = chestProfitStats()
+        return buildList {
+            if (showChestCount.get()) add(ProfitHudRow("chestsOpened", "Chests", stats.chests.toString()))
+            if (showChestProfit.get()) {
+                add(ProfitHudRow("profit", "Profit", stats.profit.formatCompactCoins()))
+                add(ProfitHudRow("avgChest", "Avg Chest", stats.average.formatCompactCoins()))
+            }
+            add(ProfitHudRow("kismets", "Kismets", state.totalKismetsUsed.toString()))
+            add(ProfitHudRow("croesus", "Croesus", croesusUnopenedCountText()))
+        }
+    }
+
+    private fun croesusUnopenedCountText(): String =
+        state.croesusUnclaimedCount.takeIf { it >= 0 }?.toString()
+            ?: "N/A"
+
+    private fun maybeUpdateCroesusUnclaimedCountFromTab() {
+        val now = System.currentTimeMillis()
+        if (now - lastCroesusTabRefreshAt < CROESUS_TAB_REFRESH_INTERVAL_MILLIS) return
+        lastCroesusTabRefreshAt = now
+        val count = croesusUnopenedCountFromTab() ?: return
+        setCroesusUnclaimedCount(count, "tab-list")
+    }
+
+    private fun croesusUnopenedCountFromTab(): Int? {
+        val lines = tabListLines()
+        for (line in lines) {
+            val normalized = line.cleanMc()
+            if (!normalized.contains("croesus", true) &&
+                !normalized.contains("unclaimed chest", true) &&
+                !normalized.contains("unopened chest", true)
+            ) continue
+            for (regex in CROESUS_TAB_COUNT_REGEXES) {
+                val count = regex.find(normalized)
+                    ?.groupValues
+                    ?.getOrNull(1)
+                    ?.toIntOrNull()
+                if (count != null) {
+                    return count
+                }
+            }
+        }
+        return null
+    }
+
+    private fun setCroesusUnclaimedCount(count: Int, source: String) {
+        val safe = count.coerceAtLeast(0)
+        if (state.croesusUnclaimedCount == safe) return
+        state.croesusUnclaimedCount = safe
+        saveState()
+        log("Croesus unclaimed count set source=$source count=$safe")
+    }
+
+    private fun incrementCroesusUnclaimedCount(source: String) {
+        val next = state.croesusUnclaimedCount.takeIf { it >= 0 }?.plus(1) ?: 1
+        setCroesusUnclaimedCount(next, source)
+    }
+
+    private fun decrementCroesusUnclaimedCount(source: String) {
+        val current = state.croesusUnclaimedCount
+        if (current < 0) return
+        setCroesusUnclaimedCount((current - 1).coerceAtLeast(0), source)
+    }
+
+    private fun tabListLines(): List<String> {
+        val connection = mc.connection ?: return emptyList()
+        return connection.listedOnlinePlayers
+            .sortedBy { it.tabListOrder }
+            .map { info ->
+                val display = info.tabListDisplayName
+                    ?: PlayerTeam.formatNameForTeam(info.team, Component.literal(info.profile.name))
+                display.string.cleanMc()
+            }
+            .filter { it.isNotBlank() }
+    }
+
+    private fun buildItemTrackerRows(): List<ProfitHudRow> {
+        val counts = trackedItemCounts()
+        fun count(key: String): Int = counts[key] ?: 0
+        return listOf(
+            ProfitHudRow("itemHandle", "Handle", count("NECRON_HANDLE").toString()),
+            ProfitHudRow("itemImplosion", "Implosion", count("IMPLOSION_SCROLL").toString()),
+            ProfitHudRow("itemWitherShield", "Wither Shield", count("WITHER_SHIELD_SCROLL").toString()),
+            ProfitHudRow("itemShadowWarp", "Shadow Warp", count("SHADOW_WARP_SCROLL").toString()),
+            ProfitHudRow("itemRecomb", "Recomb", count("RECOMBOBULATOR_3000").toString()),
+            ProfitHudRow("itemAutoRecomb", "Auto Recomb", count("AUTO_RECOMBOBULATOR").toString()),
+            ProfitHudRow("itemClaymore", "Claymore", count("DARK_CLAYMORE").toString()),
+            ProfitHudRow("itemFifthStar", "5th Star", count("FIFTH_MASTER_STAR").toString()),
+            ProfitHudRow("itemChestplate", "Chestplate", count("WITHER_CHESTPLATE").toString()),
+            ProfitHudRow("itemSkullT5", "Skull T5", count("MASTER_SKULL_TIER_5").toString()),
+            ProfitHudRow("itemNecronDye", "Necron Dye", count("NECRON_DYE").toString()),
+        )
+    }
+
+    private fun trackedItemCounts(): Map<String, Int> =
+        scopedTrackedItemDrops().groupingBy { it.itemKey }.eachCount()
+
+    private fun scopedTrackedItemDrops(): List<TrackedItemDropSample> {
+        if (state.chestProfitWindowMillis > 0L) {
+            val cutoff = System.currentTimeMillis() - state.chestProfitWindowMillis
+            return state.trackedItemDrops.filter { it.timestamp > 0L && it.timestamp >= cutoff }
+        }
+        if (chestProfitMode.getCurrent() == "Total") return state.trackedItemDrops
+        if (sessionStartedAt <= 0L) return emptyList()
+        return state.trackedItemDrops.filter { it.timestamp > 0L && it.timestamp >= sessionStartedAt }
     }
 
     private fun orderProfitRows(rows: List<ProfitHudRow>): List<ProfitHudRow> {
@@ -2345,13 +2931,25 @@ class DungeonProgressHudFeature(
             state.totalChestsOpened = state.chestProfits.size
             state.totalChestProfit = state.chestProfits.sumOf { it.profit }
         }
+        if (state.hudViewMode != HUD_MODE_ITEMS) {
+            state.hudViewMode = HUD_MODE_PROFIT
+        }
+        if (state.totalKismetsUsed == 0 && state.kismetUses.isNotEmpty()) {
+            state.totalKismetsUsed = state.kismetUses.size
+        }
         state.hudLineOrder = normalizedHudLineOrder().toMutableList()
         saveState()
     }
 
     private fun saveState() {
         stateFile.parentFile.mkdirs()
-        stateFile.writer().use { gson.toJson(state, it) }
+        val tempFile = File(stateFile.parentFile, "${stateFile.name}.tmp")
+        tempFile.writer().use { gson.toJson(state, it) }
+        runCatching {
+            Files.move(tempFile.toPath(), stateFile.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+        }.getOrElse {
+            Files.move(tempFile.toPath(), stateFile.toPath(), StandardCopyOption.REPLACE_EXISTING)
+        }
     }
 
     private fun sessionReady(): Boolean = mc.user.name.isNotBlank()
@@ -2389,6 +2987,12 @@ class DungeonProgressHudFeature(
     }
 
     private fun floorValue(): String = floorLabel.get().ifBlank { "M7" }.uppercase(Locale.ROOT)
+
+    private fun shouldTrackM7Drops(floor: String = floorValue()): Boolean =
+        floor.equals("M7", true) ||
+            floor.equals("MM7", true) ||
+            floor.equals("MASTER MODE 7", true) ||
+            floor.equals("MASTER CATACOMBS - FLOOR VII", true)
 
     private fun hardcodedXpPerRunValue(): Long = hardcodedXpPerRun.get().toLongOrNull()?.coerceAtLeast(1L) ?: 450_000L
 
@@ -2432,7 +3036,7 @@ class DungeonProgressHudFeature(
         }.trim()
     }
 
-    private fun lastRunRateSuffix(): String {
+    private fun xpPerHourSuffix(): String {
         val lastRun = state.runs.lastOrNull { it.normalizedCataXp > 0 && it.runTimeSeconds > 0 } ?: return ""
         val perHour = (lastRun.normalizedCataXp.toDouble() * 3600.0 / lastRun.runTimeSeconds.toDouble()).roundToLong()
         return "(${perHour.formatCompact()}/h)"
@@ -2484,6 +3088,11 @@ class DungeonProgressHudFeature(
         var totalChestsOpened: Int = 0,
         var chestProfitWindowMillis: Long = 0,
         var lastLogImportAt: Long = 0,
+        var hudViewMode: String = HUD_MODE_PROFIT,
+        var trackedItemDrops: MutableList<TrackedItemDropSample> = mutableListOf(),
+        var croesusUnclaimedCount: Int = -1,
+        var totalKismetsUsed: Int = 0,
+        var kismetUses: MutableList<KismetUseSample> = mutableListOf(),
         var hudLineOrder: MutableList<String>? = DEFAULT_HUD_LINE_ORDER.toMutableList(),
     )
 
@@ -2512,14 +3121,31 @@ class DungeonProgressHudFeature(
         var floorLabel: String = "M7",
     )
 
+    data class TrackedItemDropSample(
+        var timestamp: Long = 0,
+        var itemKey: String = "",
+        var displayName: String = "",
+        var chestName: String = "",
+        var floorLabel: String = "M7",
+        var profileName: String = "",
+    )
+
+    data class KismetUseSample(
+        var timestamp: Long = 0,
+        var chestName: String = "",
+        var profileName: String = "",
+        var floorLabel: String = "M7",
+    )
+
     data class ChestProfitCandidate(
         val chestName: String,
         val profit: Long,
         val cost: Int,
         val itemCount: Int,
         val scannedSlots: Int,
+        val trackedDrops: List<TrackedDrop> = emptyList(),
     ) {
-        fun summary(): String = "chest=$chestName profit=$profit cost=$cost items=$itemCount scannedSlots=$scannedSlots"
+        fun summary(): String = "chest=$chestName profit=$profit cost=$cost items=$itemCount scannedSlots=$scannedSlots tracked=${trackedDrops.joinToString { it.key }}"
     }
 
     data class ChestProfitItem(
@@ -2527,6 +3153,7 @@ class DungeonProgressHudFeature(
         val unitValue: Int,
         val amount: Int,
         val essence: Boolean,
+        val trackedDrop: TrackedDrop? = null,
     ) {
         val totalValue: Int get() = unitValue * amount
     }
@@ -2536,6 +3163,12 @@ class DungeonProgressHudFeature(
         val playerUuid: String,
         val profileName: String,
         val catacombsExperience: Long,
+    )
+
+    data class ProfileRequest(
+        val playerName: String,
+        val playerUuid: String,
+        val apiKey: String,
     )
 
     data class ChestProfitStats(
