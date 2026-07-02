@@ -18,12 +18,12 @@ reward chest profit tracking.
 
 ## Requirements
 
-- Minecraft 1.21.11
-- Fabric Loader 0.18.4 or newer
+- Minecraft 26.1.2
+- Fabric Loader 0.19.3 or newer
 - Fabric API
 - Fabric Language Kotlin
-- Devonian 1.18.8 or compatible
-- Java 21
+- Devonian 1.25.9 or compatible
+- Java 25
 
 ## Commands
 

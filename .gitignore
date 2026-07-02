@@ -3,6 +3,8 @@
 build/
 run/
 out/
+.jdks/
+repo-inspect-*/
 
 *.log
 *.tmp

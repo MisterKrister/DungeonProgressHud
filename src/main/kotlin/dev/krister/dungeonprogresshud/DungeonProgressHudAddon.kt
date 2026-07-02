@@ -16,23 +16,25 @@ import com.google.gson.JsonParser
 import com.mojang.brigadier.arguments.StringArgumentType
 import net.fabricmc.api.ClientModInitializer
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents
-import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager.argument
-import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager.literal
+import net.fabricmc.fabric.api.client.command.v2.ClientCommands.argument
+import net.fabricmc.fabric.api.client.command.v2.ClientCommands.literal
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback
-import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper
+import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents
 import net.fabricmc.loader.api.FabricLoader
 import net.minecraft.client.KeyMapping
 import net.minecraft.client.Minecraft
-import net.minecraft.client.gui.GuiGraphics
+import net.minecraft.client.gui.Font
+import net.minecraft.client.gui.GuiGraphicsExtractor
 import net.minecraft.client.gui.screens.Screen
 import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen
 import net.minecraft.client.input.KeyEvent
 import net.minecraft.client.input.MouseButtonEvent
+import net.minecraft.client.multiplayer.chat.GuiMessageTag
 import net.minecraft.network.chat.MessageSignature
 import net.minecraft.network.chat.Component
 import net.minecraft.resources.Identifier
-import net.minecraft.world.inventory.ClickType
+import net.minecraft.world.inventory.ContainerInput
 import net.minecraft.world.item.ItemStack
 import net.minecraft.world.item.Items
 import net.minecraft.world.scores.DisplaySlot
@@ -58,6 +60,10 @@ import kotlin.math.ceil
 import kotlin.math.max
 import kotlin.math.roundToInt
 import kotlin.math.roundToLong
+
+private fun GuiGraphicsExtractor.drawString(font: Font, component: Component, x: Int, y: Int, color: Int, shadow: Boolean) {
+    text(font, component, x, y, color, shadow)
+}
 
 object DungeonProgressHudAddon : ClientModInitializer {
     private val logger = LoggerFactory.getLogger("DungeonProgressHud")
@@ -131,7 +137,7 @@ object DungeonProgressHudAddon : ClientModInitializer {
         debug("Devonian feature registration complete")
     }
 
-    fun renderOverlay(graphics: GuiGraphics) {
+    fun renderOverlay(graphics: GuiGraphicsExtractor) {
         if (!renderHookSeen) {
             renderHookSeen = true
             debug("Gui render hook fired")
@@ -148,13 +154,13 @@ object DungeonProgressHudAddon : ClientModInitializer {
         current.renderHud(graphics)
     }
 
-    fun renderScreenOverlay(graphics: GuiGraphics, screen: Screen, mouseX: Int, mouseY: Int) {
+    fun renderScreenOverlay(graphics: GuiGraphicsExtractor, screen: Screen, mouseX: Int, mouseY: Int) {
         if (screen is AbstractContainerScreen<*>) {
             feature?.renderHudOrderOverlay(graphics, mouseX.toDouble(), mouseY.toDouble())
         }
     }
 
-    fun onInventoryClick(slotId: Int, button: Int, clickType: ClickType) {
+    fun onInventoryClick(slotId: Int, button: Int, clickType: ContainerInput) {
         feature?.onInventoryClick(slotId, button, clickType)
     }
 
@@ -497,7 +503,7 @@ class DungeonProgressHudFeature(
     private val keybindCategory by lazy {
         KeyMapping.Category.register(Identifier.fromNamespaceAndPath("dungeonprogresshud", "keybinds"))
     }
-    private val fakeOpenKey = KeyBindingHelper.registerKeyBinding(
+    private val fakeOpenKey = KeyMappingHelper.registerKeyMapping(
         KeyMapping("key.dungeonprogresshud.fakeOpenChest", GLFW.GLFW_KEY_H, keybindCategory)
     )
 
@@ -764,7 +770,7 @@ class DungeonProgressHudFeature(
         refresh(false)
     }
 
-    fun renderHud(graphics: GuiGraphics) {
+    fun renderHud(graphics: GuiGraphicsExtractor) {
         val enabled = isEnabled()
         if (mc.screen is AbstractContainerScreen<*>) {
             return
@@ -1087,7 +1093,7 @@ class DungeonProgressHudFeature(
         send("Status: $status")
     }
 
-    fun onInventoryClick(slotId: Int, button: Int, clickType: ClickType) {
+    fun onInventoryClick(slotId: Int, button: Int, clickType: ContainerInput) {
         if (!trackChestProfit.get()) return
         val screen = currentChestScreen() ?: return
         val title = screen.title.string
@@ -1323,7 +1329,7 @@ class DungeonProgressHudFeature(
         return normalized
     }
 
-    fun renderHudOrderOverlay(graphics: GuiGraphics, mouseX: Double, mouseY: Double) {
+    fun renderHudOrderOverlay(graphics: GuiGraphicsExtractor, mouseX: Double, mouseY: Double) {
         if (!renderHud.get() || !isEnabled()) return
         val dragging = draggedHudLineId != null
         val lines = editableHudLines()
@@ -1438,7 +1444,7 @@ class DungeonProgressHudFeature(
         return bounds
     }
 
-    private fun drawHudOrderOverlay(graphics: GuiGraphics, lines: List<HudLine>, hoverId: String?) {
+    private fun drawHudOrderOverlay(graphics: GuiGraphicsExtractor, lines: List<HudLine>, hoverId: String?) {
         val drawX = if (x.isFinite()) x.toFloat() else 10f
         val drawY = if (y.isFinite()) y.toFloat() else 10f
         val renderScale = scale.takeIf { it.isFinite() && it > 0f } ?: 1f
@@ -2458,7 +2464,7 @@ class DungeonProgressHudFeature(
         return lastVisibilityResult
     }
 
-    private fun drawDirect(graphics: GuiGraphics, lines: List<HudLine>) {
+    private fun drawDirect(graphics: GuiGraphicsExtractor, lines: List<HudLine>) {
         val (title, topRows, bottomRows) = currentHudContent()
         if (topRows.isEmpty() && bottomRows.isEmpty()) return
 
@@ -2527,7 +2533,7 @@ class DungeonProgressHudFeature(
     private fun sharedHudLayoutRows(): List<ProfitHudRow> =
         buildProfitHudTopRows() + buildProfitHudBottomRows() + buildItemTrackerTopRows() + buildItemTrackerRows()
 
-    private fun drawHudModeButton(graphics: GuiGraphics, panelWidth: Int) {
+    private fun drawHudModeButton(graphics: GuiGraphicsExtractor, panelWidth: Int) {
         val label = if (currentHudMode() == HUD_MODE_ITEMS) "Profit" else "Items"
         val x = panelWidth - HUD_MODE_BUTTON_WIDTH - HUD_MODE_BUTTON_MARGIN
         val y = HUD_TOP_PADDING + (mc.font.lineHeight - HUD_MODE_BUTTON_HEIGHT) / 2
@@ -2538,7 +2544,7 @@ class DungeonProgressHudFeature(
         graphics.drawString(mc.font, Component.literal(label), textX, textY, HUD_SKETCH_WHITE, true)
     }
 
-    private fun drawProfitScopeLabel(graphics: GuiGraphics, layout: HudPanelLayout) {
+    private fun drawProfitScopeLabel(graphics: GuiGraphicsExtractor, layout: HudPanelLayout) {
         val label = "(${chestProfitStats().label})"
         val x = (layout.width - HUD_SIDE_PADDING - mc.font.width(label)).coerceAtLeast(layout.valueX)
         val y = if (currentHudMode() == HUD_MODE_ITEMS) {
@@ -2727,7 +2733,7 @@ class DungeonProgressHudFeature(
     }
 
     private fun drawProfitRows(
-        graphics: GuiGraphics,
+        graphics: GuiGraphicsExtractor,
         rows: List<ProfitHudRow>,
         labelX: Int,
         separatorX: Int,
@@ -2798,13 +2804,13 @@ class DungeonProgressHudFeature(
         }
     )
 
-    private fun drawProfitPanel(graphics: GuiGraphics, width: Int, height: Int, dividerY: Int) {
+    private fun drawProfitPanel(graphics: GuiGraphicsExtractor, width: Int, height: Int, dividerY: Int) {
         drawRoundedFill(graphics, 0, 0, width, height, HUD_PROFIT_PANEL)
         drawRoundedBorder(graphics, 0, 0, width, height, HUD_SKETCH_WHITE)
         graphics.fill(1, dividerY, width - 1, dividerY + 1, HUD_SKETCH_WHITE)
     }
 
-    private fun drawRoundedFill(graphics: GuiGraphics, x: Int, y: Int, width: Int, height: Int, color: Int) {
+    private fun drawRoundedFill(graphics: GuiGraphicsExtractor, x: Int, y: Int, width: Int, height: Int, color: Int) {
         graphics.fill(x + 4, y, x + width - 4, y + 1, color)
         graphics.fill(x + 2, y + 1, x + width - 2, y + 2, color)
         graphics.fill(x + 1, y + 2, x + width - 1, y + 4, color)
@@ -2814,7 +2820,7 @@ class DungeonProgressHudFeature(
         graphics.fill(x + 4, y + height - 1, x + width - 4, y + height, color)
     }
 
-    private fun drawRoundedBorder(graphics: GuiGraphics, x: Int, y: Int, width: Int, height: Int, color: Int) {
+    private fun drawRoundedBorder(graphics: GuiGraphicsExtractor, x: Int, y: Int, width: Int, height: Int, color: Int) {
         graphics.fill(x + 4, y, x + width - 4, y + 1, color)
         graphics.fill(x + 2, y + 1, x + 4, y + 2, color)
         graphics.fill(x + width - 4, y + 1, x + width - 2, y + 2, color)
@@ -2829,7 +2835,7 @@ class DungeonProgressHudFeature(
         graphics.fill(x + 4, y + height - 1, x + width - 4, y + height, color)
     }
 
-    private fun drawFramedPanel(graphics: GuiGraphics, width: Int, height: Int) {
+    private fun drawFramedPanel(graphics: GuiGraphicsExtractor, width: Int, height: Int) {
         graphics.fill(2, 3, width + 2, height + 3, 0x66000000)
         graphics.fill(0, 0, width, height, HUD_OUTER_DARK)
         graphics.fill(3, 3, width - 3, height - 3, HUD_CYAN_DIM)
@@ -2852,7 +2858,7 @@ class DungeonProgressHudFeature(
         graphics.fill(width - 5, height - corner, width - 2, height - 2, HUD_CYAN)
     }
 
-    private fun drawDashedVertical(graphics: GuiGraphics, x: Int, top: Int, bottom: Int) {
+    private fun drawDashedVertical(graphics: GuiGraphicsExtractor, x: Int, top: Int, bottom: Int) {
         var y = top
         while (y < bottom) {
             graphics.fill(x, y, x + 1, (y + 5).coerceAtMost(bottom), HUD_CYAN)
@@ -2902,14 +2908,14 @@ class DungeonProgressHudFeature(
     }
 
     private fun send(message: String) {
-        mc.player?.displayClientMessage(Component.literal((PREFIX + message).colorize()), false)
+        mc.player?.sendSystemMessage(Component.literal((PREFIX + message).colorize()))
     }
 
     private fun sendReplacingSummary(lines: List<String>) {
         val chat = mc.gui.chat
         summarySignatures.forEach { chat.deleteMessage(it) }
         lines.take(summarySignatures.size).forEachIndexed { index, line ->
-            chat.addMessage(Component.literal((PREFIX + line).colorize()), summarySignatures[index], null)
+            chat.addPlayerMessage(Component.literal((PREFIX + line).colorize()), summarySignatures[index], GuiMessageTag.system())
         }
     }
 

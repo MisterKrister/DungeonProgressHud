@@ -1,10 +1,10 @@
 plugins {
-    id("fabric-loom") version "1.15-SNAPSHOT"
-    kotlin("jvm") version "2.3.0"
-    kotlin("plugin.serialization") version "2.3.0"
+    id("net.fabricmc.fabric-loom") version "1.16-SNAPSHOT"
+    kotlin("jvm") version "2.3.20"
+    kotlin("plugin.serialization") version "2.3.20"
 }
 
-version = "1.0.4"
+version = "1.0.5"
 group = "dev.krister"
 
 base {
@@ -22,24 +22,23 @@ tasks.processResources {
 }
 
 kotlin {
-    jvmToolchain(21)
+    jvmToolchain(25)
 }
 
 dependencies {
-    minecraft("com.mojang:minecraft:1.21.11")
-    mappings(loom.officialMojangMappings())
-    modImplementation("net.fabricmc:fabric-loader:0.18.4")
-    modImplementation("net.fabricmc.fabric-api:fabric-api:0.141.3+1.21.11")
-    modImplementation("net.fabricmc:fabric-language-kotlin:1.13.10+kotlin.2.3.20")
-    modApi(files("libs/devonian-1.18.8.jar"))
+    minecraft("com.mojang:minecraft:26.1.2")
+    implementation("net.fabricmc:fabric-loader:0.19.3")
+    implementation("net.fabricmc.fabric-api:fabric-api:0.150.0+26.1.2")
+    implementation("net.fabricmc:fabric-language-kotlin:1.13.10+kotlin.2.3.20")
+    implementation(files("libs/devonian-1.25.9.jar"))
 }
 
 tasks.withType<JavaCompile>().configureEach {
-    options.release.set(21)
+    options.release.set(25)
 }
 
 tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
     compilerOptions {
-        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_21)
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_25)
     }
 }
