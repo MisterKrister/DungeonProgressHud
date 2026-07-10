@@ -26,5 +26,9 @@
     "fabric-api": "*",
     "fabric-language-kotlin": "*",
     "devonian": ">=1.25.9"
+  },
+  "suggests": {
+    "skyblockpv": ">=1.8.4",
+    "skyblocker": "*"
   }
 }

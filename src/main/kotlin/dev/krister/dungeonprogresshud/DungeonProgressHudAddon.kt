@@ -12,7 +12,9 @@ import com.github.synnerz.devonian.config.ConfigData
 import com.github.synnerz.devonian.hud.texthud.TextHudFeature
 import com.github.synnerz.devonian.utils.StringUtils
 import com.google.gson.GsonBuilder
-import com.google.gson.JsonParser
+import com.google.gson.JsonArray
+import com.google.gson.JsonObject
+import com.mojang.authlib.GameProfile
 import com.mojang.brigadier.arguments.StringArgumentType
 import net.fabricmc.api.ClientModInitializer
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents
@@ -42,9 +44,6 @@ import net.minecraft.world.scores.PlayerTeam
 import org.lwjgl.glfw.GLFW
 import org.slf4j.LoggerFactory
 import java.io.File
-import java.net.HttpURLConnection
-import java.net.URI
-import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
@@ -54,6 +53,9 @@ import java.time.LocalTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
+import java.util.UUID
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.TimeUnit
 import java.util.zip.GZIPInputStream
 import kotlin.concurrent.thread
 import kotlin.math.ceil
@@ -201,12 +203,6 @@ object DungeonProgressHudAddon : ClientModInitializer {
                         withFeature { it.refresh(force = true, recordObservedSample = false, notify = true) }
                         1
                     })
-                    .then(literal("apikey")
-                        .then(argument("key", StringArgumentType.greedyString()).executes { context ->
-                            withFeature { it.setApiKey(StringArgumentType.getString(context, "key")) }
-                            1
-                        })
-                    )
                     .then(literal("reset").executes {
                         withFeature { it.resetSamples() }
                         1
@@ -365,14 +361,16 @@ class DungeonProgressHudFeature(
 ) {
     private companion object {
         private const val FEATURE_CONFIG = "dungeonProgressHud"
-        private const val API_KEY_CONFIG = "$FEATURE_CONFIG\$41_apiKey"
-        private const val LEGACY_API_KEY_CONFIG = "$FEATURE_CONFIG\$apiKey"
-        private val API_KEY_CONFIG_NAMES = listOf(API_KEY_CONFIG, LEGACY_API_KEY_CONFIG)
         private const val DAY_MILLIS = 86_400_000L
         private const val AUTO_REFRESH_INTERVAL_MILLIS = 300_000L
-        private const val API_KEY_REFRESH_DEBOUNCE_MILLIS = 1_000L
-        private const val API_KEY_REFRESH_RETRY_MILLIS = 1_000L
-        private const val MIN_REFRESHABLE_API_KEY_LENGTH = 32
+        private const val PROFILE_FETCH_TIMEOUT_SECONDS = 30L
+        private const val SESSION_INACTIVITY_MILLIS = 90_000L
+        private const val SKYBLOCK_PV_MOD_ID = "skyblockpv"
+        private const val SKYBLOCK_PV_PROFILE_API = "me.owdding.skyblockpv.api.ProfileAPI"
+        private const val SKYBLOCK_PV_PLAYER_DB_API = "me.owdding.skyblockpv.api.PlayerDbAPI"
+        private const val SKYBLOCK_API_PROFILE_API = "tech.thatgravyboat.skyblockapi.api.profile.profile.ProfileAPI"
+        private const val SKYBLOCKER_MOD_ID = "skyblocker"
+        private const val SKYBLOCKER_PROFILE_UTILS = "de.hysky.skyblocker.utils.ProfileUtils"
         private const val CROESUS_TAB_REFRESH_INTERVAL_MILLIS = 1_000L
         private const val MAX_TRACKED_ITEM_DROPS = 5_000
         private const val HUD_LINE_GAP = 2
@@ -463,7 +461,6 @@ class DungeonProgressHudFeature(
     private val logsDir = FabricLoader.getInstance().gameDir.resolve("logs").toFile()
     private val mc: Minecraft get() = Minecraft.getInstance()
 
-    private val displayDivider = addDivider("10", "DISPLAY")
     private val renderHud = addSwitch("11_renderHud", true, "Draw the HUD during normal gameplay.", "Render HUD", emptySet(), false, configTab)
     private val showEverywhere = addSwitch("12_showEverywhere", true, "Render everywhere instead of only Dungeon Hub/Catacombs.", "Show Everywhere", emptySet(), false, configTab)
     private val targetLevel = addTextInput("13_targetLevel", "50", "Target Catacombs level.", "Target Level", emptySet(), configTab)
@@ -474,20 +471,14 @@ class DungeonProgressHudFeature(
     private val showTarget = addSwitch("18_showTarget", true, "Show target Catacombs level.", "Target", emptySet(), false, configTab)
     private val showRemaining = addSwitch("19_showRemaining", true, "Show XP remaining.", "XP Remaining", emptySet(), false, configTab)
     private val showFloor = addSwitch("1a_showFloor", true, "Show floor label.", "Floor", emptySet(), false, configTab)
-    private val showXpPerRun = addSwitch("1b_showXpPerRun", true, "Show effective XP/run.", "XP/Run", emptySet(), false, configTab)
+    private val showXpPerRun = addSwitch("1b_showXpPerRun", true, "Show the scoped average XP per run and XP per hour.", "XP/Run", emptySet(), false, configTab)
     private val showRunsLeft = addSwitch("1c_showRunsLeft", true, "Show estimated runs left.", "Runs Left", emptySet(), false, configTab)
     private val showProfile = addSwitch("1d_showProfile", false, "Show selected SkyBlock profile.", "Profile", emptySet(), false, configTab)
-    private val showLastRun = addSwitch("1e_showLastRun", true, "Show last observed normalized XP delta.", "Last Run XP", emptySet(), false, configTab)
-    private val showObservedCount = addSwitch("1f_showObservedCount", false, "Show observed sample count.", "Observed Count", emptySet(), false, configTab)
+    private val showLastRun = addSwitch("1e_showLastRun", true, "Show the most recent recorded run XP in the selected tracker scope.", "Last Run XP", emptySet(), false, configTab)
+    private val showObservedCount = addSwitch("1f_showObservedCount", false, "Show persisted runs for the selected tracker scope.", "Run Count", emptySet(), false, configTab)
 
-    private val xpDivider = addDivider("20", "XP")
     private val xpMode = addSelection("21_xpMode", 0, listOf("Observed Average", "Hardcoded"), "XP/run source.", "XP/Run Mode", emptySet(), configTab)
     private val hardcodedXpPerRun = addTextInput("22_hardcodedXpPerRun", "450000", "Fallback XP per run.", "Hardcoded XP/Run", emptySet(), configTab)
-    private val scaleDailyRunXp = addSwitch("23_scaleDailyRunXp", true, "Divide high raw run XP by the daily multiplier.", "Scale Daily Run XP", emptySet(), false, configTab)
-    private val dailyThreshold = addTextInput("24_dailyThreshold", "600000", "Only scale raw run XP above this value.", "Daily XP Threshold", emptySet(), configTab)
-    private val dailyMultiplier = addTextInput("25_dailyMultiplier", "1.4", "Raw run XP is divided by this when daily scaling applies.", "Daily XP Multiplier", emptySet(), configTab)
-
-    private val profitDivider = addDivider("30", "PROFIT")
     private val trackChestProfit = addSwitch("31_trackChestProfit", true, "Track profit when claiming dungeon reward chests.", "Track Chest Profit", emptySet(), false, configTab)
     private val showChestProfit = addSwitch("32_showChestProfit", true, "Show tracked dungeon chest profit.", "Chest Profit", emptySet(), false, configTab)
     private val chestProfitMode = addSelection("33_chestProfitMode", 0, listOf("Session", "Total"), "Choose whether profit and item tracker lines use this session or all tracked chests.", "Tracker Mode", emptySet(), configTab)
@@ -496,10 +487,8 @@ class DungeonProgressHudFeature(
     private val includeEssenceProfit = addSwitch("36_includeEssenceProfit", true, "Include essence value in chest profit.", "Include Essence", emptySet(), false, configTab)
     private val includeDungeonKeyCost = addSwitch("37_includeDungeonKeyCost", false, "Subtract Dungeon Chest Key value when a reward chest requires one.", "Count Dungeon Key Cost", emptySet(), false, configTab)
 
-    private val actionsDivider = addDivider("40", "ACTIONS")
-    private val apiKey = addTextInput("41_apiKey", "", "Hypixel API key.", "Hypixel API Key", emptySet(), configTab)
-    private val refreshButton = addSortedButton("42", { refresh(force = true, recordObservedSample = false, notify = true) }, "Refresh", "Force API refresh.", "Refresh Now")
-    private val resetButton = addSortedButton("43", { resetSamples() }, "Reset", "Clear observed XP samples.", "Reset Observed Runs")
+    private val refreshButton = addButton({ refresh(force = true, recordObservedSample = false, notify = true) }, "Refresh", "Force profile refresh.", "Refresh Player Data", emptySet(), configTab)
+    private val resetButton = addButton({ resetSamples() }, "Reset", "Clear XP/run averaging samples and reset the profile XP baseline.", "Reset XP Samples", emptySet(), configTab)
     private val keybindCategory by lazy {
         KeyMapping.Category.register(Identifier.fromNamespaceAndPath("dungeonprogresshud", "keybinds"))
     }
@@ -509,17 +498,10 @@ class DungeonProgressHudFeature(
 
     private var state = RunState()
     private var data: ProfileData? = null
-    private var status = "API key missing"
+    private var status = "Waiting for profile data"
     private var refreshing = false
     private var lastRefresh = 0L
     private var lastAutoRefreshAttempt = 0L
-    private var suppressApiKeyChange = false
-    private var lastApiKeyValue = ""
-    private var pendingApiKeyRefreshValue = ""
-    private var pendingApiKeyRefreshAt = 0L
-    private var pendingApiKeyRefreshNotify = false
-    @Volatile private var devonianConfigSaveRunning = false
-    @Volatile private var devonianConfigSavePending = false
     private var joinRefreshStartedAt = 0L
     private var joinRefreshAttempts = 0
     private var nextJoinRefreshAttemptAt = 0L
@@ -556,16 +538,37 @@ class DungeonProgressHudFeature(
     private var sessionChestProfit = 0L
     private var sessionChestsOpened = 0
     private var sessionStartedAt = 0L
+    private var sessionElapsedMillis = 0L
+    private var sessionTimerLastUpdatedAt = 0L
+    private var sessionLastActivityAt = 0L
+    private var sessionTimerRunning = false
     private var draggedHudLineId: String? = null
     private var hoveredHudLineId: String? = null
+    private var settingsLoaded = false
 
     init {
-        apiKey.onChange { onApiKeyInputChanged(it) }
-        Config.onAfterLoad {
-            withApiKeyChangeSuppressed {
-                migrateLegacyApiKey()
+        xpMode.onChange { index ->
+            if (settingsLoaded && index !in xpMode.options.indices) xpMode.set(0)
+        }
+        chestProfitMode.onChange { index ->
+            if (!settingsLoaded) return@onChange
+            if (index !in chestProfitMode.options.indices) {
+                chestProfitMode.set(0)
+                return@onChange
             }
-            lastApiKeyValue = apiKey.get().trim()
+            if (state.chestProfitWindowMillis > 0L) {
+                state.chestProfitWindowMillis = 0L
+                saveState()
+                log("Rolling tracker window cleared by Tracker Mode setting")
+            }
+        }
+        trackChestProfit.onChange { enabled ->
+            if (!enabled) clearPendingChestTracking()
+        }
+        Config.onAfterLoad {
+            if (xpMode.get() !in xpMode.options.indices) xpMode.set(0)
+            if (chestProfitMode.get() !in chestProfitMode.options.indices) chestProfitMode.set(0)
+            settingsLoaded = true
         }
     }
 
@@ -587,6 +590,7 @@ class DungeonProgressHudFeature(
     }
 
     fun onServerDisconnect() {
+        pauseSessionTimer("disconnect")
         joinRefreshStartedAt = 0L
         joinRefreshAttempts = 0
         nextJoinRefreshAttemptAt = 0L
@@ -595,69 +599,53 @@ class DungeonProgressHudFeature(
         skyBlockJoinRefreshCompleted = false
     }
 
-    private fun addDivider(sortKey: String, label: String): ConfigData.Switch =
-        addSwitch("${sortKey}_divider$label", false, "", "__________ $label __________", emptySet(), false, configTab)
-
-    private fun addSortedButton(
-        sortKey: String,
-        action: () -> Unit,
-        buttonTitle: String,
-        description: String,
-        displayName: String,
-    ): ConfigData.Button {
-        val sortParent = ConfigData.FeatureSwitch("$FEATURE_CONFIG.$sortKey", true, "", "", configTab, emptySet(), true)
-        val button = ConfigData.Button(action, buttonTitle, sortParent, description, displayName, configTab, emptySet(), false)
-        Config.registerCategory(button, category, configTab)
-        configSwitch.subconfigs.add(button)
-        return button
+    override fun getEditText(): List<String> {
+        val topRows = orderProfitRows(
+            buildList {
+                add(ProfitHudRow("sessionTime", "Time", "Not started"))
+                if (showCurrentLevel.get()) add(ProfitHudRow("currentLevel", "Cata", "50"))
+                if (showTarget.get()) add(ProfitHudRow("target", "Target", targetLevelValue().toString()))
+                if (showLevelProgress.get()) add(ProfitHudRow("levelProgress", "Next", "28.9%"))
+                if (showRunsLeft.get()) add(ProfitHudRow("runsLeft", "Left", "252"))
+                if (showCurrentXp.get()) add(ProfitHudRow("currentXp", "XP", "627.58m"))
+                if (showRemaining.get()) add(ProfitHudRow("remaining", "Remaining", "113.4m"))
+                if (showFloor.get()) add(ProfitHudRow("floor", "Floor", floorValue()))
+                if (showXpPerRun.get()) add(ProfitHudRow("xpPerRun", "XP/Run", hardcodedXpPerRunValue().formatCompact()))
+                if (showProfile.get()) add(ProfitHudRow("profile", "Profile", "Selected"))
+                if (showLastRun.get()) add(ProfitHudRow("lastRun", "Last", "491k", "(4.83m/h)"))
+                if (showObservedCount.get()) add(ProfitHudRow("observedCount", "Runs", "100"))
+            }
+        )
+        val bottomRows = orderProfitRows(
+            buildList {
+                if (showChestCount.get()) add(ProfitHudRow("chestsOpened", "Chests", "359"))
+                if (showChestProfit.get()) {
+                    add(ProfitHudRow("profit", "Profit", "2.79b"))
+                    add(ProfitHudRow("avgChest", "Avg Chest", "7.77m"))
+                }
+                add(ProfitHudRow("kismets", "Kismets", "0"))
+                add(ProfitHudRow("croesus", "Croesus", "0"))
+                if (showLastChest.get()) add(ProfitHudRow("lastChest", "Last Chest", "Obsidian", "1.2m"))
+            }
+        )
+        return listOf("&fDungeon Profit Hud", "&f") +
+            topRows.map(::editPreviewLine) +
+            listOf("&f", "&f----------------", "&f") +
+            bottomRows.map(::editPreviewLine)
     }
-
-    private fun migrateLegacyApiKey() {
-        val normalized = apiKey.get().trim()
-        if (normalized.isNotBlank()) {
-            if (normalized != apiKey.get()) setApiKeyConfigValue(normalized)
-            return
-        }
-        val legacy = readConfiguredApiKeyValue(LEGACY_API_KEY_CONFIG)
-        if (legacy.isNotBlank()) setApiKeyConfigValue(legacy.trim())
-    }
-
-    override fun getEditText(): List<String> =
-        listOf(
-            "&fDungeon Profit Hud",
-            "&f"
-        ) +
-            orderProfitRows(
-                listOf(
-                    ProfitHudRow("sessionTime", "Time", "Not started"),
-                    ProfitHudRow("currentLevel", "Cata", "50"),
-                    ProfitHudRow("target", "Target", "51"),
-                    ProfitHudRow("levelProgress", "Next", "28.9%"),
-                    ProfitHudRow("runsLeft", "Left", "252"),
-                    ProfitHudRow("currentXp", "XP", "627.58m"),
-                    ProfitHudRow("lastRun", "Last", "491k", "(4.83m/h)"),
-                    ProfitHudRow("observedCount", "Runs", "100"),
-                )
-            ).map { editPreviewLine(it) } +
-            listOf(
-                "&f",
-                "&f----------------",
-                "&f"
-            ) +
-            orderProfitRows(
-                listOf(
-                    ProfitHudRow("chestsOpened", "Chests", "359"),
-                    ProfitHudRow("profit", "Profit", "2.79b"),
-                    ProfitHudRow("avgChest", "Avg Chest", "7.77m"),
-                    ProfitHudRow("kismets", "Kismets", "0"),
-                    ProfitHudRow("croesus", "Croesus", "0"),
-                )
-            ).map { editPreviewLine(it) }
 
     private fun editPreviewLine(row: ProfitHudRow): String {
         val paddedLabel = row.label.padEnd(7)
         val suffix = if (row.suffix.isBlank()) "" else " ${row.suffix}"
         return "&f$paddedLabel | ${row.value}$suffix"
+    }
+
+    private fun clearPendingChestTracking() {
+        pendingChestProfit = null
+        lastChestScanKey = ""
+        lastChestScanCandidate = null
+        lastCroesusCandidates = emptyMap()
+        selectedCroesusCandidate = null
     }
 
     override fun initialize() {
@@ -683,15 +671,14 @@ class DungeonProgressHudFeature(
         runtimeStarted = true
         log("Feature runtime started by $reason")
         loadState()
-        lastApiKeyValue = configuredApiKey()
         importRecentLogs(false)
     }
 
     private fun clientTick() {
-        val refreshedForApiKey = maybeRefreshAfterApiKeyChange()
-        val refreshedForSkyBlockJoin = if (!refreshedForApiKey) maybeRefreshAfterSkyBlockJoin() else false
-        val refreshedForJoin = if (!refreshedForApiKey && !refreshedForSkyBlockJoin) maybeRefreshAfterServerJoin() else false
-        if (!startupRefreshAttempted && sessionReady() && !refreshedForApiKey && !refreshedForJoin) {
+        updateSessionTimer()
+        val refreshedForSkyBlockJoin = maybeRefreshAfterSkyBlockJoin()
+        val refreshedForJoin = if (!refreshedForSkyBlockJoin) maybeRefreshAfterServerJoin() else false
+        if (!startupRefreshAttempted && sessionReady() && !refreshedForSkyBlockJoin && !refreshedForJoin) {
             startupRefreshAttempted = true
             lastAutoRefreshAttempt = System.currentTimeMillis()
             log("Startup refresh triggered for user=${mc.user.name} uuid=${mc.user.profileId}")
@@ -725,7 +712,7 @@ class DungeonProgressHudFeature(
 
         if (data != null && lastRefresh >= joinRefreshStartedAt) {
             skyBlockJoinRefreshCompleted = true
-            log("SkyBlock detected after server join; API already refreshed")
+            log("SkyBlock detected after server join; profile already refreshed")
             return false
         }
         if (refreshing) return true
@@ -734,7 +721,7 @@ class DungeonProgressHudFeature(
         skyBlockJoinRefreshAttempted = true
         startupRefreshAttempted = true
         lastAutoRefreshAttempt = now
-        log("SkyBlock detected after server join; forcing silent API refresh server=${mc.currentServer?.ip ?: "unknown"}")
+        log("SkyBlock detected after server join; forcing silent profile refresh server=${mc.currentServer?.ip ?: "unknown"}")
         refresh(force = true, recordObservedSample = false, notify = false)
         return true
     }
@@ -806,26 +793,30 @@ class DungeonProgressHudFeature(
             return
         }
         if (!force && System.currentTimeMillis() - lastRefresh < AUTO_REFRESH_INTERVAL_MILLIS && data != null) return
-        val requestApiKey = configuredApiKey()
-        if (requestApiKey.isBlank()) {
-            status = "API key missing"
-            log("Refresh skipped: missing API key")
-            if (notify) send("Refresh skipped: API key missing. Use /dph apikey <key> if the GUI field did not save.")
+        if (!FabricLoader.getInstance().isModLoaded(SKYBLOCK_PV_MOD_ID) &&
+            !FabricLoader.getInstance().isModLoaded(SKYBLOCKER_MOD_ID)
+        ) {
+            status = "No profile provider loaded"
+            log("Refresh skipped: neither SkyBlock Profile Viewer nor SkyBlocker is loaded")
+            if (notify) send("Refresh skipped: install SkyBlock Profile Viewer or SkyBlocker.")
             return
         }
-        val user = mc.user
+        val player = mc.player ?: run {
+            status = "Waiting for player"
+            if (notify) send("Refresh skipped: waiting for player data.")
+            return
+        }
         val request = ProfileRequest(
-            playerName = user.name,
-            playerUuid = user.profileId.toString().replace("-", ""),
-            apiKey = requestApiKey,
+            playerName = player.name.string,
+            playerUuid = player.uuid,
         )
 
         refreshing = true
         status = "Refreshing..."
         log("Refresh started force=$force recordObservedSample=$recordObservedSample user=${request.playerName} uuid=${request.playerUuid}")
-        if (notify) send("Refreshing API data...")
+        if (notify) send("Refreshing profile data...")
 
-        thread(name = "DungeonProgressHud-API", isDaemon = true) {
+        thread(name = "DungeonProgressHud-Profile", isDaemon = true) {
             val result = runCatching { fetchProfile(request) }
             mc.execute {
                 try {
@@ -839,7 +830,7 @@ class DungeonProgressHudFeature(
                             recordSample(it, recordObservedSample)
                         }
                         .onFailure {
-                            status = it.message ?: "Refresh failed"
+                            status = profileFailureMessage(it)
                             log("Refresh failed: ${it.stackTraceToString()}")
                             if (notify) send("Refresh failed: $status")
                         }
@@ -849,148 +840,6 @@ class DungeonProgressHudFeature(
             }
         }
     }
-
-    private fun configuredApiKey(): String {
-        val current = apiKey.get().trim()
-        if (current.isNotBlank()) {
-            if (current != apiKey.get()) setApiKeyConfigValue(current)
-            return current
-        }
-
-        for (configName in API_KEY_CONFIG_NAMES) {
-            val value = readConfiguredApiKeyValue(configName)
-            if (value.isNotBlank()) {
-                setApiKeyConfigValue(value)
-                return value
-            }
-        }
-
-        return ""
-    }
-
-    private fun setApiKeyConfigValue(value: String) {
-        withApiKeyChangeSuppressed {
-            apiKey.set(value)
-        }
-    }
-
-    private fun withApiKeyChangeSuppressed(block: () -> Unit) {
-        suppressApiKeyChange = true
-        try {
-            block()
-        } finally {
-            suppressApiKeyChange = false
-        }
-    }
-
-    private fun onApiKeyInputChanged(value: String) {
-        if (suppressApiKeyChange) return
-        val normalized = value.trim()
-        if (normalized == lastApiKeyValue) return
-
-        lastApiKeyValue = normalized
-        if (normalized.isBlank()) {
-            pendingApiKeyRefreshValue = ""
-            pendingApiKeyRefreshAt = 0L
-            pendingApiKeyRefreshNotify = false
-            status = "API key missing"
-            return
-        }
-        if (!isRefreshableApiKey(normalized)) {
-            pendingApiKeyRefreshValue = ""
-            pendingApiKeyRefreshAt = 0L
-            pendingApiKeyRefreshNotify = false
-            status = "API key changed"
-            return
-        }
-
-        queueApiKeyRefresh(normalized, notify = false, delayMillis = API_KEY_REFRESH_DEBOUNCE_MILLIS)
-    }
-
-    private fun isRefreshableApiKey(value: String): Boolean =
-        value.length >= MIN_REFRESHABLE_API_KEY_LENGTH && value.none { it.isWhitespace() }
-
-    private fun queueApiKeyRefresh(value: String, notify: Boolean, delayMillis: Long) {
-        val now = System.currentTimeMillis()
-        lastApiKeyValue = value
-        pendingApiKeyRefreshValue = value
-        pendingApiKeyRefreshAt = now + delayMillis
-        pendingApiKeyRefreshNotify = pendingApiKeyRefreshNotify || notify
-        status = if (delayMillis <= 0L) "API key saved; refreshing..." else "API key saved; refresh queued"
-    }
-
-    private fun maybeRefreshAfterApiKeyChange(): Boolean {
-        val queuedKey = pendingApiKeyRefreshValue
-        if (queuedKey.isBlank()) return false
-        if (!sessionReady()) return true
-
-        val now = System.currentTimeMillis()
-        if (now < pendingApiKeyRefreshAt) return true
-        if (refreshing) {
-            pendingApiKeyRefreshAt = now + API_KEY_REFRESH_RETRY_MILLIS
-            return true
-        }
-
-        val current = configuredApiKey()
-        if (current != queuedKey) {
-            if (current.isBlank() || !isRefreshableApiKey(current)) {
-                pendingApiKeyRefreshValue = ""
-                pendingApiKeyRefreshAt = 0L
-                pendingApiKeyRefreshNotify = false
-                return false
-            }
-            queueApiKeyRefresh(current, pendingApiKeyRefreshNotify, API_KEY_REFRESH_DEBOUNCE_MILLIS)
-            return true
-        }
-
-        val notify = pendingApiKeyRefreshNotify
-        pendingApiKeyRefreshValue = ""
-        pendingApiKeyRefreshAt = 0L
-        pendingApiKeyRefreshNotify = false
-        startupRefreshAttempted = true
-        lastAutoRefreshAttempt = now
-        log("API key change triggered forced refresh")
-        refresh(force = true, recordObservedSample = false, notify = notify)
-        return true
-    }
-
-    private fun saveDevonianConfigAsync(reason: String) {
-        if (devonianConfigSaveRunning) {
-            devonianConfigSavePending = true
-            return
-        }
-        devonianConfigSaveRunning = true
-        thread(name = "DungeonProgressHud-ConfigSave", isDaemon = true) {
-            do {
-                devonianConfigSavePending = false
-                runCatching { Config.save() }
-                    .onFailure { log("Devonian config save failed reason=$reason: ${it.javaClass.simpleName}: ${it.message}") }
-            } while (devonianConfigSavePending)
-            devonianConfigSaveRunning = false
-        }
-    }
-
-    fun setApiKey(value: String) {
-        val normalized = value.trim()
-        if (normalized.isBlank()) {
-            status = "API key missing"
-            send("API key was empty.")
-            return
-        }
-
-        apiKey.set(normalized)
-        runCatching { Config.setConfig(LEGACY_API_KEY_CONFIG, normalized) }
-        saveDevonianConfigAsync("api-key-command")
-        queueApiKeyRefresh(normalized, notify = true, delayMillis = 0L)
-        send("API key saved. Refreshing API data...")
-        log("API key saved via command length=${normalized.length}")
-    }
-
-    private fun readConfiguredApiKeyValue(configName: String): String =
-        runCatching { Config.getConfig(configName, "") }
-            .getOrDefault("")
-            ?.trim()
-            ?: ""
 
     fun resetSamples() {
         state.samples.clear()
@@ -1039,10 +888,10 @@ class DungeonProgressHudFeature(
 
     fun toggleTrackerMode() {
         if (state.chestProfitWindowMillis > 0L) {
-            setTrackerMode(chestProfitMode.getCurrent())
+            setTrackerMode(trackerModeValue())
             return
         }
-        setTrackerMode(if (chestProfitMode.getCurrent() == "Total") "Session" else "Total")
+        setTrackerMode(if (trackerModeValue() == "Total") "Session" else "Total")
     }
 
     fun setProfitWindow(input: String) {
@@ -1286,9 +1135,9 @@ class DungeonProgressHudFeature(
         val xpPerRun = effectiveXpPerRun()
         val remaining = xpRemaining(profile.catacombsExperience, targetLevelValue())
         val runs = xpPerRun.takeIf { it > 0 }?.let { ceil(remaining.toDouble() / it.toDouble()).toLong() }
-        val samples = samplesForFloor()
-        val last = samples.lastOrNull()
-        val source = if (xpMode.getCurrent() == "Hardcoded") "hardcoded" else if (samples.isEmpty()) "fallback" else "observed"
+        val observedXp = scopedObservedXp()
+        val last = observedXp.lastOrNull()
+        val source = if (xpModeValue() == "Hardcoded") "hardcoded" else if (observedXp.isEmpty()) "fallback" else scopedRunScopeLabel()
         val currentLevel = currentCataLevel(profile.catacombsExperience)
 
         return buildList {
@@ -1301,15 +1150,17 @@ class DungeonProgressHudFeature(
             if (showFloor.get()) add(HudLine("floor", "&bFloor: &f${floorValue()}"))
             if (showXpPerRun.get()) add(HudLine("xpPerRun", "&bXP/Run: &f${xpPerRun.format()} &7($source)"))
             if (showProfile.get()) add(HudLine("profile", "&bProfile: &f${profile.profileName}"))
-            if (showLastRun.get()) add(HudLine("lastRun", "&bLast Run: &f${last?.normalizedXpDelta?.format() ?: "N/A"}"))
-            if (showObservedCount.get()) add(HudLine("observedCount", "&bRuns: &f${observedRunCountForFloor()}"))
-            if (showChestProfit.get()) {
+            if (showLastRun.get()) add(HudLine("lastRun", "&bLast Run: &f${last?.second?.format() ?: "N/A"}"))
+            if (showObservedCount.get()) add(HudLine("observedCount", "&bRuns: &f${scopedRunCount()}"))
+            if (showChestProfit.get() || showChestCount.get()) {
                 val stats = chestProfitStats()
-                add(HudLine("profit", "&bProfit: &a${stats.profit.formatCoins()} &7(${stats.label})"))
+                if (showChestProfit.get()) {
+                    add(HudLine("profit", "&bProfit: &a${stats.profit.formatCoins()} &7(${stats.label})"))
+                    add(HudLine("avgChest", "&bAvg Chest: &a${stats.average.formatCoins()}"))
+                }
                 if (showChestCount.get()) add(HudLine("chestsOpened", "&bChest: &f${stats.chests}"))
-                if (showLastChest.get()) add(HudLine("lastChest", "&bLast Chest: &f${state.lastChestName.ifBlank { "N/A" }} &a${state.lastChestProfit.formatCoins()}"))
-                add(HudLine("avgChest", "&bAvg Chest: &a${stats.average.formatCoins()}"))
             }
+            if (showLastChest.get()) add(HudLine("lastChest", "&bLast Chest: &f${state.lastChestName.ifBlank { "N/A" }} &a${state.lastChestProfit.formatCoins()}"))
         }
     }
 
@@ -1390,26 +1241,6 @@ class DungeonProgressHudFeature(
         if (!renderHud.get() || !isEnabled()) return emptyList()
         if (currentHudMode() == HUD_MODE_ITEMS) return emptyList()
         return (buildProfitHudTopRows() + buildProfitHudBottomRows()).map { HudLine(it.id, it.label) }
-    }
-
-    private fun buildEditPreviewHudLines(): List<HudLine> = buildList {
-        if (showCurrentLevel.get()) add(HudLine("currentLevel", "&bCata Level: &fC49"))
-        if (showLevelProgress.get()) add(HudLine("levelProgress", "&bNext Level: &f73.4%"))
-        if (showTarget.get()) add(HudLine("target", "&bTarget: &fC50"))
-        if (showRunsLeft.get()) add(HudLine("runsLeft", "&bRuns Left: &a259"))
-        if (showCurrentXp.get()) add(HudLine("currentXp", "&bCata XP: &f453,559,640"))
-        if (showRemaining.get()) add(HudLine("remaining", "&bRemaining: &f116,250,000"))
-        if (showFloor.get()) add(HudLine("floor", "&bFloor: &fM7"))
-        if (showXpPerRun.get()) add(HudLine("xpPerRun", "&bXP/Run: &f450,000 &7(fallback)"))
-        if (showProfile.get()) add(HudLine("profile", "&bProfile: &fSelected"))
-        if (showLastRun.get()) add(HudLine("lastRun", "&bLast Run: &f450,000"))
-        if (showObservedCount.get()) add(HudLine("observedCount", "&bRuns: &f12"))
-        if (showChestProfit.get()) {
-            add(HudLine("profit", "&bProfit: &a12.3M coins &7(session)"))
-            if (showChestCount.get()) add(HudLine("chestsOpened", "&bChest: &f8"))
-            if (showLastChest.get()) add(HudLine("lastChest", "&bLast Chest: &fObsidian &a1.2M coins"))
-            add(HudLine("avgChest", "&bAvg Chest: &a1.5M coins"))
-        }
     }
 
     private fun hudLineAt(mouseX: Double, mouseY: Double, lines: List<HudLine>): HudLineBounds? =
@@ -1942,46 +1773,173 @@ class DungeonProgressHudFeature(
     }
 
     private fun fetchProfile(request: ProfileRequest): ProfileData {
-        val encodedUuid = URLEncoder.encode(request.playerUuid, StandardCharsets.UTF_8)
-        log("Fetching Hypixel profile user=${request.playerName} uuid=${request.playerUuid}")
-        val connection = URI("https://api.hypixel.net/v2/skyblock/profiles?uuid=$encodedUuid").toURL().openConnection() as HttpURLConnection
-        try {
-            connection.requestMethod = "GET"
-            connection.connectTimeout = 10_000
-            connection.readTimeout = 10_000
-            connection.setRequestProperty("Accept", "application/json")
-            connection.setRequestProperty("API-Key", request.apiKey)
-            connection.setRequestProperty("User-Agent", "DungeonProgressHud/1.0.0")
-
-            val code = connection.responseCode
-            log("Hypixel response code=$code")
-            if (code == 403) error("Invalid API key")
-            if (code == 429) error("Rate limited")
-            if (code !in 200..299) error("Hypixel HTTP $code")
-
-            val root = connection.inputStream.reader(StandardCharsets.UTF_8).use { reader ->
-                JsonParser.parseReader(reader).asJsonObject
-            }
-            if (root.get("success")?.asBoolean != true) error(root.get("cause")?.asString ?: "Hypixel API failed")
-            val profiles = root.getAsJsonArray("profiles") ?: error("No SkyBlock profiles")
-            val selected = profiles.map { it.asJsonObject }.firstOrNull { it.get("selected")?.asBoolean == true }
-                ?: error("No selected SkyBlock profile")
-            val selectedProfileName = selected.get("cute_name")?.asString ?: "Unknown"
-            log("Selected profile cute_name=$selectedProfileName")
-            val member = selected.getAsJsonObject("members")?.getAsJsonObject(request.playerUuid) ?: error("Selected profile missing player")
-            val dungeons = member.getAsJsonObject("dungeons") ?: error("Dungeon API unavailable")
-            val catacombs = dungeons.getAsJsonObject("dungeon_types")?.getAsJsonObject("catacombs") ?: error("Catacombs data unavailable")
-
-            return ProfileData(
-                playerName = request.playerName,
-                playerUuid = request.playerUuid,
-                profileName = selectedProfileName,
-                catacombsExperience = catacombs.get("experience")?.asLong ?: 0L,
-            )
-        } finally {
-            connection.disconnect()
+        val failures = mutableListOf<String>()
+        if (FabricLoader.getInstance().isModLoaded(SKYBLOCK_PV_MOD_ID)) {
+            runCatching { fetchSkyBlockPvProfile(request) }
+                .onSuccess { return it }
+                .onFailure {
+                    val message = profileFailureMessage(it)
+                    failures += "SkyBlock Profile Viewer: $message"
+                    log("SkyBlockPv profile fetch failed; trying SkyBlocker: $message")
+                }
         }
+        if (FabricLoader.getInstance().isModLoaded(SKYBLOCKER_MOD_ID)) {
+            runCatching { fetchSkyBlockerProfile(request) }
+                .onSuccess { return it }
+                .onFailure {
+                    val message = profileFailureMessage(it)
+                    failures += "SkyBlocker: $message"
+                    log("SkyBlocker profile fetch failed: $message")
+                }
+        }
+        error(failures.ifEmpty { listOf("No profile provider loaded") }.joinToString("; "))
     }
+
+    private fun fetchSkyBlockPvProfile(request: ProfileRequest): ProfileData {
+        val gameProfile = GameProfile(request.playerUuid, request.playerName)
+        log("Fetching SkyBlockPv profile user=${gameProfile.name} uuid=${gameProfile.id} sessionUuid=${request.playerUuid}")
+        val profileApiClass = Class.forName(SKYBLOCK_PV_PROFILE_API)
+        val profileApi = profileApiClass.getField("INSTANCE").get(null)
+        val profileResult = CompletableFuture<List<*>>()
+        val handler: (List<*>) -> Unit = { profileResult.complete(it) }
+        val getProfiles = profileApiClass.methods.firstOrNull { method ->
+            method.name == "getProfiles" && method.parameterCount == 3
+        } ?: error("SkyBlock Profile Viewer profile API is incompatible")
+
+        getProfiles.invoke(
+            profileApi,
+            gameProfile,
+            "dungeonprogresshud",
+            handler,
+        )
+
+        val profiles = profileResult.get(PROFILE_FETCH_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        val activeProfile = activeSkyBlockProfile()
+        log("SkyBlockPv returned ${profiles.size} profiles for uuid=${gameProfile.id}; active=${activeProfile?.second ?: "unknown"}/${activeProfile?.first ?: "unknown"}: ${profiles.joinToString { describeSkyBlockPvProfile(it) }}")
+        val selected = profiles.firstOrNull { profile ->
+            profile != null && invokeProfileMethod(profile, "getSelected") == true
+        } ?: activeProfile?.let { (activeId, activeName) ->
+            profiles.firstOrNull { profile ->
+                val identity = skyBlockPvProfileIdentity(profile) ?: return@firstOrNull false
+                (activeId != null && identity.first == activeId) ||
+                    (activeName.isNotBlank() && identity.second.equals(activeName, true))
+            }
+        } ?: profiles.singleOrNull() ?: error(
+            "No active SkyBlock profile match for ${gameProfile.name}; in-game profile is ${activeProfile?.second ?: "not loaded"}"
+        )
+
+        val profileId = invokeProfileMethod(selected, "getId") ?: error("Selected profile ID unavailable")
+        val profileName = invokeProfileMethod(profileId, "getName") as? String ?: "Unknown"
+        val backingProfile = invokeProfileMethod(selected, "getBackingProfile")
+            ?: error("SkyBlock Profile Viewer backing profile unavailable")
+        val dungeonFuture = invokeProfileMethod(backingProfile, "getDungeonData") as? CompletableFuture<*>
+            ?: error("SkyBlock Profile Viewer dungeon request unavailable")
+        val dungeonData = dungeonFuture.get(PROFILE_FETCH_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            ?: error("Dungeon API unavailable")
+        val dungeonTypes = invokeProfileMethod(dungeonData, "getDungeonTypes") as? Map<*, *>
+            ?: error("Dungeon types unavailable")
+        val catacombs = dungeonTypes["catacombs"] ?: error("Catacombs data unavailable")
+        val catacombsExperience = (invokeProfileMethod(catacombs, "getExperience") as? Number)?.toLong()
+            ?: error("Catacombs experience unavailable")
+
+        log("Selected SkyBlockPv profile name=$profileName")
+        return ProfileData(
+            playerName = request.playerName,
+            playerUuid = gameProfile.id.toString().replace("-", ""),
+            profileName = profileName,
+            catacombsExperience = catacombsExperience,
+        )
+    }
+
+    private fun fetchSkyBlockerProfile(request: ProfileRequest): ProfileData {
+        val uuid = request.playerUuid.toString().replace("-", "")
+        log("Fetching SkyBlocker profile user=${request.playerName} uuid=$uuid")
+        val profileUtils = Class.forName(SKYBLOCKER_PROFILE_UTILS)
+        val fetchProfiles = profileUtils.getMethod("fetchFullProfileByUuid", String::class.java)
+        val future = fetchProfiles.invoke(null, uuid) as? CompletableFuture<*>
+            ?: error("SkyBlocker profile request unavailable")
+        val root = future.get(PROFILE_FETCH_TIMEOUT_SECONDS, TimeUnit.SECONDS) as? JsonObject
+            ?: error("SkyBlocker returned no profile data")
+        if (root.get("success")?.asBoolean == false) error(root.get("cause")?.asString ?: "SkyBlocker profile request failed")
+        val profiles = root.getAsJsonArray("profiles") ?: error("SkyBlocker returned no SkyBlock profiles")
+        val selected = selectSkyBlockerProfile(profiles, request)
+        val profileName = selected.get("cute_name")?.asString ?: "Unknown"
+        val members = selected.getAsJsonObject("members") ?: error("SkyBlocker profile members unavailable")
+        val member = members.getAsJsonObject(uuid)
+            ?: members.getAsJsonObject(request.playerUuid.toString())
+            ?: error("Selected profile missing player")
+        val catacombsExperience = member.getAsJsonObject("dungeons")
+            ?.getAsJsonObject("dungeon_types")
+            ?.getAsJsonObject("catacombs")
+            ?.get("experience")
+            ?.asLong
+            ?: error("Catacombs data unavailable")
+        log("Selected SkyBlocker profile name=$profileName")
+        return ProfileData(
+            playerName = request.playerName,
+            playerUuid = uuid,
+            profileName = profileName,
+            catacombsExperience = catacombsExperience,
+        )
+    }
+
+    private fun selectSkyBlockerProfile(profiles: JsonArray, request: ProfileRequest): JsonObject {
+        val candidates = profiles.mapNotNull { it.takeIf { element -> element.isJsonObject }?.asJsonObject }
+        val activeProfile = activeSkyBlockProfile()
+        return candidates.firstOrNull { it.get("selected")?.asBoolean == true }
+            ?: activeProfile?.let { (activeId, activeName) ->
+                candidates.firstOrNull { profile ->
+                    val profileId = profile.get("profile_id")?.asString?.let { value ->
+                        runCatching { UUID.fromString(value) }.getOrNull()
+                    }
+                    val profileName = profile.get("cute_name")?.asString.orEmpty()
+                    (activeId != null && profileId == activeId) ||
+                        (activeName.isNotBlank() && profileName.equals(activeName, true))
+                }
+            }
+            ?: candidates.singleOrNull()
+            ?: error("No active SkyBlocker profile match for ${request.playerName}; in-game profile is ${activeProfile?.second ?: "not loaded"}")
+    }
+
+    private fun describeSkyBlockPvProfile(profile: Any?): String {
+        if (profile == null) return "null"
+        return runCatching {
+            val identity = skyBlockPvProfileIdentity(profile)
+            val name = identity?.second.orEmpty()
+            val selected = invokeProfileMethod(profile, "getSelected") == true
+            "${name.ifBlank { "unknown" }}(${identity?.first ?: "unknown"}, selected=$selected)"
+        }.getOrDefault("unreadable")
+    }
+
+    private fun skyBlockPvProfileIdentity(profile: Any?): Pair<UUID?, String>? {
+        if (profile == null) return null
+        val id = invokeProfileMethod(profile, "getId") ?: return null
+        return (invokeProfileMethod(id, "getId") as? UUID) to
+            ((invokeProfileMethod(id, "getName") as? String).orEmpty())
+    }
+
+    private fun activeSkyBlockProfile(): Pair<UUID?, String>? = runCatching {
+        val profileApiClass = Class.forName(SKYBLOCK_API_PROFILE_API)
+        val profileApi = profileApiClass.getField("INSTANCE").get(null)
+        val loaded = invokeProfileMethod(profileApi, "isLoaded") as? Boolean ?: false
+        if (!loaded) return@runCatching null
+        val id = invokeProfileMethod(profileApi, "getProfileId") as? UUID
+        val name = invokeProfileMethod(profileApi, "getProfileName") as? String ?: ""
+        id to name
+    }.onFailure {
+        log("Live SkyBlock profile lookup failed: ${profileFailureMessage(it)}")
+    }.getOrNull()
+
+    private fun profileFailureMessage(error: Throwable): String {
+        var cause = error
+        while (cause.cause != null && cause.cause !== cause) cause = cause.cause!!
+        return cause.message?.takeIf { it.isNotBlank() } ?: cause.javaClass.simpleName
+    }
+
+    private fun invokeProfileMethod(instance: Any, methodName: String): Any? =
+        instance.javaClass.methods.firstOrNull { it.name == methodName && it.parameterCount == 0 }
+            ?.invoke(instance)
+            ?: error("SkyBlock Profile Viewer method $methodName is unavailable")
 
     private fun recordSample(profile: ProfileData, recordObservedSample: Boolean) {
         if (state.lastPlayerUuid != profile.playerUuid) {
@@ -1994,21 +1952,21 @@ class DungeonProgressHudFeature(
         val delta = profile.catacombsExperience - state.lastCatacombsXp
         state.lastCatacombsXp = profile.catacombsExperience
         if (!recordObservedSample) {
-            log("API XP baseline updated without observed sample rawDelta=$delta floor=${floorValue()}")
+            log("Profile XP baseline updated without observed sample rawDelta=$delta floor=${floorValue()}")
             saveState()
             return
         }
 
-        val normalized = normalizeRunXp(delta)
-        log("Recorded sample rawDelta=$delta normalized=$normalized floor=${floorValue()}")
-        if (isRecentChatRunSample(delta, normalized)) {
-            log("API XP sample skipped because it matches recent dungeon completion chat rawDelta=$delta normalized=$normalized")
+        val recordedXp = delta.coerceAtLeast(0L)
+        log("Recorded sample rawDelta=$delta recordedXp=$recordedXp floor=${floorValue()}")
+        if (isRecentChatRunSample(delta, recordedXp)) {
+            log("Profile XP sample skipped because it matches recent dungeon completion chat rawDelta=$delta recordedXp=$recordedXp")
             saveState()
             return
         }
-        if (normalized > 0) {
-            ensureSessionStarted(System.currentTimeMillis(), "api-xp-sample")
-            state.samples.add(RunSample(System.currentTimeMillis(), floorValue(), delta, normalized))
+        if (recordedXp > 0) {
+        ensureSessionStarted(System.currentTimeMillis(), "profile-xp-sample")
+            state.samples.add(RunSample(System.currentTimeMillis(), floorValue(), delta, recordedXp))
             while (state.samples.size > 100) state.samples.removeAt(0)
         }
         saveState()
@@ -2065,7 +2023,7 @@ class DungeonProgressHudFeature(
         lastDungeonCompletionChat = dedupeKey
         lastDungeonCompletionChatAt = timestamp
         lastDungeonCompletionRawXp = cataXp
-        lastDungeonCompletionNormalizedXp = normalizeRunXp(cataXp)
+        lastDungeonCompletionNormalizedXp = cataXp.coerceAtLeast(0L)
         val runStartedAt = if (pendingCompletionTimeSeconds > 0) {
             timestamp - pendingCompletionTimeSeconds * 1000L
         } else {
@@ -2086,9 +2044,8 @@ class DungeonProgressHudFeature(
             )
         )
         incrementCroesusUnclaimedCount("dungeon-completion")
-        while (state.runs.size > 500) state.runs.removeAt(0)
         saveState()
-        log("Recorded dungeon completion chat XP raw=$cataXp normalized=$lastDungeonCompletionNormalizedXp floor=$floor time=$pendingCompletionTimeSeconds score=$pendingCompletionScore")
+        log("Recorded dungeon completion chat XP raw=$cataXp recordedXp=$lastDungeonCompletionNormalizedXp floor=$floor time=$pendingCompletionTimeSeconds score=$pendingCompletionScore")
         return true
     }
 
@@ -2282,7 +2239,7 @@ class DungeonProgressHudFeature(
         var imported = 0
         for (run in importedRuns) {
             if (hasRunRecord(run.floorLabel, run.rawCataXp, run.runTimeSeconds, run.score, run.timestamp)) continue
-            val normalized = normalizeRunXp(run.rawCataXp)
+            val normalized = run.rawCataXp.coerceAtLeast(0L)
             state.samples.add(RunSample(run.timestamp, run.floorLabel, run.rawCataXp, normalized))
             state.runs.add(
                 DungeonRunRecord(
@@ -2298,7 +2255,6 @@ class DungeonProgressHudFeature(
             imported++
         }
         while (state.samples.size > 100) state.samples.removeAt(0)
-        while (state.runs.size > 500) state.runs.removeAt(0)
         state.lastLogImportAt = System.currentTimeMillis()
         saveState()
         log("Log import complete files=$fileCount parsedRuns=${importedRuns.size} importedRuns=$imported")
@@ -2335,28 +2291,61 @@ class DungeonProgressHudFeature(
         return raw == lastDungeonCompletionRawXp || normalized == lastDungeonCompletionNormalizedXp
     }
 
-    private fun normalizeRunXp(raw: Long): Long {
-        if (raw <= 0) return 0
-        if (!scaleDailyRunXp.get()) return raw
-        if (raw <= dailyThresholdValue()) return raw
-        return (raw / dailyMultiplierValue()).roundToLong().coerceAtLeast(1)
-    }
-
     private fun effectiveXpPerRun(): Long {
-        if (xpMode.getCurrent() == "Hardcoded") return hardcodedXpPerRunValue()
-        return samplesForFloor().takeIf { it.isNotEmpty() }?.map { it.normalizedXpDelta }?.average()?.roundToLong()
+        if (xpModeValue() == "Hardcoded") return hardcodedXpPerRunValue()
+        return scopedObservedXp().takeIf { it.isNotEmpty() }?.map { it.second }?.average()?.roundToLong()
             ?: hardcodedXpPerRunValue()
     }
 
-    private fun samplesForFloor(): List<RunSample> {
-        val floor = floorValue()
-        return state.samples.filter { it.floorLabel.equals(floor, true) && it.normalizedXpDelta > 0 }
+    private fun scopedRuns(now: Long = System.currentTimeMillis()): List<DungeonRunRecord> {
+        if (state.chestProfitWindowMillis > 0L) {
+            val cutoff = now - state.chestProfitWindowMillis
+            return state.runs.filter { it.timestamp >= cutoff }
+        }
+        if (trackerModeValue() == "Total") return state.runs
+        if (sessionStartedAt <= 0L) return emptyList()
+        return state.runs.filter { it.timestamp >= sessionStartedAt }
     }
 
-    private fun observedRunCountForFloor(): Int {
+    private fun scopedXpRuns(): List<DungeonRunRecord> {
         val floor = floorValue()
-        val runCount = state.runs.count { it.floorLabel.equals(floor, true) && it.normalizedCataXp > 0 }
-        return runCount.takeIf { it > 0 } ?: samplesForFloor().size
+        return scopedRuns().filter { it.floorLabel.equals(floor, true) && it.rawCataXp > 0L }
+    }
+
+    private fun scopedXpSamples(now: Long = System.currentTimeMillis()): List<RunSample> {
+        val floor = floorValue()
+        return state.samples.filter {
+            it.floorLabel.equals(floor, true) && it.rawXpDelta > 0L && isInSelectedTrackerScope(it.timestamp, now)
+        }
+    }
+
+    /**
+     * Completion-chat records are the authoritative run list. Profile refreshes can also observe an
+     * XP delta when that chat is unavailable, so retain those samples after removing duplicates.
+     */
+    private fun scopedObservedXp(now: Long = System.currentTimeMillis()): List<Pair<Long, Long>> {
+        val runs = scopedXpRuns().map { it.timestamp to it.rawCataXp }
+        val profileOnlySamples = scopedXpSamples(now).filter { sample ->
+            runs.none { (timestamp, xp) ->
+                xp == sample.rawXpDelta && kotlin.math.abs(timestamp - sample.timestamp) < 10 * 60 * 1000L
+            }
+        }.map { it.timestamp to it.rawXpDelta }
+        return (runs + profileOnlySamples).sortedBy { it.first }
+    }
+
+    private fun isInSelectedTrackerScope(timestamp: Long, now: Long): Boolean = when {
+        state.chestProfitWindowMillis > 0L -> timestamp >= now - state.chestProfitWindowMillis
+        trackerModeValue() == "Total" -> true
+        sessionStartedAt > 0L -> timestamp >= sessionStartedAt
+        else -> false
+    }
+
+    private fun scopedRunCount(): Int = scopedRuns().size
+
+    private fun scopedRunScopeLabel(): String = when {
+        state.chestProfitWindowMillis > 0L -> formatProfitWindow(state.chestProfitWindowMillis)
+        trackerModeValue() == "Total" -> "total"
+        else -> "session"
     }
 
     private fun chestProfitStats(): ChestProfitStats {
@@ -2373,7 +2362,7 @@ class DungeonProgressHudFeature(
             return ChestProfitStats(formatProfitWindow(state.chestProfitWindowMillis), profit, chests, average)
         }
 
-        if (chestProfitMode.getCurrent() == "Total") {
+        if (trackerModeValue() == "Total") {
             val average = if (state.totalChestsOpened > 0) {
                 (state.totalChestProfit.toDouble() / state.totalChestsOpened.toDouble()).roundToLong()
             } else {
@@ -2409,12 +2398,12 @@ class DungeonProgressHudFeature(
         val chests = state.chestProfits.filter { it.timestamp >= cutoff }
         val runCount = runs.size
         val chestCount = chests.size
-        val xp = runs.sumOf { it.normalizedCataXp }
+        val xp = runs.sumOf { it.rawCataXp }
         val profit = chests.sumOf { it.profit }
         val runSeconds = runs.sumOf { it.runTimeSeconds.coerceAtLeast(0) }
         val elapsedSeconds = when {
+            scope.equals("session", true) -> sessionElapsedSeconds().coerceAtLeast(1L).toInt()
             runSeconds > 0 -> runSeconds
-            scope.equals("session", true) -> ((now - sessionStartedAt) / 1000L).coerceAtLeast(1L).toInt()
             else -> ((now - cutoff) / 1000L).coerceAtLeast(1L).toInt()
         }
         val hours = elapsedSeconds.toDouble() / 3600.0
@@ -2578,8 +2567,8 @@ class DungeonProgressHudFeature(
     private fun buildProfitHudTopRows(): List<ProfitHudRow> {
         val profile = data
         val xpPerRun = effectiveXpPerRun()
-        val samples = samplesForFloor()
-        val last = samples.lastOrNull()
+        val observedXp = scopedObservedXp()
+        val last = observedXp.lastOrNull()
         val remaining = profile?.let { xpRemaining(it.catacombsExperience, targetLevelValue()) } ?: 0L
         val runs = xpPerRun.takeIf { it > 0 }?.let { ceil(remaining.toDouble() / it.toDouble()).toLong() }
         val currentLevel = profile?.let { currentCataLevel(it.catacombsExperience) } ?: 0
@@ -2595,8 +2584,8 @@ class DungeonProgressHudFeature(
                 if (showFloor.get()) add(ProfitHudRow("floor", "Floor", floorValue()))
                 if (showXpPerRun.get()) add(ProfitHudRow("xpPerRun", "XP/Run", xpPerRun.formatCompact(), xpPerHourSuffix()))
                 if (showProfile.get()) add(ProfitHudRow("profile", "Profile", profile?.profileName ?: "N/A"))
-                if (showLastRun.get()) add(ProfitHudRow("lastRun", "Last Run", last?.normalizedXpDelta?.formatCompact() ?: "N/A"))
-                if (showObservedCount.get()) add(ProfitHudRow("observedCount", "Runs", observedRunCountForFloor().toString()))
+                if (showLastRun.get()) add(ProfitHudRow("lastRun", "Last Run", last?.second?.formatCompact() ?: "N/A"))
+                if (showObservedCount.get()) add(ProfitHudRow("observedCount", "Runs", scopedRunCount().toString()))
             }
         )
     }
@@ -2722,7 +2711,7 @@ class DungeonProgressHudFeature(
             val cutoff = System.currentTimeMillis() - state.chestProfitWindowMillis
             return state.trackedItemDrops.filter { it.timestamp > 0L && it.timestamp >= cutoff }
         }
-        if (chestProfitMode.getCurrent() == "Total") return state.trackedItemDrops
+        if (trackerModeValue() == "Total") return state.trackedItemDrops
         if (sessionStartedAt <= 0L) return emptyList()
         return state.trackedItemDrops.filter { it.timestamp > 0L && it.timestamp >= sessionStartedAt }
     }
@@ -2958,7 +2947,7 @@ class DungeonProgressHudFeature(
         }
     }
 
-    private fun sessionReady(): Boolean = mc.user.name.isNotBlank()
+    private fun sessionReady(): Boolean = mc.player?.uuid != null && mc.player?.name?.string?.isNotBlank() == true
 
     private fun xpRemaining(currentXp: Long, targetLevel: Int): Long = (targetXp(targetLevel) - currentXp).coerceAtLeast(0)
 
@@ -2971,7 +2960,7 @@ class DungeonProgressHudFeature(
         return CATACOMBS_LEVEL_50_XP + (normalizedLevel - CATACOMBS_LINEAR_LEVEL_START) * CATACOMBS_POST_50_XP_PER_LEVEL
     }
 
-    private fun targetLevelValue(): Int = targetLevel.get().toIntOrNull()?.coerceAtLeast(1) ?: 50
+    private fun targetLevelValue(): Int = targetLevel.get().toIntOrNull()?.coerceIn(1, 1_000) ?: 50
 
     private fun currentCataLevel(xp: Long): Int {
         if (xp >= CATACOMBS_LEVEL_50_XP) {
@@ -2994,6 +2983,10 @@ class DungeonProgressHudFeature(
 
     private fun floorValue(): String = floorLabel.get().ifBlank { "M7" }.uppercase(Locale.ROOT)
 
+    private fun xpModeValue(): String = xpMode.options.getOrElse(xpMode.get()) { xpMode.options.first() }
+
+    private fun trackerModeValue(): String = chestProfitMode.options.getOrElse(chestProfitMode.get()) { chestProfitMode.options.first() }
+
     private fun shouldTrackM7Drops(floor: String = floorValue()): Boolean =
         floor.equals("M7", true) ||
             floor.equals("MM7", true) ||
@@ -3001,10 +2994,6 @@ class DungeonProgressHudFeature(
             floor.equals("MASTER CATACOMBS - FLOOR VII", true)
 
     private fun hardcodedXpPerRunValue(): Long = hardcodedXpPerRun.get().toLongOrNull()?.coerceAtLeast(1L) ?: 450_000L
-
-    private fun dailyThresholdValue(): Long = dailyThreshold.get().toLongOrNull()?.coerceAtLeast(1L) ?: 600_000L
-
-    private fun dailyMultiplierValue(): Double = dailyMultiplier.get().toDoubleOrNull()?.coerceAtLeast(1.0) ?: 1.4
 
     private fun Long.format(): String = "%,d".format(this)
 
@@ -3018,17 +3007,48 @@ class DungeonProgressHudFeature(
     }
 
     private fun ensureSessionStarted(startedAt: Long, reason: String) {
-        if (sessionStartedAt > 0L) return
-        sessionStartedAt = startedAt.coerceAtMost(System.currentTimeMillis())
-        log("Dungeon profit session started reason=$reason startedAt=$sessionStartedAt")
+        val now = System.currentTimeMillis()
+        val activityStartedAt = startedAt.coerceIn(0L, now)
+        if (sessionStartedAt <= 0L) {
+            sessionStartedAt = activityStartedAt
+            sessionElapsedMillis = (now - activityStartedAt).coerceAtLeast(0L)
+            log("Dungeon session started reason=$reason startedAt=$sessionStartedAt")
+        }
+        if (!sessionTimerRunning) {
+            sessionTimerLastUpdatedAt = now
+            sessionTimerRunning = true
+            log("Dungeon session timer resumed reason=$reason elapsed=${sessionElapsedMillis}ms")
+        }
+        sessionLastActivityAt = now
+    }
+
+    private fun updateSessionTimer(now: Long = System.currentTimeMillis()) {
+        if (!sessionTimerRunning) return
+        val activeUntil = (sessionLastActivityAt + SESSION_INACTIVITY_MILLIS).coerceAtMost(now)
+        if (activeUntil > sessionTimerLastUpdatedAt) {
+            sessionElapsedMillis += activeUntil - sessionTimerLastUpdatedAt
+            sessionTimerLastUpdatedAt = activeUntil
+        }
+        if (now - sessionLastActivityAt >= SESSION_INACTIVITY_MILLIS) {
+            sessionTimerRunning = false
+            log("Dungeon session timer paused reason=inactivity elapsed=${sessionElapsedMillis}ms")
+        }
+    }
+
+    private fun pauseSessionTimer(reason: String) {
+        updateSessionTimer()
+        if (!sessionTimerRunning) return
+        sessionTimerRunning = false
+        log("Dungeon session timer paused reason=$reason elapsed=${sessionElapsedMillis}ms")
+    }
+
+    private fun sessionElapsedSeconds(): Long {
+        updateSessionTimer()
+        return sessionElapsedMillis / 1000L
     }
 
     private fun sessionDurationText(): String =
-        if (sessionStartedAt > 0L) {
-            formatSessionDuration(((System.currentTimeMillis() - sessionStartedAt) / 1000L).coerceAtLeast(0L))
-        } else {
-            "Not started"
-        }
+        if (sessionStartedAt > 0L) formatSessionDuration(sessionElapsedSeconds()) else "Not started"
 
     private fun formatSessionDuration(seconds: Long): String {
         val safe = seconds.coerceAtLeast(0L)
@@ -3043,8 +3063,12 @@ class DungeonProgressHudFeature(
     }
 
     private fun xpPerHourSuffix(): String {
-        val lastRun = state.runs.lastOrNull { it.normalizedCataXp > 0 && it.runTimeSeconds > 0 } ?: return ""
-        val perHour = (lastRun.normalizedCataXp.toDouble() * 3600.0 / lastRun.runTimeSeconds.toDouble()).roundToLong()
+        val elapsedSeconds = sessionElapsedSeconds()
+        if (elapsedSeconds <= 0L) return ""
+        val averageXp = effectiveXpPerRun()
+        val runs = scopedRunCount()
+        if (runs <= 0) return ""
+        val perHour = (averageXp.toDouble() * runs.toDouble() * 3600.0 / elapsedSeconds.toDouble()).roundToLong()
         return "(${perHour.formatCompact()}/h)"
     }
 
@@ -3173,8 +3197,7 @@ class DungeonProgressHudFeature(
 
     data class ProfileRequest(
         val playerName: String,
-        val playerUuid: String,
-        val apiKey: String,
+        val playerUuid: UUID,
     )
 
     data class ChestProfitStats(
