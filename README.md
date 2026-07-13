@@ -1,125 +1,169 @@
 # DungeonProgressHud
 
-DungeonProgressHud is a client-side Fabric mod for Hypixel SkyBlock dungeons.
-It adds a small HUD for Catacombs progress, estimated runs left, and dungeon
-reward chest profit tracking.
+DungeonProgressHud is a client-side Fabric mod for Hypixel SkyBlock. It combines
+Catacombs progression, run statistics, dungeon chest profit, and M7 drop tracking
+in one configurable HUD.
 
-Current release: **1.0.9** for **Minecraft 26.1.2**.
+**Current release:** 1.0.9 for Minecraft 26.1.2
 
-## Features
+[Download 1.0.9](https://github.com/MisterKrister/DungeonProgressHud/releases/tag/v1.0.9)
 
-- Catacombs level and XP display
-- Target Catacombs level progress
-- Estimated runs left from scoped observed or configured XP per run
-- Automatic player-data refresh through SkyBlock Profile Viewer or SkyBlocker while the HUD is visible
-- Dungeon completion chat/log tracking for last run XP, scoped XP/run averages, and XP/hour
-- Dungeon reward chest profit tracking using bundled SkyBlockAPI Bazaar and auction data
-- Configurable Instant Buy/Instant Sell and Lowest BIN/Median/Mean valuations
-- Missing-price health reporting and `/dph prices` diagnostics
-- Optional Dungeon Chest Key, essence, and Kismet Feather cost accounting
-- Detailed persisted chest breakdowns without repricing historical records
-- Session, total, or rolling-window chest profit view
-- Session, total, or rolling-window M7 item drop tracker
-- Dungeon-aware session timer with a five-minute grace period between runs
-- Shared session, total, or rolling-window scope for run count and observed XP; XP/hour uses the active session timer
-- Optional chest count and average chest profit display
+## What it tracks
+
+### Catacombs progress
+
+- Current Catacombs level and total XP
+- Progress toward the next level and a configurable target level
+- Remaining XP and estimated runs to the target
+- Observed or manually configured XP per run
+- Last run XP, scoped run count, and XP per hour
+- Automatically detected normal and Master Mode floor
+- Dungeon-aware session time with a five-minute grace period between runs
+
+Run completions are read from chat and recent logs. Profile refreshes can fill in
+missed completion records without counting the same XP twice.
+
+### Dungeon chest profit
+
+- Wood through Bedrock reward chests
+- Croesus chest rewards
+- Bazaar and auction pricing through bundled SkyBlockAPI 4.2.8
+- Instant Buy or Instant Sell Bazaar valuation
+- Lowest BIN, Median, or Mean auction valuation
+- Optional essence, Dungeon Chest Key, and Kismet Feather accounting
+- Incomplete-price detection instead of silently treating unavailable prices as real zeroes
+- Duplicate claim and reroll suppression
+- Session, total, and custom rolling-window statistics
+
+The calculation used for new records is:
+
+```text
+gross reward value
+- chest coin cost
+- optional Dungeon Chest Key value
+- optional Kismet Feather value
+= net profit
+```
+
+DPH calculates new chest profit directly. Devonian pricing can be used as a
+temporary compatibility fallback while SkyBlockAPI's asynchronous caches load.
+
+### M7 drop tracking
+
+- Scoped M7 item-drop counts
+- Session, total, and rolling-window views
+- Resettable tracked-drop history
+- Shared scope with run and profit statistics
 
 ## Requirements
 
 - Minecraft 26.1.2
+- Java 25
 - Fabric Loader 0.19.3 or newer
 - Fabric API
 - Fabric Language Kotlin
 - Devonian 1.25.9 or compatible
-- SkyBlockAPI 4.2.8 is bundled with the mod
-- SkyBlock Profile Viewer 1.8.4 or newer, or SkyBlocker
-- Java 25
+- SkyBlock Profile Viewer 1.8.4+ or SkyBlocker for player-profile data
+
+SkyBlockAPI and its compatible 26.1 support libraries are bundled inside the
+DungeonProgressHud JAR. Do not install a second SkyBlockAPI copy alongside it.
+
+## Installation
+
+1. Install Fabric Loader for Minecraft 26.1.2.
+2. Add Fabric API, Fabric Language Kotlin, and Devonian to the instance's `mods` folder.
+3. Add SkyBlock Profile Viewer or SkyBlocker if you want live Catacombs profile data.
+4. Download `DungeonProgressHud-1.0.9.jar` from the [1.0.9 release](https://github.com/MisterKrister/DungeonProgressHud/releases/tag/v1.0.9).
+5. Place the JAR in the same `mods` folder and launch the game.
+
+Open Devonian with `/devonian` to configure the HUD, pricing modes, visible
+lines, target level, and cost-accounting options.
 
 ## Commands
 
-GUI settings are managed through Devonian with `/devonian`.
+| Command | Description |
+| --- | --- |
+| `/dph` | Show profile and pricing status. |
+| `/dph refresh` | Refresh player data without recording a run. |
+| `/dph reset` | Clear observed XP samples and reset the profile XP baseline. |
+| `/dph prices` | Show pricing modes, cache health, fallback state, and missing IDs from the last chest. |
+| `/dph session` | Use the current dungeon session for HUD statistics. |
+| `/dph daily` | Use the last 24 hours for HUD statistics. |
+| `/dph weekly` | Use the last seven days for HUD statistics. |
+| `/dph total` | Use all retained history for HUD statistics. |
+| `/dph <scope>` | Set a custom rolling window such as `2`, `7`, `1w`, `2w`, or `1m`. |
+| `/dph summary [session\|daily\|weekly]` | Print a run, XP, time, and profit summary. |
+| `/dph importlogs` | Import recent dungeon completion messages from client logs. |
+| `/dph fake` | Record the selected or open reward chest without clicking its claim button. |
+| `/dph profit` | Show the current profit tracker state. |
+| `/dph profit toggle` | Toggle the shared tracker between session and total scope. |
+| `/dph profit session\|total\|<window>` | Change the shared tracker scope. |
+| `/dph items` | Show the current item tracker state. |
+| `/dph items toggle` | Toggle the shared tracker between session and total scope. |
+| `/dph items session\|total\|<window>` | Change the shared tracker scope. |
+| `/dph items reset` | Clear tracked M7 item drops. |
+| `/dph order reset` | Restore the default HUD line order. |
+
+The default fake-open key is `H`. It can be changed in Minecraft's keybind settings.
+
+## Pricing behavior
+
+The default modes match SkyMyce-style chest valuation:
+
+- Bazaar: **Instant Buy**
+- Auction: **Lowest BIN**
+- Missing prices: **Mark Chest Incomplete**
+- Devonian loading fallback: **Enabled**
+- Essence value: **Included**
+- Dungeon Chest Key cost: **Excluded**
+- Kismet Feather cost: **Included**
+
+SkyBlockAPI refreshes its Bazaar and auction caches asynchronously. `/dph prices`
+reports `Loading`, `Partial`, or `Ready`; DPH will not silently record a
+zero-valued chest when the required pricing data is unavailable.
+
+## Player data
+
+While the HUD is visible, profile data refreshes approximately every five
+minutes. Manual `/dph refresh` calls update the display and XP baseline without
+creating a run or changing Last Run XP.
+
+## Saved data
+
+Persistent data is stored at:
 
 ```text
-/dph
-/dph refresh
-/dph reset
-/dph prices
-/dph session
-/dph daily
-/dph weekly
-/dph total
-/dph <scope>
-/dph summary
-/dph summary session
-/dph summary daily
-/dph summary weekly
-/dph importlogs
-/dph profit
-/dph fake
-/dph profit toggle
-/dph profit session
-/dph profit total
-/dph profit <window>
-/dph items
-/dph items toggle
-/dph items session
-/dph items total
-/dph items <window>
-/dph items reset
+<Fabric config directory>/DungeonProgressHud/runs.json
 ```
 
-- `/dph` shows the current mod status.
-- `/dph refresh` refreshes player data and updates the XP baseline without adding an observed run sample.
-- `/dph reset` clears observed XP samples and resets the profile XP baseline.
-- `/dph prices` reports Bazaar and auction cache health, active valuation modes, loading fallback state, and IDs missing from the last chest.
-- `/dph session`, `/dph daily`, `/dph weekly`, `/dph total`, and `/dph <scope>` change the shared run/profit/item tracker view. The Run Count, observed XP/run, and last-run lines use the same scope. Scopes accept values like `1`, `2`, `7`, `1w`, `2w`, or `1m`.
-- `/dph summary`, `/dph summary session`, `/dph summary daily`, and `/dph summary weekly` print run and profit summaries.
-- `/dph importlogs` imports recent dungeon completion messages from client logs.
-- `/dph fake` records the currently selected/open reward chest without clicking it.
-- `/dph profit ...` and `/dph items ...` remain aliases for changing or showing the same tracker scope.
-- Undated legacy/backfill item drops are only counted in total.
+Records include runs, observed XP, chest profit, scoped Kismet uses, and tracked
+M7 drops. New chest records also store gross value, individual costs, quote
+sources, priced items, and missing item IDs.
 
-## Player Data
+Old records retain their saved `profit` value during migration. They are never
+repriced using today's market data.
 
-DungeonProgressHud uses SkyBlock Profile Viewer's authenticated, cached profile
-API and falls back to SkyBlocker when Profile Viewer cannot supply data. A
-personal Hypixel API key is not required. Install either provider and ensure it
-can authenticate with its service.
+## Building from source
 
-Chest pricing also requires no personal API key. SkyBlockAPI loads public
-Hypixel Bazaar data and its auction price cache asynchronously. Devonian pricing
-is used only as an optional compatibility fallback while those caches load.
+The project targets Kotlin 2.3.20 and Java 25. A Java 25 JDK and Gradle are
+required.
 
-Hypixel's direct SkyBlock profiles endpoint does not return profile data without
-authenticated API access, so the mod deliberately uses one of those providers
-instead of asking for a separate key.
-
-While the HUD is visible, it refreshes profile data about every five minutes.
-Using `/dph refresh` only updates the displayed profile data and XP baseline;
-it does not count as a dungeon run or change Last Run XP.
-
-Observed XP/run uses raw XP stored in `runs.json` plus any scoped profile-refresh
-observations that do not duplicate a completion-chat record. Run Count, XP/run,
-and Last Run follow the selected session, total, or rolling-window scope.
-
-## Saved Data
-
-DungeonProgressHud stores its run/profit data in the normal Fabric config
-folder, under `DungeonProgressHud/runs.json`. This uses Fabric's instance paths,
-so it works on Windows and Linux without hardcoded launcher folders.
-
-New chest records retain gross reward value, opening/key/Kismet costs, pricing
-sources, and missing item IDs. Historical records keep their stored net profit
-and are not repriced during migration.
-
-## Building
-
-```sh
+```powershell
 gradle build
 ```
 
-The built jar is written to `build/libs/`.
+The production artifact is written to:
+
+```text
+build/libs/DungeonProgressHud-1.0.9.jar
+```
+
+Run only the unit tests with:
+
+```powershell
+gradle test
+```
 
 ## License
 
-MIT
+DungeonProgressHud is available under the [MIT License](LICENSE).
