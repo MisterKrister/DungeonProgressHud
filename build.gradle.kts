@@ -4,7 +4,7 @@ plugins {
     kotlin("plugin.serialization") version "2.3.20"
 }
 
-version = "1.0.8"
+version = "1.0.9"
 group = "dev.krister"
 
 base {
@@ -25,12 +25,33 @@ kotlin {
     jvmToolchain(25)
 }
 
+repositories {
+    maven("https://maven.teamresourceful.com/repository/maven-public/")
+    maven("https://api.modrinth.com/maven")
+}
+
 dependencies {
     minecraft("com.mojang:minecraft:26.1.2")
     implementation("net.fabricmc:fabric-loader:0.19.3")
     implementation("net.fabricmc.fabric-api:fabric-api:0.150.0+26.1.2")
     implementation("net.fabricmc:fabric-language-kotlin:1.13.10+kotlin.2.3.20")
     implementation(files("libs/devonian-1.25.9.jar"))
+    implementation("tech.thatgravyboat:skyblock-api:4.2.8") {
+        exclude(group = "me.djtheredstoner", module = "DevAuth-fabric")
+        capabilities {
+            requireCapability("tech.thatgravyboat:skyblock-api-26.1")
+        }
+    }
+    include("tech.thatgravyboat:skyblock-api:4.2.8") {
+        capabilities {
+            requireCapability("tech.thatgravyboat:skyblock-api-26.1")
+        }
+    }
+    testImplementation(kotlin("test"))
+}
+
+tasks.test {
+    useJUnitPlatform()
 }
 
 tasks.withType<JavaCompile>().configureEach {
