@@ -4,9 +4,9 @@ DungeonProgressHud is a client-side Fabric mod for Hypixel SkyBlock. It combines
 Catacombs progression, run statistics, dungeon chest profit, and M7 drop tracking
 in one configurable HUD.
 
-**Current release:** 1.0.9 for Minecraft 26.1.2
+**Current release:** 1.0.12 for Minecraft 26.1.2
 
-[Download 1.0.9](https://github.com/MisterKrister/DungeonProgressHud/releases/tag/v1.0.9)
+[Download 1.0.12](https://github.com/MisterKrister/DungeonProgressHud/releases/tag/v1.0.12)
 
 ## What it tracks
 
@@ -20,14 +20,15 @@ in one configurable HUD.
 - Automatically detected normal and Master Mode floor
 - Dungeon-aware session time with a five-minute grace period between runs
 
-Run completions are read from chat and recent logs. Profile refreshes can fill in
-missed completion records without counting the same XP twice.
+Run completions are read from chat and dated archive logs. Profile refreshes store
+XP intervals; unattributed XP contributes to session XP/hour without becoming an
+invented run or affecting observed XP/run.
 
 ### Dungeon chest profit
 
 - Wood through Bedrock reward chests
 - Croesus chest rewards
-- Bazaar and auction pricing through bundled SkyBlockAPI 4.2.8
+- Bazaar and auction pricing through bundled SkyBlockAPI 4.2.19
 - Instant Buy or Instant Sell Bazaar valuation
 - Lowest BIN, Median, or Mean auction valuation
 - Optional essence, Dungeon Chest Key, and Kismet Feather accounting
@@ -62,7 +63,7 @@ temporary compatibility fallback while SkyBlockAPI's asynchronous caches load.
 - Fabric Loader 0.19.3 or newer
 - Fabric API
 - Fabric Language Kotlin
-- Devonian 1.25.9 or compatible
+- Devonian 1.31.9
 - SkyBlock Profile Viewer 1.8.4+ or SkyBlocker for player-profile data
 
 SkyBlockAPI and its compatible 26.1 support libraries are bundled inside the
@@ -73,7 +74,7 @@ DungeonProgressHud JAR. Do not install a second SkyBlockAPI copy alongside it.
 1. Install Fabric Loader for Minecraft 26.1.2.
 2. Add Fabric API, Fabric Language Kotlin, and Devonian to the instance's `mods` folder.
 3. Add SkyBlock Profile Viewer or SkyBlocker if you want live Catacombs profile data.
-4. Download `DungeonProgressHud-1.0.9.jar` from the [1.0.9 release](https://github.com/MisterKrister/DungeonProgressHud/releases/tag/v1.0.9).
+4. Download `DungeonProgressHud-1.0.12.jar` from the [1.0.12 release](https://github.com/MisterKrister/DungeonProgressHud/releases/tag/v1.0.12).
 5. Place the JAR in the same `mods` folder and launch the game.
 
 Open Devonian with `/devonian` to configure the HUD, pricing modes, visible
@@ -119,7 +120,7 @@ The default modes match SkyMyce-style chest valuation:
 - Kismet Feather cost: **Included**
 
 SkyBlockAPI refreshes its Bazaar and auction caches asynchronously. `/dph prices`
-reports `Loading`, `Partial`, or `Ready`; DPH will not silently record a
+reports `Loading`, `Partial`, or `Loaded (freshness unknown)`; DPH will not silently record a
 zero-valued chest when the required pricing data is unavailable.
 
 ## Player data
@@ -145,24 +146,92 @@ repriced using today's market data.
 
 ## Building from source
 
-The project targets Kotlin 2.3.20 and Java 25. A Java 25 JDK and Gradle are
-required.
+The project targets Kotlin 2.3.20 and Java 25. Set `JAVA_HOME` to a Java 25 JDK.
+The committed wrapper supplies Gradle 9.5.1; Loom is pinned to 1.16.3.
 
 ```powershell
-gradle build
+./gradlew build
 ```
 
 The production artifact is written to:
 
 ```text
-build/libs/DungeonProgressHud-1.0.9.jar
+build/libs/DungeonProgressHud-1.0.12.jar
 ```
 
 Run only the unit tests with:
 
 ```powershell
-gradle test
+./gradlew test
 ```
+
+## Changes in 1.0.12
+
+- Updated the development dependency and required Devonian version to 1.31.9 for
+  Minecraft 26.1.2.
+
+- Purchase clicks create pending attempts. A matching server reward heading or
+  purchased marker confirms the claim. Rerolls require the server's used-Kismet
+  marker. Failed or unconfirmed attempts do not change totals. H-key fake opens
+  remain explicit and persist `source = "fake-open"`.
+- Claim identity is independent of prices. Confirmed Kismet uses retain their
+  claim association, price availability, and consumption state in the saved ledger.
+  A missing Kismet quote blocks recording unless Count Missing As Zero is selected.
+- All reward valuation uses DPH's pricing service. Whole-chest Devonian aggregate
+  estimates no longer override incomplete itemized calculations.
+- New records carry account UUID and profile ID. Chest, item and Kismet totals
+  include the current profile plus older local records with unknown ownership,
+  filtered by the selected time scope. Old ownership fields remain unchanged.
+  `/dph legacy` shows historical lifetime counters, including records discarded
+  by older versions that cannot be assigned to a time window.
+- HUD scope labels show only the time scope and stay inside the panel. Chest
+  parsing recognizes essence quantities in reward names as well as lore and
+  scans the complete reward slot range used by Devonian 1.31.9.
+- Chest, drop, and Kismet histories are no longer truncated. Records discarded by
+  earlier versions cannot be reconstructed automatically. Legacy pricing remains
+  explicitly unknown and is never recomputed from today's prices.
+- `/dph reset` resets the observed averaging boundary while preserving run history.
+  XP/run uses completed runs on the displayed floor; the `/h session` suffix uses
+  current-profile session XP, including reconciled unattributed intervals. Summary
+  messages label their rate denominator.
+- Log import reads dates from `YYYY-MM-DD-N.log[.gz]` archive names and handles
+  midnight rollover. Undated files, including `latest.log`, are skipped rather
+  than assigned a guessed date. Imported ownership remains unknown. Failed files
+  are retried independently.
+- History writes run in one background queue. `runs.json.bak` retains the previous
+  readable version. Unreadable history disables automatic replacement. `/dph`
+  reports persistence health; `/dph recoverbackup` validates the backup and
+  preserves the damaged original as `runs.json.unreadable-<id>` before recovery.
+- Configuration uses Devonian's existing **Mod** subcategory; DPH no longer alters
+  private category structures. Disabling DPH stops automatic chest/run recording.
+
+Chest context is bounded to the current connection and selected run. When the
+server supplies no durable Croesus run ID, that identity cannot be reconstructed
+across a restart; pending costs remain saved but are never attached to a guessed
+new chest. Inventory/chat confirmation paths still require in-game validation
+against live server behavior; unit tests exercise the markers used by the bundled
+Devonian reference implementation.
+
+## Development dependencies and preview
+
+`libs/devonian-1.31.9.jar` is the repository-supplied development dependency; obtain
+it by cloning this repository. Its SHA-256 is:
+
+```text
+17ebb41ee38738c0e69aa03db16f40d774265880ca8a51f701b7c132f4ca31cd
+```
+
+This 1.31.9 JAR is built from the official 26.1 branch; see
+[dependency provenance](libs/devonian-1.31.9.md) for the exact commit and build steps.
+The build verifies that checksum before compiling. GitHub Actions builds and
+runs the tests with Java 25. The local inspection checkout is no longer tracked
+as a submodule.
+
+`run-hud-preview.bat` uses the configured JDK and resolves paths from its own
+location. The desktop preview and Minecraft HUD share `HudGeometry`; both modes
+measure a shared width. Preview data and fonts are illustrative. Missing source
+files now produce an explicit error. The profit-range counting script is a
+heuristic over retained samples, not evidence that an item dropped.
 
 ## License
 

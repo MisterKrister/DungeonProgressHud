@@ -5,6 +5,7 @@ import tech.thatgravyboat.skyblockapi.api.remote.hypixel.pricing.BazaarAPI
 import tech.thatgravyboat.skyblockapi.api.remote.hypixel.pricing.LowestBinAPI
 
 interface PriceService {
+    fun beginCalculation() {}
     fun quote(itemId: String): PriceQuote
     fun health(): PricingHealth
 }
@@ -58,7 +59,7 @@ data class PricingHealth(
         get() = when {
             bazaarItemCount == 0 && auctionItemCount == 0 -> "Loading"
             bazaarItemCount == 0 || auctionItemCount == 0 -> "Partial"
-            else -> "Ready"
+            else -> "Loaded (freshness unknown)"
         }
 }
 
@@ -85,6 +86,8 @@ class SkyBlockPriceService(
     private var lastQuote: PriceQuote? = null
     private var fallbackActive = false
 
+    override fun beginCalculation() { fallbackActive = false }
+
     override fun quote(itemId: String): PriceQuote {
         val id = normalizeSkyBlockId(itemId)
         val settings = options()
@@ -110,7 +113,7 @@ class SkyBlockPriceService(
             ?: hardcodedPrices[id]?.positiveOrNull()?.let { PriceQuote(id, it, PriceSource.HARDCODED) }
             ?: PriceQuote(id, null, PriceSource.UNAVAILABLE, available = false)
 
-        fallbackActive = quote.source == PriceSource.DEVONIAN_FALLBACK
+        fallbackActive = fallbackActive || quote.source == PriceSource.DEVONIAN_FALLBACK
         if (quote.available) lastQuote = quote
         return quote
     }
@@ -149,9 +152,8 @@ internal fun normalizeSkyBlockId(itemId: String): String {
 }
 
 internal fun resolveEnchantedBookId(enchantName: String, tier: Int, prices: PriceService): String {
-    val normalizedName = enchantName.trim().replace(" ", "_").uppercase()
-    val standard = "ENCHANTMENT_${normalizedName}_$tier"
-    return if (prices.quote(standard).available) standard else "ENCHANTMENT_ULTIMATE_${normalizedName}_$tier"
+    val normalizedName = enchantName.trim().replace(" ", "_").uppercase(java.util.Locale.ROOT)
+    return "ENCHANTMENT_${normalizedName}_$tier"
 }
 
 private fun Double.positiveOrNull(): Double? = takeIf { it.isFinite() && it > 0.0 }

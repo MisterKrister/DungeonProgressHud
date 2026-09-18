@@ -25,8 +25,8 @@
     "java": ">=25",
     "fabric-api": "*",
     "fabric-language-kotlin": "*",
-    "devonian": ">=1.25.9",
-    "skyblock-api": ">=4.2.8"
+    "devonian": "1.31.9",
+    "skyblock-api": ">=4.2.19 <5.0.0"
   },
   "suggests": {
     "skyblockpv": ">=1.8.4",

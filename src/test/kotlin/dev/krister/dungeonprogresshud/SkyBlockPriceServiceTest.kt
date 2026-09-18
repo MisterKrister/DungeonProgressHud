@@ -57,6 +57,20 @@ class SkyBlockPriceServiceTest {
         assertEquals("ENCHANTMENT_ULTIMATE_WISE_5", resolveEnchantedBookId("Ultimate Wise", 5, service))
     }
 
+    @Test
+    fun `book identity does not depend on prices being available`() {
+        val service = SkyBlockPriceService(FakeProvider(), devonianPrice = { 0.0 })
+        assertEquals("ENCHANTMENT_SHARPNESS_5", resolveEnchantedBookId("Sharpness", 5, service))
+        assertEquals("ENCHANTMENT_ULTIMATE_WISE_5", resolveEnchantedBookId("Ultimate Wise", 5, service))
+    }
+
+    @Test
+    fun `disabled loading fallback never supplies a quote`() {
+        val service = SkyBlockPriceService(FakeProvider(bazaarCount = 0, auctionCount = 0),
+            { PricingOptions(allowDevonianWhileLoading = false) }, devonianPrice = { error("Fallback must not be called") })
+        assertFalse(service.quote("ITEM").available)
+    }
+
     private class FakeProvider(
         private val bazaar: Map<String, BazaarPrice> = emptyMap(),
         private val auction: Map<String, AuctionPrice> = emptyMap(),

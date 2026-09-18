@@ -1,3 +1,4 @@
+import dev.krister.dungeonprogresshud.HudGeometry;
 import java.awt.BasicStroke;
 import java.awt.Color;
 import java.awt.Dimension;
@@ -306,27 +307,26 @@ public final class HudPreview {
             int separatorX = l.sidePadding + labelWidth + 8;
             int valueX = separatorX + 8;
             int valueWidth = valueWidth(g, topRows, bottomRows);
-            return Math.max(
-                valueX + valueWidth + l.sidePadding,
-                g.getFontMetrics().stringWidth(title) + l.sidePadding * 2 + BUTTON_WIDTH + BUTTON_MARGIN * 2
-            );
+            int titleWidth = Math.max(g.getFontMetrics().stringWidth("Dungeon Profit Hud"),
+                g.getFontMetrics().stringWidth("Dungeon Item Tracker"));
+            return HudGeometry.measure(labelWidth, valueWidth, titleWidth, topRows.size(), bottomRows.size(), true).width();
         }
 
         private int panelHeight(Layout l, List<Row> topRows, List<Row> bottomRows) {
-            return dividerY(l, topRows) + 1 + l.profitGap + bottomRows.size() * l.rowHeight + l.topPadding;
+            return HudGeometry.measure(0, 0, 0, topRows.size(), bottomRows.size(), true).height();
         }
 
         private int labelWidth(Graphics2D g, List<Row> topRows, List<Row> bottomRows) {
-            int max = 88;
-            for (Row row : topRows) max = Math.max(max, g.getFontMetrics().stringWidth(row.label()));
-            for (Row row : bottomRows) max = Math.max(max, g.getFontMetrics().stringWidth(row.label()));
+            int max = 0;
+            for (List<Row> rows : List.of(PROFIT_TOP_ROWS, PROFIT_BOTTOM_ROWS, ITEM_TOP_ROWS, ITEM_ROWS))
+                for (Row row : rows) max = Math.max(max, g.getFontMetrics().stringWidth(row.label()));
             return max;
         }
 
         private int valueWidth(Graphics2D g, List<Row> topRows, List<Row> bottomRows) {
-            int max = 72;
-            for (Row row : topRows) max = Math.max(max, rowValueWidth(g, row));
-            for (Row row : bottomRows) max = Math.max(max, rowValueWidth(g, row));
+            int max = 0;
+            for (List<Row> rows : List.of(PROFIT_TOP_ROWS, PROFIT_BOTTOM_ROWS, ITEM_TOP_ROWS, ITEM_ROWS))
+                for (Row row : rows) max = Math.max(max, rowValueWidth(g, row));
             return max;
         }
 
@@ -335,7 +335,7 @@ public final class HudPreview {
         }
 
         private int dividerY(Layout l, List<Row> topRows) {
-            return l.topPadding + l.titleHeight + topRows.size() * l.rowHeight + l.profitGap / 2;
+            return HudGeometry.measure(0, 0, 0, topRows.size(), 0, true).dividerY();
         }
 
         private void drawDashedVertical(Graphics2D g, int x, int top, int bottom, int color) {
@@ -425,8 +425,14 @@ public final class HudPreview {
             layout.panel = colorValue(source, "HUD_PANEL", layout.panel);
             layout.profitPanel = colorValue(source, "HUD_PROFIT_PANEL", layout.profitPanel);
             layout.sketchWhite = colorValue(source, "HUD_SKETCH_WHITE", layout.sketchWhite);
-        } catch (IOException ignored) {
+        } catch (IOException failure) {
+            throw new IllegalStateException("HUD source could not be loaded: " + HUD_SOURCE.toAbsolutePath(), failure);
         }
+        layout.rowHeight = HudGeometry.ROW_HEIGHT;
+        layout.titleHeight = HudGeometry.TITLE_HEIGHT;
+        layout.topPadding = HudGeometry.TOP_PADDING;
+        layout.sidePadding = HudGeometry.SIDE_PADDING;
+        layout.profitGap = HudGeometry.PROFIT_GAP;
         return layout;
     }
 

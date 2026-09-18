@@ -17,12 +17,12 @@ data class ChestCalculationInput(
 )
 
 data class PricedChestItem(
-    var itemId: String = "",
-    var quantity: Int = 0,
-    var unitPrice: Double = 0.0,
-    var totalValue: Long = 0,
-    var source: PriceSource = PriceSource.UNAVAILABLE,
-    var available: Boolean = false,
+    val itemId: String = "",
+    val quantity: Int = 0,
+    val unitPrice: Double = 0.0,
+    val totalValue: Long = 0,
+    val source: PriceSource = PriceSource.UNAVAILABLE,
+    val available: Boolean = false,
 )
 
 data class ChestProfitCalculation(

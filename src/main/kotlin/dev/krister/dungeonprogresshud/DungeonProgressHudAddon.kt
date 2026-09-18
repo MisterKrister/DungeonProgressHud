@@ -98,20 +98,10 @@ object DungeonProgressHudAddon : ClientModInitializer {
                 feature?.onServerDisconnect()
             }
         }
+        net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents.CLIENT_STOPPING.register {
+            feature?.flushHistory()
+        }
         ClientTickEvents.END_CLIENT_TICK.register { client ->
-            val serverKey = detectedServerKey(client)
-            if (serverKey != lastTickDetectedServerKey) {
-                lastTickDetectedServerKey = serverKey
-                if (serverKey.isNotBlank()) {
-                    val current = feature
-                    if (current != null) {
-                        current.onServerJoin()
-                    } else {
-                        pendingServerJoinAt = System.currentTimeMillis()
-                        debug("Tick detected server join queued until feature registration server=$serverKey")
-                    }
-                }
-            }
             feature?.onFabricClientTick()
         }
     }
@@ -126,7 +116,7 @@ object DungeonProgressHudAddon : ClientModInitializer {
         debug("Registering DungeonProgressHud feature with Devonian")
         registerCommands()
         val category = Categories.GLOBAL
-        val subcategory = ensureDevonianSubcategory(category, "DPH") ?: "Mod"
+        val subcategory = "Mod"
         val created = DungeonProgressHudFeature(category, subcategory)
         feature = created
         Devonian.addFeatureInstance(created)
@@ -161,8 +151,12 @@ object DungeonProgressHudAddon : ClientModInitializer {
         }
     }
 
-    fun onInventoryClick(slotId: Int, button: Int, clickType: ContainerInput) {
-        feature?.onInventoryClick(slotId, button, clickType)
+    fun onServerInventoryUpdate(containerId: Int) {
+        feature?.onServerInventoryUpdate(containerId)
+    }
+
+    fun onInventoryClick(containerId: Int, slotId: Int, button: Int, clickType: ContainerInput) {
+        feature?.onInventoryClick(containerId, slotId, button, clickType)
     }
 
     fun onHudOrderMouseClicked(screen: AbstractContainerScreen<*>, event: MouseButtonEvent, shiftDown: Boolean): Boolean =
@@ -198,6 +192,14 @@ object DungeonProgressHudAddon : ClientModInitializer {
                         withFeature { it.sendStatus() }
                         1
                     }
+                    .then(literal("legacy").executes {
+                        feature?.sendLegacyStatus()
+                        1
+                    })
+                    .then(literal("recoverbackup").executes {
+                        feature?.recoverBackup()
+                        1
+                    })
                     .then(literal("refresh").executes {
                         withFeature { it.refresh(force = true, recordObservedSample = false, notify = true) }
                         1
@@ -319,36 +321,10 @@ object DungeonProgressHudAddon : ClientModInitializer {
         action(current)
     }
 
-    @Suppress("UNCHECKED_CAST")
-    private fun ensureDevonianSubcategory(category: Categories, subcategory: String): String? {
-        return runCatching {
-            val categoryField = category.javaClass.getDeclaredField("subcategories")
-            categoryField.isAccessible = true
-            val existingSubcategories = categoryField.get(category) as List<String>
-            if (subcategory !in existingSubcategories) {
-                categoryField.set(category, existingSubcategories + subcategory)
-            }
-
-            val configClass = Class.forName("com.github.synnerz.devonian.config.Config")
-            val categoriesField = configClass.getDeclaredField("categories")
-            categoriesField.isAccessible = true
-            val categories = categoriesField.get(null) as MutableMap<Categories, MutableMap<String, MutableList<ConfigData<*>>>>
-            categories.getValue(category).getOrPut(subcategory) { mutableListOf() }
-            subcategory
-        }.getOrElse {
-            debug("Failed to register Devonian subcategory $subcategory, falling back to Mod: ${it::class.simpleName}: ${it.message}")
-            null
-        }
-    }
-
     fun debug(message: String) {
-        val line = "[${LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))}] $message"
-        logger.info(line)
-        runCatching {
-            debugLogFile.parentFile.mkdirs()
-            debugLogFile.appendText(line + System.lineSeparator(), Charsets.UTF_8)
-        }
+        logger.debug(message)
     }
+
 }
 
 class DungeonProgressHudFeature(
@@ -376,11 +352,11 @@ class DungeonProgressHudFeature(
         private const val CROESUS_TAB_REFRESH_INTERVAL_MILLIS = 1_000L
         private const val MAX_TRACKED_ITEM_DROPS = 5_000
         private const val HUD_LINE_GAP = 2
-        private const val HUD_ROW_HEIGHT = 15
-        private const val HUD_TITLE_HEIGHT = 28
-        private const val HUD_TOP_PADDING = 10
-        private const val HUD_SIDE_PADDING = 13
-        private const val HUD_PROFIT_GAP = 10
+        private const val HUD_ROW_HEIGHT = HudGeometry.ROW_HEIGHT
+        private const val HUD_TITLE_HEIGHT = HudGeometry.TITLE_HEIGHT
+        private const val HUD_TOP_PADDING = HudGeometry.TOP_PADDING
+        private const val HUD_SIDE_PADDING = HudGeometry.SIDE_PADDING
+        private const val HUD_PROFIT_GAP = HudGeometry.PROFIT_GAP
         private const val HUD_ORDER_HINT = "&eHold Shift to drag HUD lines"
         private const val STATUS_LINE_ID = "status"
         private const val JOIN_SKYBLOCK_DETECTION_TIMEOUT_MILLIS = 300_000L
@@ -502,9 +478,12 @@ class DungeonProgressHudFeature(
         KeyMapping("key.dungeonprogresshud.fakeOpenChest", GLFW.GLFW_KEY_H, keybindCategory)
     )
 
+    private var stateRevision = 0L
     private var state = RunState()
+    private val profileProvider by lazy { ProfileProvider(::log) }
     private var data: ProfileData? = null
     private var status = "Waiting for profile data"
+    private var refreshGeneration = 0L
     private var refreshing = false
     private var lastRefresh = 0L
     private var lastAutoRefreshAttempt = 0L
@@ -531,7 +510,11 @@ class DungeonProgressHudFeature(
     private var lastCroesusTabRefreshAt = 0L
     private val chestClaimDeduplicator = EventDeduplicator()
     private val kismetDeduplicator = EventDeduplicator()
-    private val pendingKismetCosts = mutableMapOf<String, Long>()
+    private val claimAttempts = ChestAttemptTracker<ChestProfitCandidate>()
+    private val rerollAttempts = ChestAttemptTracker<Pair<String, PriceQuote>>()
+    private var chestContextId = UUID.randomUUID().toString()
+    private var chestContextFloor = "N/A"
+
     private var lastDungeonCompletionChat = ""
     private var lastDungeonCompletionChatAt = 0L
     private var lastDungeonCompletionRawXp = 0L
@@ -543,7 +526,8 @@ class DungeonProgressHudFeature(
     private var pendingCompletionGrade = ""
     private var sessionChestProfit = 0L
     private var sessionChestsOpened = 0
-    private val sessionTracker = DungeonSessionTracker()
+    private var sessionTracker = DungeonSessionTracker()
+    private var trackingOwner = ""
     private val sessionStartedAt: Long
         get() = sessionTracker.startedAt
     private var detectedFloorLabel = ""
@@ -615,6 +599,18 @@ class DungeonProgressHudFeature(
     }
 
     fun onServerDisconnect() {
+        clearPendingChestTracking()
+        detectedFloorLabel = ""
+        pendingCompletionAt = 0L
+        pendingCompletionFloor = ""
+        pendingCompletionTimeSeconds = 0
+        pendingCompletionScore = 0
+        pendingCompletionGrade = ""
+        lastDungeonCompletionChat = ""
+        data = null
+        refreshGeneration++
+        refreshing = false
+        lastRefresh = 0L
         pauseSessionTimer("disconnect")
         joinRefreshStartedAt = 0L
         joinRefreshAttempts = 0
@@ -671,23 +667,39 @@ class DungeonProgressHudFeature(
         lastChestScanCandidate = null
         lastCroesusCandidates = emptyMap()
         selectedCroesusCandidate = null
+        claimAttempts.clear()
+        rerollAttempts.clear()
+        chestContextId = UUID.randomUUID().toString()
+        chestContextFloor = "N/A"
     }
 
     override fun initialize() {
         startRuntime("devonian initialize")
 
-        on<GuiKeyDownEvent> { event ->
-            if (!fakeOpenKey.matches(event.event)) return@on
-            fakeOpenChest(event.screen as? AbstractContainerScreen<*>)
-        }
 
-        on<ChatEvent> { event ->
-            parseDungeonCompletionMessage(event.message)
-        }
     }
 
     fun onFabricClientTick() {
         startRuntime("fabric client tick")
+        val account = currentAccountId()
+        val profile = currentProfileId()
+        val owner = "$account:$profile"
+        if (account.isNotBlank() && profile.isNotBlank() && owner != trackingOwner) {
+            trackingOwner = owner
+            clearPendingChestTracking()
+            refreshGeneration++
+            refreshing = false
+            data = null
+            lastRefresh = 0L
+            state.croesusUnclaimedCount = -1
+            pendingCompletionAt = 0L
+            pendingCompletionFloor = ""
+            pendingCompletionTimeSeconds = 0
+            pendingCompletionScore = 0
+            pendingCompletionGrade = ""
+            lastDungeonCompletionChat = ""
+            sessionTracker = DungeonSessionTracker()
+        }
         clientTick()
     }
 
@@ -767,6 +779,7 @@ class DungeonProgressHudFeature(
         if (refreshing) return true
         if (joinRefreshAttempts >= 1 && now < nextJoinRefreshAttemptAt) return true
         if (joinRefreshAttempts >= JOIN_REFRESH_RETRY_DELAYS.size + 1) {
+            joinRefreshCompleted = true
             log("Join refresh gave up after $joinRefreshAttempts attempts status=$status")
             return false
         }
@@ -799,16 +812,11 @@ class DungeonProgressHudFeature(
             return
         }
 
-        val hudLines = orderedHudLines(buildHudLines())
-        if (hudLines.isEmpty()) {
-            logRenderState("Render blocked: no lines")
-            return
-        }
 
-        drawDirect(graphics, hudLines)
+        drawDirect(graphics)
         if (!renderedOnce) {
             renderedOnce = true
-            log("HUD rendered lines=${hudLines.size} x=$x y=$y scale=$scale status=$status")
+            log("HUD rendered x=$x y=$y scale=$scale status=$status")
         }
     }
 
@@ -838,18 +846,23 @@ class DungeonProgressHudFeature(
             return
         }
         val request = ProfileRequest(
+            activeProfile = activeSkyBlockProfile(),
             playerName = player.name.string,
             playerUuid = player.uuid,
         )
 
+        val generation = refreshGeneration
+        val requestedProfile = activeSkyBlockProfile()?.first
         refreshing = true
         status = "Refreshing..."
         log("Refresh started force=$force recordObservedSample=$recordObservedSample user=${request.playerName} uuid=${request.playerUuid}")
         if (notify) send("Refreshing profile data...")
 
         thread(name = "DungeonProgressHud-Profile", isDaemon = true) {
-            val result = runCatching { fetchProfile(request) }
+            val result = runCatching { profileProvider.fetch(request) }
             mc.execute {
+                if (generation != refreshGeneration || mc.player?.uuid != request.playerUuid) return@execute
+                if (activeSkyBlockProfile()?.first != requestedProfile) { refreshing = false; return@execute }
                 try {
                     result
                         .onSuccess {
@@ -873,6 +886,7 @@ class DungeonProgressHudFeature(
     }
 
     fun resetSamples() {
+        state.averagingResetAt = System.currentTimeMillis()
         state.samples.clear()
         state.lastCatacombsXp = data?.catacombsExperience ?: 0L
         state.lastPlayerUuid = data?.playerUuid.orEmpty()
@@ -949,6 +963,7 @@ class DungeonProgressHudFeature(
     fun sendTrackerStatus() {
         val stats = chestProfitStats()
         send("Tracker view: ${stats.label}, ${stats.profit.formatCoins()} across ${stats.chests} chests.")
+        send("Includes current profile and older local chest history with unknown ownership. /dph legacy shows historical lifetime counters; discarded records cannot be assigned to a time window.")
     }
 
     fun resetTrackedItems() {
@@ -964,13 +979,19 @@ class DungeonProgressHudFeature(
             listOf(
                 "${summary.label}: ${summary.runs} runs, ${summary.xp.format()} XP, ${summary.profit.formatCoins()} profit.",
                 "Profit/run ${summary.profitPerRun.formatCoins()}, chest ${summary.profitPerChest.formatCoins()}, hour ${summary.profitPerHour.formatCoins()}.",
-                "Avg time ${formatDuration(summary.averageRunTimeSeconds)}, XP/hour ${summary.xpPerHour.format()}.",
+                "Avg time ${formatDuration(summary.averageRunTimeSeconds)}, XP/hour ${summary.xpPerHour.format()} (${if (scope.equals("session", true)) "active session time" else "recorded run time; window time if absent"}; current profile).",
             )
         )
     }
 
+    fun sendLegacyStatus() {
+        val legacy = state.chestProfits.filter { it.accountId.isBlank() || it.profileId.isBlank() }
+        send("Unknown ownership: ${legacy.size} retained chests, ${legacy.sumOf { it.profit }.formatCoins()}; ${state.runs.count { it.accountId.isBlank() || it.profileId.isBlank() }} runs.")
+        send("All historical counters: ${state.totalChestsOpened} chests; ${state.totalKismetsUsed} Kismets. Missing chest records: ${(state.totalChestsOpened - state.chestProfits.size).coerceAtLeast(0)}.")
+    }
+
     fun sendStatus() {
-        send("Status: $status. Prices: ${priceService.health().status}.")
+        send("Status: $status. Prices: ${priceService.health().status}. History: ${historyRepository.error?.message ?: if (historyWriter.dirty) "unsaved changes" else "saved"}.")
     }
 
     fun sendPricingStatus() {
@@ -982,10 +1003,15 @@ class DungeonProgressHudFeature(
         if (last != null) send("Last quote: ${last.itemId} via ${last.source} at ${LocalDateTime.ofInstant(java.time.Instant.ofEpochMilli(last.quotedAt), ZoneId.systemDefault()).format(DateTimeFormatter.ISO_LOCAL_TIME)}.")
     }
 
-    fun onInventoryClick(slotId: Int, button: Int, clickType: ContainerInput) {
-        if (!trackChestProfit.get()) return
+    fun onInventoryClick(containerId: Int, slotId: Int, button: Int, clickType: ContainerInput) {
+        if (!isEnabled() || !trackChestProfit.get()) return
         val screen = currentChestScreen() ?: return
+        if (screen.menu.containerId != containerId || button != 0 || clickType != ContainerInput.PICKUP) return
         val title = screen.title.string
+        if (title == "Croesus") {
+            clearPendingChestTracking()
+            return
+        }
         if (title.matches(runChestRegex)) {
             cacheClickedCroesusChest(screen, slotId)
             return
@@ -999,46 +1025,56 @@ class DungeonProgressHudFeature(
         val parsedCandidate = runCatching { parseChestProfit(screen) }
             .onFailure { log("Chest claim parse failed: ${it.stackTraceToString()}") }
             .getOrNull()
-        val directCandidates = listOfNotNull(
-            parsedCandidate,
-            pendingChestProfit?.takeIf { it.chestName == title },
-            selectedCroesusCandidate?.takeIf { it.chestName == title },
-            lastCroesusCandidates[title],
-        )
-        val candidate = directCandidates.firstOrNull { it.canRecordDirectly() }
-            ?: devonianChestProfitCandidates()[title]
-            ?: directCandidates.firstOrNull()
+        val candidate = parsedCandidate
         val enrichedCandidate = candidate?.withTrackedDropsFrom(parsedCandidate)
         if (enrichedCandidate == null) {
             log("Chest claim click ignored: no profit candidate for title=$title")
             return
         }
 
-        recordChestProfit(enrichedCandidate, "claim-click")
+        claimAttempts.begin(containerId, claimIdentity(enrichedCandidate), System.currentTimeMillis(), enrichedCandidate)
     }
 
-    private fun recordKismetUseIfClicked(screen: AbstractContainerScreen<*>, slotId: Int): Boolean {
-        val stack = screen.menu.slots.getOrNull(slotId)?.item ?: screen.menu.items.getOrNull(slotId) ?: return false
-        val name = stack.hoverName.string.cleanMc()
-        val lore = plainLore(stack)
-        val text = (listOf(name) + lore).joinToString(" ").lowercase(Locale.ROOT)
-        if (!text.contains("kismet")) return false
+    private fun claimIdentity(candidate: ChestProfitCandidate): String =
+        "${mc.player?.uuid}:${activeSkyBlockProfile()?.first}:$chestContextId:${candidate.chestName}"
 
-        val now = System.currentTimeMillis()
-        val key = "${screen.menu.containerId}:${screen.title.string}:$slotId"
-        if (!kismetDeduplicator.shouldAccept(key, now)) {
-            log("Duplicate kismet use ignored key=$key")
-            return true
-        }
-        val quote = priceService.quote("KISMET_FEATHER")
-        val cost = quote.unitPrice?.roundToLong()?.coerceAtLeast(0L) ?: 0L
-        pendingKismetCosts[screen.title.string] = pendingKismetCosts.getOrDefault(screen.title.string, 0L) + cost
-        state.totalKismetsUsed++
-        state.kismetUses.add(KismetUseSample(now, screen.title.string, cost, data?.profileName.orEmpty(), floorValue()))
-        while (state.kismetUses.size > 5000) state.kismetUses.removeAt(0)
-        saveState()
-        log("Recorded kismet use title=${screen.title.string} slot=$slotId cost=$cost source=${quote.source} total=${state.totalKismetsUsed}")
+    private fun recordKismetUseIfClicked(screen: AbstractContainerScreen<*>, slotId: Int): Boolean {
+        val stack = screen.menu.slots.getOrNull(slotId)?.item ?: return false
+        val lore = plainLore(stack)
+        if (slotId != 50 || ChestConfirmation.rerolled(lore) ||
+            !(stack.hoverName.string.cleanMc() + lore.joinToString()).contains("Kismet", true)) return false
+        val candidate = parseChestProfit(screen) ?: return true
+        rerollAttempts.begin(screen.menu.containerId, claimIdentity(candidate), System.currentTimeMillis(),
+            candidate.chestName to priceService.quote("KISMET_FEATHER"))
         return true
+    }
+
+    fun onServerInventoryUpdate(containerId: Int) {
+        if (!isEnabled() || !trackChestProfit.get()) return
+        val screen = currentChestScreen() ?: return
+        if (screen.menu.containerId != containerId) return
+        val now = System.currentTimeMillis()
+        val stacks = screen.menu.items.take(chestContainerSlotCount(screen.menu.items.size))
+        val reroll = rerollAttempts.confirm(containerId, now) { (name, _) ->
+            screen.title.string == name && screen.menu.items.getOrNull(50)?.let {
+                ChestConfirmation.rerolled(plainLore(it))
+            } == true
+        }
+        if (reroll != null) {
+            val (name, quote) = reroll.value
+            val cost = quote.unitPrice?.roundToLong()?.coerceAtLeast(0) ?: 0L
+            state.totalKismetsUsed++
+            state.kismetUses.add(KismetUseSample(now, name, cost, data?.profileName.orEmpty(), chestContextFloor, currentAccountId(), currentProfileId(), reroll.claimId, quote.available, quote.source))
+            saveState()
+        }
+        claimAttempts.confirm(containerId, now) { candidate ->
+            stacks.any { stack ->
+                val sameChest = screen.title.string == candidate.chestName ||
+                    stack.hoverName.string.cleanMc() == candidate.chestName
+                sameChest && plainLore(stack).any { it == "Already opened!" }
+            }
+        }?.let { recordChestProfit(it.value, "server-confirmed", it.claimId) }
+        lastChestScanKey = ""
     }
 
     fun onFakeOpenKey(screen: AbstractContainerScreen<*>): Boolean {
@@ -1060,7 +1096,7 @@ class DungeonProgressHudFeature(
     }
 
     private fun fakeOpenChest(screenOverride: AbstractContainerScreen<*>? = null): Boolean {
-        if (!trackChestProfit.get()) {
+        if (!isEnabled() || !trackChestProfit.get()) {
             send("Chest profit tracking is disabled.")
             return false
         }
@@ -1082,16 +1118,13 @@ class DungeonProgressHudFeature(
         }
         val candidate = runCatching {
             when {
-                chestNames.contains(title) -> listOfNotNull(
-                    parsedDirectCandidate,
-                    pendingChestProfit?.takeIf { it.chestName == title },
-                    selectedCroesusCandidate?.takeIf { it.chestName == title },
-                    lastCroesusCandidates[title],
-                ).firstOrNull { it.canRecordDirectly() }
-                    ?: devonianChestProfitCandidates()[title]
-                title.matches(runChestRegex) -> selectedCroesusCandidate
-                    ?: parseBestCroesusChest(screen)
-                    ?: devonianChestProfitCandidates().values.maxByOrNull { it.profit }
+                chestNames.contains(title) -> parsedDirectCandidate
+                title.matches(runChestRegex) -> {
+                    chestContextFloor = DungeonActivityDetector.detectFloor(null, null, title, emptyList()) ?: "N/A"
+                    val candidates = parseCroesusCandidatesFromScreen(screen)
+                    selectedCroesusCandidate?.chestName?.let { candidates[it] }
+                        ?: candidates.values.filter { it.canRecordDirectly() }.maxByOrNull { it.profit }
+                }
                 else -> null
             }
         }.onFailure {
@@ -1112,13 +1145,10 @@ class DungeonProgressHudFeature(
         val chestName = clickedStack.customName?.string ?: clickedStack.hoverName.string
         if (!chestNames.contains(chestName)) return
 
+        chestContextFloor = DungeonActivityDetector.detectFloor(null, null, screen.title.string, emptyList()) ?: "N/A"
         val parsedFromScreen = parseCroesusCandidatesFromScreen(screen)
         val parsedCandidates = parsedFromScreen.toMutableMap()
-        devonianChestProfitCandidates().forEach { (name, fallback) ->
-            if (parsedCandidates[name]?.canRecordDirectly() != true) {
-                parsedCandidates[name] = fallback.withTrackedDropsFrom(parsedFromScreen[name])
-            }
-        }
+
 
         if (parsedCandidates.isNotEmpty()) lastCroesusCandidates = parsedCandidates
         val candidate = parsedCandidates[chestName] ?: return
@@ -1129,15 +1159,6 @@ class DungeonProgressHudFeature(
     private data class HudLine(
         val id: String,
         val text: String,
-    )
-
-    private data class HudRow(
-        val id: String,
-        val label: String,
-        val value: String,
-        val icon: ItemStack,
-        val accentValue: Boolean,
-        val mutedSuffix: String = "",
     )
 
     private data class ProfitHudRow(
@@ -1151,11 +1172,6 @@ class DungeonProgressHudFeature(
         val key: String,
         val displayName: String,
         val aliases: Set<String>,
-    )
-
-    data class TrackedDrop(
-        val key: String,
-        val displayName: String,
     )
 
     private data class HudPanelLayout(
@@ -1178,37 +1194,8 @@ class DungeonProgressHudFeature(
     private fun buildLines(): List<String> = orderedHudLines(buildHudLines()).map { it.text }
 
     private fun buildHudLines(): List<HudLine> {
-        val profile = data ?: return listOf(HudLine(STATUS_LINE_ID, "&bDungeon Progress: &7$status"))
-        val xpPerRun = effectiveXpPerRun()
-        val remaining = xpRemaining(profile.catacombsExperience, targetLevelValue())
-        val runs = xpPerRun.takeIf { it > 0 }?.let { ceil(remaining.toDouble() / it.toDouble()).toLong() }
-        val observedXp = scopedObservedXp()
-        val last = observedXp.lastOrNull()
-        val source = if (xpModeValue() == "Hardcoded") "hardcoded" else if (observedXp.isEmpty()) "fallback" else scopedRunScopeLabel()
-        val currentLevel = currentCataLevel(profile.catacombsExperience)
-
-        return buildList {
-            if (showCurrentLevel.get()) add(HudLine("currentLevel", "&bCata Level: &fC$currentLevel"))
-            if (showLevelProgress.get()) add(HudLine("levelProgress", "&bNext Level: &f${levelProgressPercent(profile.catacombsExperience)}%"))
-            if (showTarget.get()) add(HudLine("target", "&bTarget: &fC${targetLevelValue()}"))
-            if (showRunsLeft.get()) add(HudLine("runsLeft", "&bRuns Left: &a${runs?.format() ?: "N/A"}"))
-            if (showCurrentXp.get()) add(HudLine("currentXp", "&bCata XP: &f${profile.catacombsExperience.format()}"))
-            if (showRemaining.get()) add(HudLine("remaining", "&bRemaining: &f${remaining.format()}"))
-            if (showFloor.get()) add(HudLine("floor", "&bFloor: &f${floorValue()}"))
-            if (showXpPerRun.get()) add(HudLine("xpPerRun", "&bXP/Run: &f${xpPerRun.format()} &7($source)"))
-            if (showProfile.get()) add(HudLine("profile", "&bProfile: &f${profile.profileName}"))
-            if (showLastRun.get()) add(HudLine("lastRun", "&bLast Run: &f${last?.second?.format() ?: "N/A"}"))
-            if (showObservedCount.get()) add(HudLine("observedCount", "&bRuns: &f${scopedRunCount()}"))
-            if (showChestProfit.get() || showChestCount.get()) {
-                val stats = chestProfitStats()
-                if (showChestProfit.get()) {
-                    add(HudLine("profit", "&bProfit: &a${stats.profit.formatCoins()} &7(${stats.label})"))
-                    add(HudLine("avgChest", "&bAvg Chest: &a${stats.average.formatCoins()}"))
-                }
-                if (showChestCount.get()) add(HudLine("chestsOpened", "&bChest: &f${stats.chests}"))
-            }
-            if (showLastChest.get()) add(HudLine("lastChest", "&bLast Chest: &f${state.lastChestName.ifBlank { "N/A" }} &a${state.lastChestProfit.formatCoins()}"))
-        }
+        val (_, top, bottom) = currentHudContent()
+        return (top + bottom).map { HudLine(it.id, "${it.label}: ${it.value} ${it.suffix}".trim()) }
     }
 
     private fun orderedHudLines(lines: List<HudLine>): List<HudLine> {
@@ -1232,7 +1219,7 @@ class DungeonProgressHudFeature(
         val dragging = draggedHudLineId != null
         val lines = editableHudLines()
         if (lines.isEmpty()) {
-            drawDirect(graphics, lines)
+            drawDirect(graphics)
             return
         }
 
@@ -1243,13 +1230,6 @@ class DungeonProgressHudFeature(
     }
 
     fun onHudOrderMouseClicked(screen: AbstractContainerScreen<*>, event: MouseButtonEvent, shiftDown: Boolean): Boolean {
-        val liveMouse = currentScaledMousePosition()
-        if (event.button() == GLFW.GLFW_MOUSE_BUTTON_LEFT &&
-            (hudModeButtonContains(event.x(), event.y()) || hudModeButtonContains(liveMouse.first, liveMouse.second))
-        ) {
-            toggleHudViewMode()
-            return true
-        }
         if (!shiftDown || event.button() != GLFW.GLFW_MOUSE_BUTTON_LEFT) return false
         val hit = hudLineAt(event.x(), event.y(), editableHudLines()) ?: return false
         draggedHudLineId = hit.id
@@ -1300,7 +1280,7 @@ class DungeonProgressHudFeature(
         val renderScale = scale.takeIf { it.isFinite() && it > 0f } ?: 1f
         val topRows = buildProfitHudTopRows()
         val bottomRows = buildProfitHudBottomRows()
-        val layout = hudPanelLayout("Dungeon Profit Hud", topRows, bottomRows)
+        val layout = hudPanelLayout(topRows, bottomRows)
         val left = drawX
         val right = drawX + layout.width * renderScale
 
@@ -1329,7 +1309,7 @@ class DungeonProgressHudFeature(
         val hintY = (drawY - (mc.font.lineHeight + HUD_LINE_GAP + 2) * renderScale).coerceAtLeast(2f)
         graphics.drawString(mc.font, Component.literal(HUD_ORDER_HINT.colorize()), drawX.toInt(), hintY.toInt(), 0xFFFFFFFF.toInt(), true)
 
-        drawDirect(graphics, lines)
+        drawDirect(graphics)
 
         graphics.pose().pushMatrix()
         graphics.pose().translate(drawX, drawY)
@@ -1339,7 +1319,7 @@ class DungeonProgressHudFeature(
         val targetId = if (draggedId != null) hoveredHudLineId ?: hoverId else hoverId
         val topRows = buildProfitHudTopRows()
         val bottomRows = buildProfitHudBottomRows()
-        val layout = hudPanelLayout("Dungeon Profit Hud", topRows, bottomRows)
+        val layout = hudPanelLayout(topRows, bottomRows)
         val panelWidth = layout.width
 
         fun highlightRows(rows: List<ProfitHudRow>, startY: Int) {
@@ -1385,10 +1365,12 @@ class DungeonProgressHudFeature(
     }
 
     private fun scanCurrentChestScreen() {
-        if (!trackChestProfit.get()) return
+        if (!isEnabled() || !trackChestProfit.get()) return
         val screen = currentChestScreen()
         if (screen == null) {
             pendingChestProfit = null
+            selectedCroesusCandidate = null
+            lastCroesusCandidates = emptyMap()
             lastChestScanKey = ""
             lastChestScanCandidate = null
             return
@@ -1428,12 +1410,12 @@ class DungeonProgressHudFeature(
         val plainLore = plainLore(reward)
         if (!plainLore.any { it == "Cost" }) return null
 
-        val costs = chestCosts(plainLore)
+        val costs = chestCosts(plainLore) ?: return null
         val parsedItems = mutableListOf<ChestProfitItem>()
         val trackedDrops = mutableListOf<TrackedDrop>()
         val containerSlotCount = chestContainerSlotCount(items.size)
 
-        for (stack in (9..17).mapNotNull(items::getOrNull)) {
+        for (stack in (9..18).mapNotNull(items::getOrNull)) {
             if (stack.isEmpty || stack.item == Items.GRAY_STAINED_GLASS_PANE || stack.item == Items.BLACK_STAINED_GLASS_PANE) continue
             parseChestItem(stack)?.let {
                 parsedItems.add(it)
@@ -1459,6 +1441,11 @@ class DungeonProgressHudFeature(
             append(includeEssenceProfit.get())
             append('|')
             append(includeDungeonKeyCost.get())
+            append(bazaarValuation.get())
+            append(auctionValuation.get())
+            append(allowDevonianPriceFallback.get())
+            append(missingPriceBehavior.get())
+            append(System.currentTimeMillis() / 1000)
             for (index in 0 until containerSlotCount) {
                 val stack = items.getOrNull(index) ?: continue
                 append('|')
@@ -1467,6 +1454,7 @@ class DungeonProgressHudFeature(
                 append(stack.count)
                 append(':')
                 append(stack.hoverName.string.cleanMc())
+                append(plainLore(stack).joinToString("\u0001"))
                 append(':')
                 append(ItemUtils.skyblockId(stack).orEmpty())
             }
@@ -1480,24 +1468,6 @@ class DungeonProgressHudFeature(
                 append(plainLore(reward).joinToString("\u0001"))
             }
         }
-    }
-
-    private fun parseBestCroesusChest(screen: AbstractContainerScreen<*>): ChestProfitCandidate? {
-        val parsedFromScreen = parseCroesusCandidatesFromScreen(screen)
-        val candidatesByName = parsedFromScreen.toMutableMap()
-        devonianChestProfitCandidates().forEach { (name, fallback) ->
-            if (candidatesByName[name]?.canRecordDirectly() != true) {
-                candidatesByName[name] = fallback.withTrackedDropsFrom(parsedFromScreen[name])
-            }
-        }
-        if (candidatesByName.isNotEmpty()) {
-            lastCroesusCandidates = candidatesByName
-            val best = candidatesByName.values.maxByOrNull { it.profit }
-            log("Fake open Croesus candidates=${candidatesByName.values.joinToString { "${it.chestName}:${it.profit}" }} best=${best?.summary()}")
-            return best
-        }
-
-        return null
     }
 
     private fun parseCroesusCandidatesFromScreen(screen: AbstractContainerScreen<*>): Map<String, ChestProfitCandidate> = runCatching {
@@ -1516,135 +1486,14 @@ class DungeonProgressHudFeature(
         return copy(trackedDrops = other.trackedDrops)
     }
 
-    private fun devonianChestProfitCandidates(): Map<String, ChestProfitCandidate> {
-        val candidates = linkedMapOf<String, ChestProfitCandidate>()
-        // Lowest-level listener first, visible HUD features last. If the same chest exists in
-        // multiple Devonian caches, the value displayed by Devonian's profit HUD should win.
-        candidates.putAll(devonianCroesusListenerCandidates())
-        candidates.putAll(devonianChestProfitFeatureCandidates())
-        candidates.putAll(devonianCroesusProfitCandidates())
-        return candidates
-    }
-
-    private fun devonianChestProfitFeatureCandidates(): Map<String, ChestProfitCandidate> = runCatching {
-        val cls = Class.forName("com.github.synnerz.devonian.features.dungeons.ChestProfit")
-        val instance = kotlinObjectInstance(cls)
-        val currentChestData = (call(instance, "getCurrentChestData") ?: objectField(cls, instance, "currentChestData")) as? Map<*, *>
-            ?: return@runCatching emptyMap()
-
-        currentChestData.mapNotNull { (key, value) ->
-            val chestName = key?.toString() ?: return@mapNotNull null
-            if (!chestNames.contains(chestName) || value == null) return@mapNotNull null
-            val itemCount = ((readMember(value, "itemData") as? Collection<*>)?.size ?: 0)
-            if (itemCount <= 0) return@mapNotNull null
-            val profit = (call(value, "profit") as? Number)?.toLong() ?: return@mapNotNull null
-            val cost = ((readMember(value, "chestPrice") as? Number)?.toInt() ?: 0)
-            ChestProfitCandidate(chestName, profit, cost, itemCount, scannedSlots = 0)
-        }.associateBy { it.chestName }
-    }.onFailure {
-        log("Devonian ChestProfit unavailable: ${it.javaClass.simpleName}: ${it.message}")
-    }.getOrDefault(emptyMap())
-
-    private fun devonianCroesusProfitCandidates(): Map<String, ChestProfitCandidate> = runCatching {
-        val cls = Class.forName("com.github.synnerz.devonian.features.dungeons.CroesusProfit")
-        val instance = kotlinObjectInstance(cls)
-        val chestsData = objectField(cls, instance, "chestsData") as? Map<*, *>
-            ?: return@runCatching emptyMap()
-
-        chestsData.mapNotNull { (key, value) ->
-            val chestName = key?.toString() ?: return@mapNotNull null
-            if (!chestNames.contains(chestName) || value == null) return@mapNotNull null
-            val bought = (readMember(value, "bought") as? Boolean) ?: false
-            if (bought) return@mapNotNull null
-            val itemCount = ((readMember(value, "items") as? Collection<*>)?.size ?: 0)
-            if (itemCount <= 0) return@mapNotNull null
-            val profit = (call(value, "totalProfit") as? Number)?.toLong() ?: return@mapNotNull null
-            if (profit == Int.MIN_VALUE.toLong()) return@mapNotNull null
-            val cost = ((readMember(value, "chestPrice") as? Number)?.toInt() ?: 0)
-            val slot = ((readMember(value, "slotIdx") as? Number)?.toInt() ?: 0)
-            ChestProfitCandidate(chestName, profit, cost, itemCount, slot)
-        }.associateBy { it.chestName }
-    }.onFailure {
-        log("Devonian CroesusProfit unavailable: ${it.javaClass.simpleName}: ${it.message}")
-    }.getOrDefault(emptyMap())
-
-    private fun devonianCroesusListenerCandidates(): Map<String, ChestProfitCandidate> = runCatching {
-        val cls = Class.forName("com.github.synnerz.devonian.api.dungeon.CroesusListener")
-        val instance = kotlinObjectInstance(cls)
-        val chestsData = objectField(cls, instance, "chestsData") as? Map<*, *>
-            ?: return@runCatching emptyMap()
-
-        chestsData.mapNotNull { (key, value) ->
-            val chestName = key?.toString() ?: return@mapNotNull null
-            if (!chestNames.contains(chestName) || value == null) return@mapNotNull null
-            val purchased = (readMember(value, "purchased") as? Boolean) ?: false
-            if (purchased) return@mapNotNull null
-            val itemCount = ((readMember(value, "items") as? Collection<*>)?.size ?: 0)
-            if (itemCount <= 0) return@mapNotNull null
-            val profit = (call(value, "totalProfit", false) as? Number)?.toLong()
-                ?: (call(value, "totalProfit") as? Number)?.toLong()
-                ?: return@mapNotNull null
-            if (profit == Int.MIN_VALUE.toLong()) return@mapNotNull null
-            val cost = ((readMember(value, "price") as? Number)?.toInt() ?: 0)
-            val slot = ((readMember(value, "slot") as? Number)?.toInt() ?: 0)
-            ChestProfitCandidate(chestName, profit, cost, itemCount, slot)
-        }.associateBy { it.chestName }
-    }.onFailure {
-        log("Devonian CroesusListener unavailable: ${it.javaClass.simpleName}: ${it.message}")
-    }.getOrDefault(emptyMap())
-
-    private fun kotlinObjectInstance(cls: Class<*>): Any? =
-        runCatching { cls.getField("INSTANCE").get(null) }.getOrNull()
-
-    private fun objectField(cls: Class<*>, instance: Any?, name: String): Any? {
-        val field = cls.getDeclaredField(name)
-        field.isAccessible = true
-        return runCatching { field.get(instance) }.getOrElse { field.get(null) }
-    }
-
-    private fun readMember(target: Any, name: String): Any? {
-        val getter = "get" + name.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() }
-        return call(target, getter) ?: runCatching {
-            val field = target.javaClass.getDeclaredField(name)
-            field.isAccessible = true
-            field.get(target)
-        }.getOrNull()
-    }
-
-    private fun call(target: Any?, name: String, vararg args: Any?): Any? {
-        val cls = target?.javaClass ?: return null
-        val method = cls.methods.firstOrNull { it.name == name && it.parameterCount == args.size }
-            ?: cls.declaredMethods.firstOrNull { it.name == name && it.parameterCount == args.size }
-            ?: return null
-        method.isAccessible = true
-        return runCatching { method.invoke(target, *args) }.getOrNull()
-    }
-
     private fun parseCroesusChestItem(chestName: String, stack: ItemStack, slot: Int): ChestProfitCandidate? {
-        val plainLore = plainLore(stack)
-        val formattedLore = ItemUtils.lore(stack, true) ?: emptyList()
-        var costs = ChestCosts()
-        val parsedItems = mutableListOf<ChestProfitItem>()
-        val trackedDrops = mutableListOf<TrackedDrop>()
-
-        for (idx in plainLore.indices) {
-            val line = plainLore[idx]
-            if (line == "Already opened!") return null
-            if (line == "No chests opened yet!" || line == "Contents" || line.isBlank()) continue
-
-            if (line == "Cost") {
-                costs = chestCosts(plainLore)
-                continue
-            }
-
-            parseCroesusLoreItem(line, formattedLore.getOrNull(idx) ?: line)?.let {
-                parsedItems.add(it)
-                it.trackedDrop?.let(trackedDrops::add)
-            }
-        }
-
-        if (parsedItems.isEmpty()) return null
-        return calculateChestCandidate(chestName, parsedItems, costs, slot, trackedDrops)
+        val parsed = ChestLoreParser.parse(plainLore(stack)) { parseCroesusLoreItem(it, it) }
+        if (parsed.error != null) { log("$chestName: ${parsed.error}"); return null }
+        if (parsed.rewards.isEmpty() && parsed.unknownRewards.isEmpty()) return null
+        val candidate = calculateChestCandidate(chestName, parsed.rewards,
+            ChestCosts(parsed.coinCost!!, parsed.requiresKey), slot, parsed.rewards.mapNotNull { it.trackedDrop })
+        return if (parsed.unknownRewards.isEmpty()) candidate else candidate.copy(
+            missingItemIds = candidate.missingItemIds + parsed.unknownRewards.map { "UNPARSED_REWARD:$it" })
     }
 
     private fun parseCroesusLoreItem(line: String, formattedLine: String): ChestProfitItem? {
@@ -1668,6 +1517,7 @@ class DungeonProgressHudFeature(
             .replace(" ", "_")
         id = normalizeItemId(id)
 
+        if (tech.thatgravyboat.skyblockapi.api.remote.hypixel.itemdata.ItemData.getItemData(id) == null) return null
         val trackedDrop = trackedDropFor(id, line)
         return ChestProfitItem(id, 1, essence = false, trackedDrop = trackedDrop)
     }
@@ -1692,7 +1542,7 @@ class DungeonProgressHudFeature(
             return ChestProfitItem(id, 1, essence = false)
         }
 
-        for (line in plainLore) {
+        for (line in listOf(name) + plainLore) {
             essenceRegex.matchEntire(line)?.groupValues?.drop(1)?.let { match ->
                 val type = match[0].uppercase(Locale.ROOT)
                 val amount = match[1].toIntOrNull() ?: return@let
@@ -1723,13 +1573,9 @@ class DungeonProgressHudFeature(
         return TrackedDrop(definition.key, definition.displayName)
     }
 
-    private fun chestCosts(lore: List<String>): ChestCosts {
-        val costIndex = lore.indexOf("Cost")
-        if (costIndex < 0) return ChestCosts()
-        val coins = lore.getOrNull(costIndex + 1)?.let {
-            costRegex.matchEntire(it)?.groupValues?.getOrNull(1)?.replace(",", "")?.toIntOrNull()
-        } ?: 0
-        return ChestCosts(coins.toLong(), lore.getOrNull(costIndex + 2) == "Dungeon Chest Key")
+    private fun chestCosts(lore: List<String>): ChestCosts? {
+        val coins = ChestLoreParser.coinCost(lore) ?: return null
+        return ChestCosts(coins, "Dungeon Chest Key" in lore.drop(lore.indexOf("Cost") + 1))
     }
 
     private fun calculateChestCandidate(
@@ -1739,6 +1585,7 @@ class DungeonProgressHudFeature(
         scannedSlots: Int,
         trackedDrops: List<TrackedDrop>,
     ): ChestProfitCandidate {
+        priceService.beginCalculation()
         val keyQuote = if (costs.requiresKey && includeDungeonKeyCost.get()) priceService.quote("DUNGEON_CHEST_KEY") else null
         val calculation = chestProfitCalculator.calculate(
             ChestCalculationInput(
@@ -1755,15 +1602,11 @@ class DungeonProgressHudFeature(
         val missing = (calculation.missingItemIds + if (keyMissing) listOf("DUNGEON_CHEST_KEY") else emptyList()).distinct()
         return ChestProfitCandidate(
             chestName = chestName,
-            profit = calculation.netProfit,
-            cost = (calculation.chestCoinCost + calculation.keyCost).coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
             itemCount = items.size,
             scannedSlots = scannedSlots,
             trackedDrops = trackedDrops,
-            grossValue = calculation.grossValue,
             chestCoinCost = calculation.chestCoinCost,
             keyCost = calculation.keyCost,
-            pricingComplete = missing.isEmpty(),
             missingItemIds = missing,
             pricedItems = calculation.pricedItems,
         )
@@ -1773,226 +1616,27 @@ class DungeonProgressHudFeature(
 
     private fun currentChestScreen(): AbstractContainerScreen<*>? = mc.screen as? AbstractContainerScreen<*>
 
-    private fun recordChestProfit(candidate: ChestProfitCandidate, source: String) {
+    private fun recordChestProfit(candidate: ChestProfitCandidate, source: String, claimKey: String = claimIdentity(candidate)) {
         val now = System.currentTimeMillis()
-        if (!candidate.canRecordDirectly()) {
-            state.lastMissingItemIds = candidate.missingItemIds.toMutableList()
-            saveState()
-            send("Chest pricing incomplete; not recorded. Missing: ${candidate.missingItemIds.joinToString()}.")
-            log("Incomplete chest profit ignored source=$source: ${candidate.summary()}")
-            return
-        }
-        val effectiveCandidate = candidate.withKismetCost(pendingKismetCosts.remove(candidate.chestName) ?: 0L)
-        val claimKey = "${effectiveCandidate.chestName}:${effectiveCandidate.profit}"
-        if (!chestClaimDeduplicator.shouldAccept(claimKey, now)) {
-            log("Duplicate chest profit ignored source=$source: ${effectiveCandidate.summary()}")
-            return
-        }
-
-        val floor = floorValue()
-        ensureSessionStarted(now, "chest-profit-$source")
-        state.lastChestName = effectiveCandidate.chestName
-        state.lastChestProfit = effectiveCandidate.profit
-        state.lastMissingItemIds = effectiveCandidate.missingItemIds.toMutableList()
-        sessionChestProfit += effectiveCandidate.profit
-        sessionChestsOpened++
-        state.totalChestProfit += effectiveCandidate.profit
-        state.totalChestsOpened++
-        state.chestProfits.add(
-            ChestProfitSample(
-                timestamp = now,
-                chestName = effectiveCandidate.chestName,
-                profit = effectiveCandidate.profit,
-                grossValue = effectiveCandidate.grossValue,
-                chestCoinCost = effectiveCandidate.chestCoinCost,
-                keyCost = effectiveCandidate.keyCost,
-                kismetCost = effectiveCandidate.kismetCost,
-                pricingComplete = effectiveCandidate.pricingComplete,
-                missingItemIds = effectiveCandidate.missingItemIds.toMutableList(),
-                pricedItems = effectiveCandidate.pricedItems.toMutableList(),
-                detailsVersion = 1,
-                profileName = data?.profileName.orEmpty(),
-                floorLabel = floor,
-            )
-        )
-        if (shouldTrackM7Drops(floor)) {
-            effectiveCandidate.trackedDrops.forEach { drop ->
-                state.trackedItemDrops.add(
-                    TrackedItemDropSample(
-                        timestamp = now,
-                        itemKey = drop.key,
-                        displayName = drop.displayName,
-                        chestName = effectiveCandidate.chestName,
-                        floorLabel = floor,
-                        profileName = data?.profileName.orEmpty(),
-                    )
-                )
+        val context = ClaimContext(claimKey, currentAccountId(), currentProfileId(), data?.profileName.orEmpty(), chestContextFloor)
+        when (val result = ChestRecorder.record(state, candidate, context, source, now,
+            selectedMissingPricePolicy(), includeKismetCost.get())) {
+            is ClaimResult.Recorded -> {
+                ensureSessionStarted(now, "chest-profit-$source")
+                saveState()
             }
+            is ClaimResult.Incomplete -> send("Chest pricing incomplete; not recorded. Missing: ${result.missing.joinToString()}.")
+            ClaimResult.Duplicate -> log("Duplicate claim ignored: $claimKey")
         }
-        while (state.trackedItemDrops.size > MAX_TRACKED_ITEM_DROPS) state.trackedItemDrops.removeAt(0)
-        decrementCroesusUnclaimedCount("chest-profit-$source")
-        while (state.chestProfits.size > 250) state.chestProfits.removeAt(0)
-        saveState()
-        log("Recorded chest profit source=$source ${effectiveCandidate.summary()} tracked=${effectiveCandidate.trackedDrops.joinToString { it.key }} samples=${state.chestProfits.size} sessionProfit=$sessionChestProfit totalProfit=${state.totalChestProfit}")
     }
 
-    private fun fetchProfile(request: ProfileRequest): ProfileData {
-        val failures = mutableListOf<String>()
-        if (FabricLoader.getInstance().isModLoaded(SKYBLOCK_PV_MOD_ID)) {
-            runCatching { fetchSkyBlockPvProfile(request) }
-                .onSuccess { return it }
-                .onFailure {
-                    val message = profileFailureMessage(it)
-                    failures += "SkyBlock Profile Viewer: $message"
-                    log("SkyBlockPv profile fetch failed; trying SkyBlocker: $message")
-                }
-        }
-        if (FabricLoader.getInstance().isModLoaded(SKYBLOCKER_MOD_ID)) {
-            runCatching { fetchSkyBlockerProfile(request) }
-                .onSuccess { return it }
-                .onFailure {
-                    val message = profileFailureMessage(it)
-                    failures += "SkyBlocker: $message"
-                    log("SkyBlocker profile fetch failed: $message")
-                }
-        }
-        error(failures.ifEmpty { listOf("No profile provider loaded") }.joinToString("; "))
+    private fun selectedMissingPricePolicy(): MissingPriceBehavior =
+        MissingPriceBehavior.entries.getOrElse(missingPriceBehavior.get()) { MissingPriceBehavior.MARK_INCOMPLETE }
+
+    private fun activeSkyBlockProfile(): Pair<UUID?, String>? {
+        val api = tech.thatgravyboat.skyblockapi.api.profile.profile.ProfileAPI
+        return if (api.isLoaded) api.profileId to api.profileName.orEmpty() else null
     }
-
-    private fun fetchSkyBlockPvProfile(request: ProfileRequest): ProfileData {
-        val gameProfile = GameProfile(request.playerUuid, request.playerName)
-        log("Fetching SkyBlockPv profile user=${gameProfile.name} uuid=${gameProfile.id} sessionUuid=${request.playerUuid}")
-        val profileApiClass = Class.forName(SKYBLOCK_PV_PROFILE_API)
-        val profileApi = profileApiClass.getField("INSTANCE").get(null)
-        val profileResult = CompletableFuture<List<*>>()
-        val handler: (List<*>) -> Unit = { profileResult.complete(it) }
-        val getProfiles = profileApiClass.methods.firstOrNull { method ->
-            method.name == "getProfiles" && method.parameterCount == 3
-        } ?: error("SkyBlock Profile Viewer profile API is incompatible")
-
-        getProfiles.invoke(
-            profileApi,
-            gameProfile,
-            "dungeonprogresshud",
-            handler,
-        )
-
-        val profiles = profileResult.get(PROFILE_FETCH_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-        val activeProfile = activeSkyBlockProfile()
-        log("SkyBlockPv returned ${profiles.size} profiles for uuid=${gameProfile.id}; active=${activeProfile?.second ?: "unknown"}/${activeProfile?.first ?: "unknown"}: ${profiles.joinToString { describeSkyBlockPvProfile(it) }}")
-        val selected = profiles.firstOrNull { profile ->
-            profile != null && invokeProfileMethod(profile, "getSelected") == true
-        } ?: activeProfile?.let { (activeId, activeName) ->
-            profiles.firstOrNull { profile ->
-                val identity = skyBlockPvProfileIdentity(profile) ?: return@firstOrNull false
-                (activeId != null && identity.first == activeId) ||
-                    (activeName.isNotBlank() && identity.second.equals(activeName, true))
-            }
-        } ?: profiles.singleOrNull() ?: error(
-            "No active SkyBlock profile match for ${gameProfile.name}; in-game profile is ${activeProfile?.second ?: "not loaded"}"
-        )
-
-        val profileId = invokeProfileMethod(selected, "getId") ?: error("Selected profile ID unavailable")
-        val profileName = invokeProfileMethod(profileId, "getName") as? String ?: "Unknown"
-        val backingProfile = invokeProfileMethod(selected, "getBackingProfile")
-            ?: error("SkyBlock Profile Viewer backing profile unavailable")
-        val dungeonFuture = invokeProfileMethod(backingProfile, "getDungeonData") as? CompletableFuture<*>
-            ?: error("SkyBlock Profile Viewer dungeon request unavailable")
-        val dungeonData = dungeonFuture.get(PROFILE_FETCH_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-            ?: error("Dungeon API unavailable")
-        val dungeonTypes = invokeProfileMethod(dungeonData, "getDungeonTypes") as? Map<*, *>
-            ?: error("Dungeon types unavailable")
-        val catacombs = dungeonTypes["catacombs"] ?: error("Catacombs data unavailable")
-        val catacombsExperience = (invokeProfileMethod(catacombs, "getExperience") as? Number)?.toLong()
-            ?: error("Catacombs experience unavailable")
-
-        log("Selected SkyBlockPv profile name=$profileName")
-        return ProfileData(
-            playerName = request.playerName,
-            playerUuid = gameProfile.id.toString().replace("-", ""),
-            profileName = profileName,
-            catacombsExperience = catacombsExperience,
-        )
-    }
-
-    private fun fetchSkyBlockerProfile(request: ProfileRequest): ProfileData {
-        val uuid = request.playerUuid.toString().replace("-", "")
-        log("Fetching SkyBlocker profile user=${request.playerName} uuid=$uuid")
-        val profileUtils = Class.forName(SKYBLOCKER_PROFILE_UTILS)
-        val fetchProfiles = profileUtils.getMethod("fetchFullProfileByUuid", String::class.java)
-        val future = fetchProfiles.invoke(null, uuid) as? CompletableFuture<*>
-            ?: error("SkyBlocker profile request unavailable")
-        val root = future.get(PROFILE_FETCH_TIMEOUT_SECONDS, TimeUnit.SECONDS) as? JsonObject
-            ?: error("SkyBlocker returned no profile data")
-        if (root.get("success")?.asBoolean == false) error(root.get("cause")?.asString ?: "SkyBlocker profile request failed")
-        val profiles = root.getAsJsonArray("profiles") ?: error("SkyBlocker returned no SkyBlock profiles")
-        val selected = selectSkyBlockerProfile(profiles, request)
-        val profileName = selected.get("cute_name")?.asString ?: "Unknown"
-        val members = selected.getAsJsonObject("members") ?: error("SkyBlocker profile members unavailable")
-        val member = members.getAsJsonObject(uuid)
-            ?: members.getAsJsonObject(request.playerUuid.toString())
-            ?: error("Selected profile missing player")
-        val catacombsExperience = member.getAsJsonObject("dungeons")
-            ?.getAsJsonObject("dungeon_types")
-            ?.getAsJsonObject("catacombs")
-            ?.get("experience")
-            ?.asLong
-            ?: error("Catacombs data unavailable")
-        log("Selected SkyBlocker profile name=$profileName")
-        return ProfileData(
-            playerName = request.playerName,
-            playerUuid = uuid,
-            profileName = profileName,
-            catacombsExperience = catacombsExperience,
-        )
-    }
-
-    private fun selectSkyBlockerProfile(profiles: JsonArray, request: ProfileRequest): JsonObject {
-        val candidates = profiles.mapNotNull { it.takeIf { element -> element.isJsonObject }?.asJsonObject }
-        val activeProfile = activeSkyBlockProfile()
-        return candidates.firstOrNull { it.get("selected")?.asBoolean == true }
-            ?: activeProfile?.let { (activeId, activeName) ->
-                candidates.firstOrNull { profile ->
-                    val profileId = profile.get("profile_id")?.asString?.let { value ->
-                        runCatching { UUID.fromString(value) }.getOrNull()
-                    }
-                    val profileName = profile.get("cute_name")?.asString.orEmpty()
-                    (activeId != null && profileId == activeId) ||
-                        (activeName.isNotBlank() && profileName.equals(activeName, true))
-                }
-            }
-            ?: candidates.singleOrNull()
-            ?: error("No active SkyBlocker profile match for ${request.playerName}; in-game profile is ${activeProfile?.second ?: "not loaded"}")
-    }
-
-    private fun describeSkyBlockPvProfile(profile: Any?): String {
-        if (profile == null) return "null"
-        return runCatching {
-            val identity = skyBlockPvProfileIdentity(profile)
-            val name = identity?.second.orEmpty()
-            val selected = invokeProfileMethod(profile, "getSelected") == true
-            "${name.ifBlank { "unknown" }}(${identity?.first ?: "unknown"}, selected=$selected)"
-        }.getOrDefault("unreadable")
-    }
-
-    private fun skyBlockPvProfileIdentity(profile: Any?): Pair<UUID?, String>? {
-        if (profile == null) return null
-        val id = invokeProfileMethod(profile, "getId") ?: return null
-        return (invokeProfileMethod(id, "getId") as? UUID) to
-            ((invokeProfileMethod(id, "getName") as? String).orEmpty())
-    }
-
-    private fun activeSkyBlockProfile(): Pair<UUID?, String>? = runCatching {
-        val profileApiClass = Class.forName(SKYBLOCK_API_PROFILE_API)
-        val profileApi = profileApiClass.getField("INSTANCE").get(null)
-        val loaded = invokeProfileMethod(profileApi, "isLoaded") as? Boolean ?: false
-        if (!loaded) return@runCatching null
-        val id = invokeProfileMethod(profileApi, "getProfileId") as? UUID
-        val name = invokeProfileMethod(profileApi, "getProfileName") as? String ?: ""
-        id to name
-    }.onFailure {
-        log("Live SkyBlock profile lookup failed: ${profileFailureMessage(it)}")
-    }.getOrNull()
 
     private fun profileFailureMessage(error: Throwable): String {
         var cause = error
@@ -2000,13 +1644,13 @@ class DungeonProgressHudFeature(
         return cause.message?.takeIf { it.isNotBlank() } ?: cause.javaClass.simpleName
     }
 
-    private fun invokeProfileMethod(instance: Any, methodName: String): Any? =
-        instance.javaClass.methods.firstOrNull { it.name == methodName && it.parameterCount == 0 }
-            ?.invoke(instance)
-            ?: error("SkyBlock Profile Viewer method $methodName is unavailable")
-
     private fun recordSample(profile: ProfileData, recordObservedSample: Boolean) {
-        if (state.lastPlayerUuid != profile.playerUuid) {
+        val profileId = profile.profileId.replace("-", "")
+        val now = System.currentTimeMillis()
+        val previousAt = state.lastBaselineAt
+        state.lastBaselineAt = now
+        if (profileId.isBlank() || state.lastProfileId != profileId || state.lastPlayerUuid != profile.playerUuid) {
+            state.lastProfileId = profileId
             state.lastPlayerUuid = profile.playerUuid
             state.lastCatacombsXp = profile.catacombsExperience
             saveState()
@@ -2021,58 +1665,33 @@ class DungeonProgressHudFeature(
             return
         }
 
-        val recordedXp = delta.coerceAtLeast(0L)
-        log("Recorded sample rawDelta=$delta recordedXp=$recordedXp floor=${floorValue()}")
-        if (isRecentChatRunSample(delta, recordedXp)) {
-            log("Profile XP sample skipped because it matches recent dungeon completion chat rawDelta=$delta recordedXp=$recordedXp")
-            saveState()
-            return
-        }
-        if (recordedXp > 0) {
-        ensureSessionStarted(System.currentTimeMillis(), "profile-xp-sample")
-            state.samples.add(RunSample(System.currentTimeMillis(), floorValue(), delta, recordedXp))
-            while (state.samples.size > 100) state.samples.removeAt(0)
+        if (delta > 0 && previousAt > 0) {
+            state.xpIntervals.add(XpInterval(previousAt, now, delta, profile.playerUuid.replace("-", ""), profileId))
         }
         saveState()
     }
 
     fun parseDungeonCompletionMessage(message: String) {
-        message.cleanMc().lines().forEach { parseDungeonCompletionLine(it) }
+        if (!isEnabled()) return
+        message.cleanMc().lines().forEach { line ->
+            ChestConfirmation.claimedTier(line)?.let { tier ->
+                claimAttempts.confirmChat(System.currentTimeMillis()) { it.chestName.equals(tier, true) }
+                    ?.let { recordChestProfit(it.value, "server-chat", it.claimId) }
+            }
+            parseDungeonCompletionLine(line)
+        }
     }
 
     private fun parseDungeonCompletionLine(message: String, timestamp: Long = System.currentTimeMillis()): Boolean {
-        val normalizedMessage = message.trim().replace(Regex("\\s*\\(x\\d+\\)$"), "")
-        if (normalizedMessage.isBlank()) return false
-        if (timestamp - pendingCompletionAt > 30_000) {
-            pendingCompletionFloor = ""
-            pendingCompletionTimeSeconds = 0
-            pendingCompletionScore = 0
-            pendingCompletionGrade = ""
-        }
-
-        parseCompletionFloor(normalizedMessage)?.let {
-            pendingCompletionAt = timestamp
-            pendingCompletionFloor = it
-            detectedFloorLabel = it
-        }
-        if (normalizedMessage.contains("Defeated", true)) {
-            pendingCompletionAt = timestamp
-            pendingCompletionTimeSeconds = parseCompletionTimeSeconds(normalizedMessage)
-        }
-        parseCompletionScore(normalizedMessage)?.let {
-            pendingCompletionAt = timestamp
-            pendingCompletionScore = it.first
-            pendingCompletionGrade = it.second
-        }
-
-        val cataXp = dungeonCompletionCataXpRegex.find(normalizedMessage)
-            ?.groupValues
-            ?.getOrNull(1)
-            ?.replace(",", "")
-            ?.toLongOrNull()
-            ?: run {
-                return false
-            }
+        val parsed = CompletionParser.accept(
+            CompletionState(pendingCompletionAt, pendingCompletionFloor, pendingCompletionTimeSeconds,
+                pendingCompletionScore, pendingCompletionGrade), message, timestamp)
+        pendingCompletionAt = parsed.state.timestamp
+        pendingCompletionFloor = parsed.state.floor
+        pendingCompletionTimeSeconds = parsed.state.seconds
+        pendingCompletionScore = parsed.state.score
+        pendingCompletionGrade = parsed.state.grade
+        val cataXp = parsed.completion?.xp ?: return false
 
         val floor = pendingCompletionFloor.ifBlank { floorValue() }
         val dedupeKey = "$floor:$cataXp:$pendingCompletionTimeSeconds:$pendingCompletionScore"
@@ -2085,6 +1704,8 @@ class DungeonProgressHudFeature(
             return false
         }
 
+        clearPendingChestTracking()
+        chestContextFloor = floor
         lastDungeonCompletionChat = dedupeKey
         lastDungeonCompletionChatAt = timestamp
         lastDungeonCompletionRawXp = cataXp
@@ -2095,10 +1716,11 @@ class DungeonProgressHudFeature(
             timestamp
         }
         ensureSessionStarted(runStartedAt, "dungeon-completion")
-        state.samples.add(RunSample(timestamp, floor, cataXp, lastDungeonCompletionNormalizedXp))
-        while (state.samples.size > 100) state.samples.removeAt(0)
         state.runs.add(
             DungeonRunRecord(
+                accountId = currentAccountId(),
+                profileId = currentProfileId(),
+                source = "completion-chat",
                 timestamp = timestamp,
                 floorLabel = floor,
                 runTimeSeconds = pendingCompletionTimeSeconds,
@@ -2115,189 +1737,51 @@ class DungeonProgressHudFeature(
     }
 
     private fun hasRunRecord(floor: String, rawXp: Long, runTimeSeconds: Int, score: Int, timestamp: Long): Boolean =
-        state.runs.any {
-            it.floorLabel.equals(floor, true) &&
-                it.rawCataXp == rawXp &&
-                it.runTimeSeconds == runTimeSeconds &&
-                it.score == score &&
-                kotlin.math.abs(it.timestamp - timestamp) < 20 * 60 * 1000
-        }
-
-    private fun hasRunRecord(records: List<DungeonRunRecord>, floor: String, rawXp: Long, runTimeSeconds: Int, score: Int, timestamp: Long): Boolean =
-        records.any {
-            it.floorLabel.equals(floor, true) &&
-                it.rawCataXp == rawXp &&
-                it.runTimeSeconds == runTimeSeconds &&
-                it.score == score &&
-                kotlin.math.abs(it.timestamp - timestamp) < 20 * 60 * 1000
-        }
-
-    private fun hasImportedRunRecord(records: List<ImportedDungeonRun>, floor: String, rawXp: Long, runTimeSeconds: Int, score: Int, timestamp: Long): Boolean =
-        records.any {
-            it.floorLabel.equals(floor, true) &&
-                it.rawCataXp == rawXp &&
-                it.runTimeSeconds == runTimeSeconds &&
-                it.score == score &&
-                kotlin.math.abs(it.timestamp - timestamp) < 20 * 60 * 1000
-        }
-
-    private fun parseCompletionFloor(message: String): String? =
-        dungeonCompletionFloorRegex.find(message)?.groupValues?.getOrNull(2)?.uppercase(Locale.ROOT)
-
-    private fun parseCompletionTimeSeconds(message: String): Int {
-        val match = dungeonCompletionTimeRegex.find(message) ?: return 0
-        val minutes = match.groupValues.getOrNull(1)?.toIntOrNull() ?: return 0
-        val seconds = match.groupValues.getOrNull(2)?.toIntOrNull() ?: return 0
-        return minutes * 60 + seconds
-    }
-
-    private fun parseCompletionScore(message: String): Pair<Int, String>? {
-        val match = dungeonCompletionScoreRegex.find(message) ?: return null
-        val score = match.groupValues.getOrNull(1)?.toIntOrNull() ?: return null
-        val grade = match.groupValues.getOrNull(2).orEmpty()
-        return score to grade
-    }
+        state.runs.any { RunReconciler.matches(it, floor, rawXp, runTimeSeconds, score, timestamp) }
 
     fun importRecentLogs(manual: Boolean) {
         if (!logsDir.isDirectory) {
             if (manual) send("No Minecraft logs folder found.")
             return
         }
-
-        val existingRuns = state.runs.toList()
-        val fallbackFloor = floorValue()
-        val lastLogImportAt = state.lastLogImportAt
+        val progress = state.importedLogFiles.toMap()
         thread(name = "DPH Log Import", isDaemon = true) {
-            val cutoff = System.currentTimeMillis() - 8L * DAY_MILLIS
-            val files = logsDir.listFiles()
-                ?.filter { it.isFile && it.lastModified() >= cutoff && (it.extension == "log" || it.name.endsWith(".log.gz")) }
-                ?.sortedWith(compareBy<File> { it.lastModified() }.thenBy { it.name })
-                ?: emptyList()
-            if (!manual && files.none { it.lastModified() > lastLogImportAt }) return@thread
-
+            val files = logsDir.listFiles()?.filter {
+                it.isFile && (it.extension == "log" || it.name.endsWith(".log.gz"))
+            }?.sortedBy { it.name }.orEmpty()
             val importedRuns = mutableListOf<ImportedDungeonRun>()
-            var pendingAt = 0L
-            var pendingFloor = ""
-            var pendingTimeSeconds = 0
-            var pendingScore = 0
-            var pendingGrade = ""
-            var lastDedupeKey = ""
-            var lastDedupeAt = 0L
-
+            val completed = mutableMapOf<String, String>()
+            var undated = 0
+            var failed = 0
             for (file in files) {
+                val timeline = LogTimeline.forArchive(file.name) ?: run { undated++; continue }
+                val fingerprint = "${file.length()}:${file.lastModified()}"
+                if (!manual && progress[file.name] == fingerprint) continue
                 runCatching {
+                    var pending = CompletionState()
+                    val fileRuns = mutableListOf<ImportedDungeonRun>()
                     file.forEachLogLine { line ->
+                        val timestamp = timeline.timestamp(line)
                         val chat = extractLogChat(line)
-                        if (chat != null) {
-                            val timestamp = parseLogTimestamp(line, file)
-                            val parsed = parseImportedDungeonCompletionLine(
-                                chat,
-                                timestamp,
-                                fallbackFloor,
-                                existingRuns,
-                                importedRuns,
-                                pendingAt,
-                                pendingFloor,
-                                pendingTimeSeconds,
-                                pendingScore,
-                                pendingGrade,
-                                lastDedupeKey,
-                                lastDedupeAt,
-                            )
-                            pendingAt = parsed.pending.timestamp
-                            pendingFloor = parsed.pending.floor
-                            pendingTimeSeconds = parsed.pending.runTimeSeconds
-                            pendingScore = parsed.pending.score
-                            pendingGrade = parsed.pending.grade
-                            lastDedupeKey = parsed.lastDedupeKey
-                            lastDedupeAt = parsed.lastDedupeAt
-                            parsed.run?.let { importedRuns.add(it) }
+                        if (timestamp != null && chat != null) {
+                            val parsed = CompletionParser.accept(pending, chat, timestamp)
+                            pending = parsed.state
+                            parsed.completion?.let { run ->
+                                fileRuns.add(ImportedDungeonRun(run.timestamp, run.metadata.floor.ifBlank { "N/A" },
+                                    run.metadata.seconds, run.metadata.score, run.metadata.grade, run.xp))
+                            }
                         }
                     }
-                }.onFailure {
-                    log("Log import failed file=${file.name}: ${it.javaClass.simpleName}: ${it.message}")
-                }
+                    importedRuns.addAll(fileRuns)
+                    completed[file.name] = fingerprint
+                }.onFailure { failed++; log("Log import failed file=${file.name}: $it") }
             }
-
-            mc.execute { mergeImportedLogRuns(importedRuns, files.size, manual) }
+            mc.execute {
+                state.importedLogFiles.putAll(completed)
+                mergeImportedLogRuns(importedRuns, completed.size, manual)
+                if (manual && (undated > 0 || failed > 0)) send("Skipped $undated undated logs; $failed files failed. Imported ownership remains unknown.")
+            }
         }
-    }
-
-    private fun parseImportedDungeonCompletionLine(
-        message: String,
-        timestamp: Long,
-        fallbackFloor: String,
-        existingRuns: List<DungeonRunRecord>,
-        importedRuns: List<ImportedDungeonRun>,
-        previousPendingAt: Long,
-        previousPendingFloor: String,
-        previousPendingTimeSeconds: Int,
-        previousPendingScore: Int,
-        previousPendingGrade: String,
-        previousDedupeKey: String,
-        previousDedupeAt: Long,
-    ): ImportedParseResult {
-        val normalizedMessage = message.cleanMc().trim().replace(Regex("\\s*\\(x\\d+\\)$"), "")
-        if (normalizedMessage.isBlank()) {
-            return ImportedParseResult(
-                PendingCompletionState(previousPendingAt, previousPendingFloor, previousPendingTimeSeconds, previousPendingScore, previousPendingGrade),
-                previousDedupeKey,
-                previousDedupeAt,
-                null,
-            )
-        }
-
-        var pendingAt = previousPendingAt
-        var pendingFloor = previousPendingFloor
-        var pendingTimeSeconds = previousPendingTimeSeconds
-        var pendingScore = previousPendingScore
-        var pendingGrade = previousPendingGrade
-        if (timestamp - pendingAt > 30_000) {
-            pendingFloor = ""
-            pendingTimeSeconds = 0
-            pendingScore = 0
-            pendingGrade = ""
-        }
-
-        parseCompletionFloor(normalizedMessage)?.let {
-            pendingAt = timestamp
-            pendingFloor = it
-        }
-        if (normalizedMessage.contains("Defeated", true)) {
-            pendingAt = timestamp
-            pendingTimeSeconds = parseCompletionTimeSeconds(normalizedMessage)
-        }
-        parseCompletionScore(normalizedMessage)?.let {
-            pendingAt = timestamp
-            pendingScore = it.first
-            pendingGrade = it.second
-        }
-
-        val cataXp = dungeonCompletionCataXpRegex.find(normalizedMessage)
-            ?.groupValues
-            ?.getOrNull(1)
-            ?.replace(",", "")
-            ?.toLongOrNull()
-        val pending = PendingCompletionState(pendingAt, pendingFloor, pendingTimeSeconds, pendingScore, pendingGrade)
-        if (cataXp == null) return ImportedParseResult(pending, previousDedupeKey, previousDedupeAt, null)
-
-        val floor = pendingFloor.ifBlank { fallbackFloor }
-        val dedupeKey = "$floor:$cataXp:$pendingTimeSeconds:$pendingScore"
-        if (dedupeKey == previousDedupeKey && timestamp - previousDedupeAt < 10_000) {
-            return ImportedParseResult(pending, previousDedupeKey, previousDedupeAt, null)
-        }
-        if (hasRunRecord(existingRuns, floor, cataXp, pendingTimeSeconds, pendingScore, timestamp) ||
-            hasImportedRunRecord(importedRuns, floor, cataXp, pendingTimeSeconds, pendingScore, timestamp)
-        ) {
-            return ImportedParseResult(pending, previousDedupeKey, previousDedupeAt, null)
-        }
-
-        return ImportedParseResult(
-            pending,
-            dedupeKey,
-            timestamp,
-            ImportedDungeonRun(timestamp, floor, pendingTimeSeconds, pendingScore, pendingGrade, cataXp),
-        )
     }
 
     private fun mergeImportedLogRuns(importedRuns: List<ImportedDungeonRun>, fileCount: Int, manual: Boolean) {
@@ -2305,9 +1789,9 @@ class DungeonProgressHudFeature(
         for (run in importedRuns) {
             if (hasRunRecord(run.floorLabel, run.rawCataXp, run.runTimeSeconds, run.score, run.timestamp)) continue
             val normalized = run.rawCataXp.coerceAtLeast(0L)
-            state.samples.add(RunSample(run.timestamp, run.floorLabel, run.rawCataXp, normalized))
             state.runs.add(
                 DungeonRunRecord(
+                    source = "log-import",
                     timestamp = run.timestamp,
                     floorLabel = run.floorLabel,
                     runTimeSeconds = run.runTimeSeconds,
@@ -2319,7 +1803,6 @@ class DungeonProgressHudFeature(
             )
             imported++
         }
-        while (state.samples.size > 100) state.samples.removeAt(0)
         state.lastLogImportAt = System.currentTimeMillis()
         saveState()
         log("Log import complete files=$fileCount parsedRuns=${importedRuns.size} importedRuns=$imported")
@@ -2340,22 +1823,6 @@ class DungeonProgressHudFeature(
         return line.substring(index + marker.length).trim()
     }
 
-    private fun parseLogTimestamp(line: String, file: File): Long {
-        val time = Regex("^\\[(\\d{2}):(\\d{2}):(\\d{2})]").find(line)?.let {
-            LocalTime.of(it.groupValues[1].toInt(), it.groupValues[2].toInt(), it.groupValues[3].toInt())
-        } ?: return file.lastModified()
-        return file.lastModifiedDate().atTime(time).atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
-    }
-
-    private fun File.lastModifiedDate() =
-        java.time.Instant.ofEpochMilli(lastModified()).atZone(ZoneId.systemDefault()).toLocalDate()
-
-    private fun isRecentChatRunSample(raw: Long, normalized: Long): Boolean {
-        val now = System.currentTimeMillis()
-        if (now - lastDungeonCompletionChatAt > 10 * 60 * 1000) return false
-        return raw == lastDungeonCompletionRawXp || normalized == lastDungeonCompletionNormalizedXp
-    }
-
     private fun effectiveXpPerRun(): Long {
         if (xpModeValue() == "Hardcoded") return hardcodedXpPerRunValue()
         return scopedObservedXp().takeIf { it.isNotEmpty() }?.map { it.second }?.average()?.roundToLong()
@@ -2363,21 +1830,24 @@ class DungeonProgressHudFeature(
     }
 
     private fun ChestProfitCandidate.canRecordDirectly(): Boolean =
-        pricingComplete || missingPriceBehavior.get() == 1
+        pricingComplete || selectedMissingPricePolicy() == MissingPriceBehavior.COUNT_AS_ZERO
 
-    private fun ChestProfitCandidate.withKismetCost(cost: Long): ChestProfitCandidate {
-        val applied = if (includeKismetCost.get()) cost.coerceAtLeast(0L) else 0L
-        return if (applied == 0L) this else copy(profit = profit - applied, kismetCost = kismetCost + applied)
-    }
+    private fun currentAccountId(): String = mc.player?.uuid?.toString()?.replace("-", "").orEmpty()
+    private fun currentProfileId(): String = activeSkyBlockProfile()?.first?.toString()?.replace("-", "").orEmpty()
+    private fun owns(account: String, profile: String): Boolean =
+        account.isNotBlank() && profile.isNotBlank() && account == currentAccountId() && profile == currentProfileId()
+    private fun ownedRuns() = HistoryQueries.runs(state, currentAccountId(), currentProfileId())
+    private fun ownedChests() = HistoryQueries.chests(state, currentAccountId(), currentProfileId())
+    private fun ownedDrops() = HistoryQueries.drops(state, currentAccountId(), currentProfileId())
 
     private fun scopedRuns(now: Long = System.currentTimeMillis()): List<DungeonRunRecord> {
         if (state.chestProfitWindowMillis > 0L) {
             val cutoff = now - state.chestProfitWindowMillis
-            return state.runs.filter { it.timestamp >= cutoff }
+            return ownedRuns().filter { it.timestamp >= cutoff }
         }
-        if (trackerModeValue() == "Total") return state.runs
+        if (trackerModeValue() == "Total") return ownedRuns()
         if (sessionStartedAt <= 0L) return emptyList()
-        return state.runs.filter { it.timestamp >= sessionStartedAt }
+        return ownedRuns().filter { it.timestamp >= sessionStartedAt }
     }
 
     private fun scopedXpRuns(): List<DungeonRunRecord> {
@@ -2396,17 +1866,12 @@ class DungeonProgressHudFeature(
      * Completion-chat records are the authoritative run list. Profile refreshes can also observe an
      * XP delta when that chat is unavailable, so retain those samples after removing duplicates.
      */
-    private fun scopedObservedXp(now: Long = System.currentTimeMillis()): List<Pair<Long, Long>> {
-        val runs = scopedXpRuns().map { it.timestamp to it.rawCataXp }
-        val profileOnlySamples = scopedXpSamples(now).filter { sample ->
-            runs.none { (timestamp, xp) ->
-                xp == sample.rawXpDelta && kotlin.math.abs(timestamp - sample.timestamp) < 10 * 60 * 1000L
-            }
-        }.map { it.timestamp to it.rawXpDelta }
-        return (runs + profileOnlySamples).sortedBy { it.first }
-    }
+    private fun scopedObservedXp(now: Long = System.currentTimeMillis()): List<Pair<Long, Long>> =
+        scopedXpRuns().filter { it.timestamp >= state.averagingResetAt }
+            .map { it.timestamp to it.rawCataXp }.sortedBy { it.first }
 
     private fun isInSelectedTrackerScope(timestamp: Long, now: Long): Boolean = when {
+        timestamp > now -> false
         state.chestProfitWindowMillis > 0L -> timestamp >= now - state.chestProfitWindowMillis
         trackerModeValue() == "Total" -> true
         sessionStartedAt > 0L -> timestamp >= sessionStartedAt
@@ -2414,7 +1879,7 @@ class DungeonProgressHudFeature(
     }
 
     private fun scopedKismetUses(now: Long = System.currentTimeMillis()): List<KismetUseSample> =
-        state.kismetUses.filter { isInSelectedTrackerScope(it.timestamp, now) }
+        HistoryQueries.kismets(state, currentAccountId(), currentProfileId()).filter { isInSelectedTrackerScope(it.timestamp, now) }
 
     private fun scopedRunCount(): Int = scopedRuns().size
 
@@ -2425,34 +1890,11 @@ class DungeonProgressHudFeature(
     }
 
     private fun chestProfitStats(): ChestProfitStats {
-        if (state.chestProfitWindowMillis > 0L) {
-            val cutoff = System.currentTimeMillis() - state.chestProfitWindowMillis
-            val samples = state.chestProfits.filter { it.timestamp >= cutoff }
-            val profit = samples.sumOf { it.profit }
-            val chests = samples.size
-            val average = if (chests > 0) {
-                (profit.toDouble() / chests.toDouble()).roundToLong()
-            } else {
-                0L
-            }
-            return ChestProfitStats(formatProfitWindow(state.chestProfitWindowMillis), profit, chests, average)
-        }
-
-        if (trackerModeValue() == "Total") {
-            val average = if (state.totalChestsOpened > 0) {
-                (state.totalChestProfit.toDouble() / state.totalChestsOpened.toDouble()).roundToLong()
-            } else {
-                0L
-            }
-            return ChestProfitStats("total", state.totalChestProfit, state.totalChestsOpened, average)
-        }
-
-        val average = if (sessionChestsOpened > 0) {
-            (sessionChestProfit.toDouble() / sessionChestsOpened.toDouble()).roundToLong()
-        } else {
-            0L
-        }
-        return ChestProfitStats("session", sessionChestProfit, sessionChestsOpened, average)
+        val now = System.currentTimeMillis()
+        val samples = ownedChests().filter { isInSelectedTrackerScope(it.timestamp, now) }
+        val profit = samples.sumOf { it.profit }
+        val label = scopedRunScopeLabel()
+        return ChestProfitStats(label, profit, samples.size, if (samples.isEmpty()) 0 else profit / samples.size)
     }
 
     private fun runSummary(scope: String): RunSummary {
@@ -2470,8 +1912,8 @@ class DungeonProgressHudFeature(
         if (scope.equals("session", true) && sessionStartedAt <= 0L) {
             return RunSummary(label, 0, 0L, 0L, 0, 0, 0L, 0L, 0L, 0L)
         }
-        val runs = state.runs.filter { it.timestamp >= cutoff }
-        val chests = state.chestProfits.filter { it.timestamp >= cutoff }
+        val runs = ownedRuns().filter { it.timestamp >= cutoff }
+        val chests = ownedChests().filter { it.timestamp >= cutoff }
         val runCount = runs.size
         val chestCount = chests.size
         val xp = runs.sumOf { it.rawCataXp }
@@ -2529,7 +1971,7 @@ class DungeonProgressHudFeature(
         return lastVisibilityResult
     }
 
-    private fun drawDirect(graphics: GuiGraphicsExtractor, lines: List<HudLine>) {
+    private fun drawDirect(graphics: GuiGraphicsExtractor) {
         val (title, topRows, bottomRows) = currentHudContent()
         if (topRows.isEmpty() && bottomRows.isEmpty()) return
 
@@ -2541,7 +1983,7 @@ class DungeonProgressHudFeature(
         graphics.pose().scale(renderScale, renderScale)
 
         val fontHeight = mc.font.lineHeight
-        val layout = hudPanelLayout(title, topRows, bottomRows)
+        val layout = hudPanelLayout(topRows, bottomRows)
 
         drawProfitPanel(graphics, layout.width, layout.height, layout.dividerY)
 
@@ -2561,12 +2003,32 @@ class DungeonProgressHudFeature(
         graphics.pose().popMatrix()
     }
 
-    private fun currentHudContent(): Triple<String, List<ProfitHudRow>, List<ProfitHudRow>> =
-        if (currentHudMode() == HUD_MODE_ITEMS) {
-            Triple("Dungeon Item Tracker", buildItemTrackerTopRows(), buildItemTrackerRows())
-        } else {
-            Triple("Dungeon Profit Hud", buildProfitHudTopRows(), buildProfitHudBottomRows())
-        }
+    private data class PresentationSnapshot(
+        val key: List<Any?>,
+        val profitTop: List<ProfitHudRow>, val profitBottom: List<ProfitHudRow>,
+        val itemTop: List<ProfitHudRow>, val itemBottom: List<ProfitHudRow>,
+        val scopeLabel: String,
+    )
+    private var presentation: PresentationSnapshot? = null
+    private fun presentationSnapshot(): PresentationSnapshot {
+        val key = listOf<Any?>(stateRevision, System.currentTimeMillis() / 1000,
+            trackingOwner, floorValue(), data, state.hudViewMode,
+            renderHud.get(), showEverywhere.get(), targetLevel.get(), showCurrentLevel.get(), showCurrentXp.get(), showLevelProgress.get(), showTarget.get(), showRemaining.get(), showFloor.get(), showXpPerRun.get(), showRunsLeft.get(), showProfile.get(), showLastRun.get(), showObservedCount.get(), xpMode.get(), hardcodedXpPerRun.get(), trackChestProfit.get(), showChestProfit.get(), chestProfitMode.get(), showChestCount.get(), showLastChest.get(), includeEssenceProfit.get(), includeDungeonKeyCost.get(), bazaarValuation.get(), auctionValuation.get(), missingPriceBehavior.get(), allowDevonianPriceFallback.get(), includeKismetCost.get())
+        presentation?.takeIf { it.key == key }?.let { return it }
+        return PresentationSnapshot(key, rawProfitHudTopRows(), rawProfitHudBottomRows(),
+            rawItemTrackerTopRows(), rawItemTrackerRows(), chestProfitStats().label).also { presentation = it }
+    }
+    private fun buildProfitHudTopRows() = presentationSnapshot().profitTop
+    private fun buildProfitHudBottomRows() = presentationSnapshot().profitBottom
+    private fun buildItemTrackerTopRows() = presentationSnapshot().itemTop
+    private fun buildItemTrackerRows() = presentationSnapshot().itemBottom
+
+    private fun currentHudContent(): Triple<String, List<ProfitHudRow>, List<ProfitHudRow>> {
+        val snapshot = presentationSnapshot()
+        return if (currentHudMode() == HUD_MODE_ITEMS)
+            Triple("Dungeon Item Tracker", snapshot.itemTop, snapshot.itemBottom)
+        else Triple("Dungeon Profit Hud", snapshot.profitTop, snapshot.profitBottom)
+    }
 
     private fun currentHudMode(): String =
         if (state.hudViewMode == HUD_MODE_ITEMS) HUD_MODE_ITEMS else HUD_MODE_PROFIT
@@ -2577,22 +2039,15 @@ class DungeonProgressHudFeature(
         log("HUD view mode toggled mode=${state.hudViewMode}")
     }
 
-    private fun hudPanelLayout(title: String, topRows: List<ProfitHudRow>, bottomRows: List<ProfitHudRow>): HudPanelLayout {
+    private fun hudPanelLayout(topRows: List<ProfitHudRow>, bottomRows: List<ProfitHudRow>): HudPanelLayout {
         val allRows = sharedHudLayoutRows()
         val labelWidth = allRows.maxOfOrNull { mc.font.width(it.label) } ?: 72
         val valueWidth = allRows.maxOfOrNull { mc.font.width(it.value) + if (it.suffix.isBlank()) 0 else 10 + mc.font.width(it.suffix) } ?: 64
-        val separatorX = HUD_SIDE_PADDING + labelWidth + 8
-        val valueX = separatorX + 8
-        val titleButtonSpace = if (mc.screen is AbstractContainerScreen<*>) {
-            HUD_MODE_BUTTON_WIDTH + HUD_MODE_BUTTON_MARGIN * 2
-        } else {
-            0
-        }
-        val sharedTitleWidth = max(mc.font.width("Dungeon Profit Hud"), mc.font.width("Dungeon Item Tracker"))
-        val width = max(valueX + valueWidth + HUD_SIDE_PADDING, sharedTitleWidth + HUD_SIDE_PADDING * 2 + titleButtonSpace)
-        val dividerY = HUD_TOP_PADDING + HUD_TITLE_HEIGHT + topRows.size * HUD_ROW_HEIGHT + HUD_PROFIT_GAP / 2
-        val height = dividerY + 1 + HUD_PROFIT_GAP + bottomRows.size * HUD_ROW_HEIGHT + HUD_TOP_PADDING
-        return HudPanelLayout(width, dividerY, height, separatorX, valueX)
+        val titleWidth = maxOf(mc.font.width("Dungeon Profit Hud"), mc.font.width("Dungeon Item Tracker"),
+            mc.font.width("(${presentationSnapshot().scopeLabel})"))
+        val layout = HudGeometry.measure(labelWidth, valueWidth, titleWidth, topRows.size, bottomRows.size,
+            mc.screen is AbstractContainerScreen<*>)
+        return HudPanelLayout(layout.width(), layout.dividerY(), layout.height(), layout.separatorX(), layout.valueX())
     }
 
     private fun sharedHudLayoutRows(): List<ProfitHudRow> =
@@ -2610,8 +2065,8 @@ class DungeonProgressHudFeature(
     }
 
     private fun drawProfitScopeLabel(graphics: GuiGraphicsExtractor, layout: HudPanelLayout) {
-        val label = "(${chestProfitStats().label})"
-        val x = (layout.width - HUD_SIDE_PADDING - mc.font.width(label)).coerceAtLeast(layout.valueX)
+        val label = "(${presentationSnapshot().scopeLabel})"
+        val x = (layout.width - HUD_SIDE_PADDING - mc.font.width(label)).coerceAtLeast(HUD_SIDE_PADDING)
         val y = if (currentHudMode() == HUD_MODE_ITEMS) {
             HUD_TOP_PADDING + HUD_TITLE_HEIGHT - 8
         } else {
@@ -2624,7 +2079,7 @@ class DungeonProgressHudFeature(
         if (mc.screen !is AbstractContainerScreen<*>) return false
         if (!renderHud.get() || !isEnabled()) return false
         val (title, topRows, bottomRows) = currentHudContent()
-        val layout = hudPanelLayout(title, topRows, bottomRows)
+        val layout = hudPanelLayout(topRows, bottomRows)
         val drawX = if (x.isFinite()) x else 10.0
         val drawY = if (y.isFinite()) y else 10.0
         val renderScale = scale.takeIf { it.isFinite() && it > 0f } ?: 1f
@@ -2640,7 +2095,7 @@ class DungeonProgressHudFeature(
         return mc.mouseHandler.getScaledXPos(window) to mc.mouseHandler.getScaledYPos(window)
     }
 
-    private fun buildProfitHudTopRows(): List<ProfitHudRow> {
+    private fun rawProfitHudTopRows(): List<ProfitHudRow> {
         val profile = data
         val xpPerRun = effectiveXpPerRun()
         val observedXp = scopedObservedXp()
@@ -2650,13 +2105,14 @@ class DungeonProgressHudFeature(
         val currentLevel = profile?.let { currentCataLevel(it.catacombsExperience) } ?: 0
         return orderProfitRows(
             buildList {
+                if (!historyRepository.writable || historyRepository.error != null) add(ProfitHudRow("historyError", "History", "Save blocked: /dph"))
                 add(ProfitHudRow("sessionTime", "Session Time", sessionDurationText()))
-                if (showCurrentLevel.get()) add(ProfitHudRow("currentLevel", "Cata Level", currentLevel.toString()))
+                if (showCurrentLevel.get()) add(ProfitHudRow("currentLevel", "Cata Level", if (profile == null) "Unknown" else currentLevel.toString()))
                 if (showTarget.get()) add(ProfitHudRow("target", "Target", targetLevelValue().toString()))
                 if (showLevelProgress.get()) add(ProfitHudRow("levelProgress", "Next Level", profile?.let { "${levelProgressPercent(it.catacombsExperience)}%" } ?: "N/A"))
-                if (showRunsLeft.get()) add(ProfitHudRow("runsLeft", "Runs Left", runs?.formatCompact() ?: "N/A"))
+                if (showRunsLeft.get()) add(ProfitHudRow("runsLeft", "Runs Left", runs?.takeIf { profile != null }?.formatCompact() ?: "N/A"))
                 if (showCurrentXp.get()) add(ProfitHudRow("currentXp", "Cata XP", profile?.catacombsExperience?.formatCompact() ?: "N/A"))
-                if (showRemaining.get()) add(ProfitHudRow("remaining", "Remaining", remaining.formatCompact()))
+                if (showRemaining.get()) add(ProfitHudRow("remaining", "Remaining", if (profile == null) "N/A" else remaining.formatCompact()))
                 if (showFloor.get()) add(ProfitHudRow("floor", "Floor", floorValue()))
                 if (showXpPerRun.get()) add(ProfitHudRow("xpPerRun", "XP/Run", xpPerRun.formatCompact(), xpPerHourSuffix()))
                 if (showProfile.get()) add(ProfitHudRow("profile", "Profile", profile?.profileName ?: "N/A"))
@@ -2666,7 +2122,7 @@ class DungeonProgressHudFeature(
         )
     }
 
-    private fun buildProfitHudBottomRows(): List<ProfitHudRow> {
+    private fun rawProfitHudBottomRows(): List<ProfitHudRow> {
         val stats = chestProfitStats()
         return orderProfitRows(
             buildList {
@@ -2678,13 +2134,13 @@ class DungeonProgressHudFeature(
                 add(ProfitHudRow("kismets", "Kismets", scopedKismetUses().size.toString()))
                 add(ProfitHudRow("croesus", "Croesus", croesusUnopenedCountText()))
                 if (showLastChest.get()) {
-                    add(ProfitHudRow("lastChest", "Last Chest", state.lastChestName.ifBlank { "N/A" }, state.lastChestProfit.formatCompactCoins()))
+                    add(ProfitHudRow("lastChest", "Last Chest", ownedChests().lastOrNull { isInSelectedTrackerScope(it.timestamp, System.currentTimeMillis()) }?.chestName ?: "N/A", ownedChests().lastOrNull { isInSelectedTrackerScope(it.timestamp, System.currentTimeMillis()) }?.profit?.formatCompactCoins().orEmpty()))
                 }
             }
         )
     }
 
-    private fun buildItemTrackerTopRows(): List<ProfitHudRow> {
+    private fun rawItemTrackerTopRows(): List<ProfitHudRow> {
         val stats = chestProfitStats()
         return buildList {
             if (showChestCount.get()) add(ProfitHudRow("chestsOpened", "Chests", stats.chests.toString()))
@@ -2739,7 +2195,7 @@ class DungeonProgressHudFeature(
     }
 
     private fun incrementCroesusUnclaimedCount(source: String) {
-        val next = state.croesusUnclaimedCount.takeIf { it >= 0 }?.plus(1) ?: 1
+        val next = state.croesusUnclaimedCount.takeIf { it >= 0 }?.plus(1) ?: return
         setCroesusUnclaimedCount(next, source)
     }
 
@@ -2761,7 +2217,7 @@ class DungeonProgressHudFeature(
             .filter { it.isNotBlank() }
     }
 
-    private fun buildItemTrackerRows(): List<ProfitHudRow> {
+    private fun rawItemTrackerRows(): List<ProfitHudRow> {
         val counts = trackedItemCounts()
         fun count(key: String): Int = counts[key] ?: 0
         return listOf(
@@ -2785,11 +2241,11 @@ class DungeonProgressHudFeature(
     private fun scopedTrackedItemDrops(): List<TrackedItemDropSample> {
         if (state.chestProfitWindowMillis > 0L) {
             val cutoff = System.currentTimeMillis() - state.chestProfitWindowMillis
-            return state.trackedItemDrops.filter { it.timestamp > 0L && it.timestamp >= cutoff }
+            return ownedDrops().filter { it.timestamp > 0L && it.timestamp >= cutoff }
         }
-        if (trackerModeValue() == "Total") return state.trackedItemDrops
+        if (trackerModeValue() == "Total") return ownedDrops()
         if (sessionStartedAt <= 0L) return emptyList()
-        return state.trackedItemDrops.filter { it.timestamp > 0L && it.timestamp >= sessionStartedAt }
+        return ownedDrops().filter { it.timestamp > 0L && it.timestamp >= sessionStartedAt }
     }
 
     private fun orderProfitRows(rows: List<ProfitHudRow>): List<ProfitHudRow> {
@@ -2821,54 +2277,6 @@ class DungeonProgressHudFeature(
         return yOffset
     }
 
-    private fun hudRow(line: HudLine): HudRow {
-        val plain = line.text.colorize().cleanMc()
-        val splitAt = plain.indexOf(':')
-        val label = if (splitAt >= 0) plain.substring(0, splitAt + 1) else plain
-        var value = if (splitAt >= 0) plain.substring(splitAt + 1).trim() else ""
-        var suffix = ""
-        val suffixStart = value.lastIndexOf(" (")
-        if (suffixStart > 0 && value.endsWith(")")) {
-            suffix = value.substring(suffixStart).trim()
-            value = value.substring(0, suffixStart).trim()
-        }
-        return HudRow(line.id, label, value.ifBlank { "..." }, hudIcon(line.id), line.id in ACCENT_VALUE_HUD_LINE_IDS, suffix)
-    }
-
-    private fun hudPanelWidth(rows: List<HudRow>): Int = hudContentWidth(rows) + 10
-
-    private fun hudContentWidth(rows: List<HudRow>): Int {
-        val labelX = 32
-        val labelWidth = rows.maxOfOrNull { mc.font.width(it.label) } ?: 88
-        val valueSepX = max(96, labelX + labelWidth + 6)
-        val valueX = valueSepX + 7
-        val valueWidth = rows.maxOfOrNull {
-            mc.font.width(it.value) + if (it.mutedSuffix.isBlank()) 0 else 5 + mc.font.width(it.mutedSuffix)
-        } ?: 72
-        return max(valueX + valueWidth + 7, 166)
-    }
-
-    private fun hudIcon(id: String): ItemStack = ItemStack(
-        when (id) {
-            "currentLevel" -> Items.SKELETON_SKULL
-            "target" -> Items.COMPASS
-            "levelProgress" -> Items.EXPERIENCE_BOTTLE
-            "runsLeft" -> Items.FEATHER
-            "currentXp" -> Items.NETHER_STAR
-            "remaining" -> Items.REDSTONE
-            "floor" -> Items.MAP
-            "xpPerRun" -> Items.WRITABLE_BOOK
-            "profile" -> Items.PLAYER_HEAD
-            "lastRun" -> Items.CLOCK
-            "observedCount" -> Items.ENDER_EYE
-            "profit" -> Items.GOLD_INGOT
-            "chestsOpened" -> Items.CHEST
-            "lastChest" -> Items.ENDER_CHEST
-            "avgChest" -> Items.EMERALD
-            else -> Items.PAPER
-        }
-    )
-
     private fun drawProfitPanel(graphics: GuiGraphicsExtractor, width: Int, height: Int, dividerY: Int) {
         drawRoundedFill(graphics, 0, 0, width, height, HUD_PROFIT_PANEL)
         drawRoundedBorder(graphics, 0, 0, width, height, HUD_SKETCH_WHITE)
@@ -2898,37 +2306,6 @@ class DungeonProgressHudFeature(
         graphics.fill(x + 2, y + height - 2, x + 4, y + height - 1, color)
         graphics.fill(x + width - 4, y + height - 2, x + width - 2, y + height - 1, color)
         graphics.fill(x + 4, y + height - 1, x + width - 4, y + height, color)
-    }
-
-    private fun drawFramedPanel(graphics: GuiGraphicsExtractor, width: Int, height: Int) {
-        graphics.fill(2, 3, width + 2, height + 3, 0x66000000)
-        graphics.fill(0, 0, width, height, HUD_OUTER_DARK)
-        graphics.fill(3, 3, width - 3, height - 3, HUD_CYAN_DIM)
-        graphics.fill(5, 5, width - 5, height - 5, HUD_INNER_DARK)
-        graphics.fill(9, 9, width - 9, height - 9, HUD_PANEL)
-
-        graphics.fill(0, 0, width, 2, HUD_BLACK)
-        graphics.fill(0, height - 2, width, height, HUD_BLACK)
-        graphics.fill(0, 0, 2, height, HUD_BLACK)
-        graphics.fill(width - 2, 0, width, height, HUD_BLACK)
-
-        val corner = 8
-        graphics.fill(2, 2, corner, 5, HUD_CYAN)
-        graphics.fill(2, 2, 5, corner, HUD_CYAN)
-        graphics.fill(width - corner, 2, width - 2, 5, HUD_CYAN)
-        graphics.fill(width - 5, 2, width - 2, corner, HUD_CYAN)
-        graphics.fill(2, height - 5, corner, height - 2, HUD_CYAN)
-        graphics.fill(2, height - corner, 5, height - 2, HUD_CYAN)
-        graphics.fill(width - corner, height - 5, width - 2, height - 2, HUD_CYAN)
-        graphics.fill(width - 5, height - corner, width - 2, height - 2, HUD_CYAN)
-    }
-
-    private fun drawDashedVertical(graphics: GuiGraphicsExtractor, x: Int, top: Int, bottom: Int) {
-        var y = top
-        while (y < bottom) {
-            graphics.fill(x, y, x + 1, (y + 5).coerceAtMost(bottom), HUD_CYAN)
-            y += 8
-        }
     }
 
     private fun logRenderState(message: String) {
@@ -3005,28 +2382,62 @@ class DungeonProgressHudFeature(
         return MessageSignature(bytes)
     }
 
-    private fun loadState() {
-        state = runCatching {
-            if (!stateFile.exists()) return
-            stateFile.reader().use { gson.fromJson(it, RunState::class.java) }
-        }.getOrNull() ?: RunState()
-        RunStateMigration.migrate(state)
-        if (state.hudViewMode != HUD_MODE_ITEMS) {
-            state.hudViewMode = HUD_MODE_PROFIT
-        }
-        state.hudLineOrder = normalizedHudLineOrder().toMutableList()
-        saveState()
+    private val historyRepository by lazy {
+        HistoryRepository(stateFile.toPath(), { text ->
+            val loaded = gson.fromJson(text, RunState::class.java)
+                ?: error("History contains null instead of a state object")
+            HistoryValidation.validate(loaded)
+            RunStateMigration.migrate(loaded)
+            loaded
+        }, { value: RunState -> gson.toJson(value) })
     }
 
-    private fun saveState() {
-        stateFile.parentFile.mkdirs()
-        val tempFile = File(stateFile.parentFile, "${stateFile.name}.tmp")
-        tempFile.writer().use { gson.toJson(state, it) }
-        runCatching {
-            Files.move(tempFile.toPath(), stateFile.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
-        }.getOrElse {
-            Files.move(tempFile.toPath(), stateFile.toPath(), StandardCopyOption.REPLACE_EXISTING)
+    private fun loadState() {
+        state = historyRepository.load { RunState() }
+        if (!historyRepository.writable) {
+            status = "History unreadable; automatic saving disabled"
+            log("$status: ${historyRepository.error}")
+            return
         }
+        if (state.hudViewMode != HUD_MODE_ITEMS) state.hudViewMode = HUD_MODE_PROFIT
+        state.hudLineOrder = normalizedHudLineOrder().toMutableList()
+    }
+
+    private val historyWriter by lazy { HistoryWriter(historyRepository) }
+
+    private fun saveState() {
+        stateRevision++
+        if (!historyRepository.writable) {
+            status = "History unreadable; saving disabled. Use /dph recoverbackup."
+            return
+        }
+        val snapshot = state.copy(
+            runs = state.runs.map { it.copy() }.toMutableList(),
+            samples = state.samples.map { it.copy() }.toMutableList(),
+            xpIntervals = state.xpIntervals.toMutableList(),
+            importedLogFiles = state.importedLogFiles.toMutableMap(),
+            chestProfits = state.chestProfits.map { it.copy(
+                missingItemIds = it.missingItemIds.toMutableList(),
+                pricedItems = it.pricedItems.map { item -> item.copy() }.toMutableList()) }.toMutableList(),
+            kismetUses = state.kismetUses.map { it.copy() }.toMutableList(),
+            trackedItemDrops = state.trackedItemDrops.map { it.copy() }.toMutableList(),
+            lastMissingItemIds = state.lastMissingItemIds.toMutableList(),
+            hudLineOrder = state.hudLineOrder?.toMutableList(),
+        )
+        historyWriter.submit(snapshot)
+    }
+
+    fun flushHistory() {
+        runCatching { historyWriter.flush() }.onFailure { log("History flush failed: $it") }
+    }
+
+    fun recoverBackup() {
+        flushHistory()
+        runCatching { historyRepository.recoverBackup() }.onSuccess {
+            state = it
+            clearPendingChestTracking()
+            send("Backup recovered; previous file preserved as runs.json.unreadable-<id>.")
+        }.onFailure { send("Backup recovery failed: ${it.message}. Original history preserved.") }
     }
 
     private fun sessionReady(): Boolean = mc.player?.uuid != null && mc.player?.name?.string?.isNotBlank() == true
@@ -3131,19 +2542,17 @@ class DungeonProgressHudFeature(
             recordedXp,
             sessionTracker.elapsedMillis(System.currentTimeMillis()),
         ) ?: return ""
-        return "(${perHour.formatCompact()}/h)"
+        return "(${perHour.formatCompact()}/h session)"
     }
 
     /** Completion chat is preferred, while profile deltas cover runs whose completion chat was missed. */
     private fun sessionRecordedXp(): List<Long> {
         if (sessionStartedAt <= 0L) return emptyList()
-        val runs = state.runs.filter { it.timestamp >= sessionStartedAt && it.rawCataXp > 0L }
-        val profileOnlySamples = state.samples.filter { sample ->
-            sample.timestamp >= sessionStartedAt && sample.rawXpDelta > 0L && runs.none { run ->
-                run.rawCataXp == sample.rawXpDelta && kotlin.math.abs(run.timestamp - sample.timestamp) < 10 * 60 * 1000L
-            }
-        }
-        return runs.map { it.rawCataXp } + profileOnlySamples.map { it.rawXpDelta }
+        val runs = ownedRuns().filter { it.timestamp >= sessionStartedAt && it.rawCataXp > 0L }
+        val unattributed = state.xpIntervals.filter {
+            owns(it.accountId, it.profileId) && it.start >= sessionStartedAt
+        }.map { interval -> XpReconciliation.unattributed(interval, runs.map { it.timestamp to it.rawCataXp }) }
+        return runs.map { it.rawCataXp } + unattributed
     }
 
     private fun Long.formatCompact(): String {
@@ -3180,158 +2589,6 @@ class DungeonProgressHudFeature(
         DungeonProgressHudAddon.debug(message)
     }
 
-    data class RunState(
-        var samples: MutableList<RunSample> = mutableListOf(),
-        var lastCatacombsXp: Long = 0,
-        var lastPlayerUuid: String = "",
-        var runs: MutableList<DungeonRunRecord> = mutableListOf(),
-        var chestProfits: MutableList<ChestProfitSample> = mutableListOf(),
-        var lastChestName: String = "",
-        var lastChestProfit: Long = 0,
-        var totalChestProfit: Long = 0,
-        var totalChestsOpened: Int = 0,
-        var chestProfitWindowMillis: Long = 0,
-        var lastLogImportAt: Long = 0,
-        var hudViewMode: String = HUD_MODE_PROFIT,
-        var trackedItemDrops: MutableList<TrackedItemDropSample> = mutableListOf(),
-        var croesusUnclaimedCount: Int = -1,
-        var totalKismetsUsed: Int = 0,
-        var kismetUses: MutableList<KismetUseSample> = mutableListOf(),
-        var lastMissingItemIds: MutableList<String> = mutableListOf(),
-        var hudLineOrder: MutableList<String>? = DEFAULT_HUD_LINE_ORDER.toMutableList(),
-    )
-
-    data class RunSample(
-        var timestamp: Long = 0,
-        var floorLabel: String = "M7",
-        var rawXpDelta: Long = 0,
-        var normalizedXpDelta: Long = 0,
-    )
-
-    data class DungeonRunRecord(
-        var timestamp: Long = 0,
-        var floorLabel: String = "M7",
-        var runTimeSeconds: Int = 0,
-        var score: Int = 0,
-        var grade: String = "",
-        var rawCataXp: Long = 0,
-        var normalizedCataXp: Long = 0,
-    )
-
-    data class ChestProfitSample(
-        var timestamp: Long = 0,
-        var chestName: String = "",
-        var profit: Long = 0,
-        var grossValue: Long = 0,
-        var chestCoinCost: Long = 0,
-        var keyCost: Long = 0,
-        var kismetCost: Long = 0,
-        var pricingComplete: Boolean = true,
-        var missingItemIds: MutableList<String> = mutableListOf(),
-        var pricedItems: MutableList<PricedChestItem> = mutableListOf(),
-        var detailsVersion: Int = 0,
-        var profileName: String = "",
-        var floorLabel: String = "M7",
-    )
-
-    data class TrackedItemDropSample(
-        var timestamp: Long = 0,
-        var itemKey: String = "",
-        var displayName: String = "",
-        var chestName: String = "",
-        var floorLabel: String = "M7",
-        var profileName: String = "",
-    )
-
-    data class KismetUseSample(
-        var timestamp: Long = 0,
-        var chestName: String = "",
-        var cost: Long = 0,
-        var profileName: String = "",
-        var floorLabel: String = "M7",
-    )
-
-    data class ChestProfitCandidate(
-        val chestName: String,
-        val profit: Long,
-        val cost: Int,
-        val itemCount: Int,
-        val scannedSlots: Int,
-        val trackedDrops: List<TrackedDrop> = emptyList(),
-        val grossValue: Long = profit + cost,
-        val chestCoinCost: Long = cost.toLong(),
-        val keyCost: Long = 0,
-        val kismetCost: Long = 0,
-        val pricingComplete: Boolean = true,
-        val missingItemIds: List<String> = emptyList(),
-        val pricedItems: List<PricedChestItem> = emptyList(),
-    ) {
-        fun summary(): String = "chest=$chestName profit=$profit gross=$grossValue cost=$cost kismet=$kismetCost complete=$pricingComplete missing=${missingItemIds.joinToString()} items=$itemCount scannedSlots=$scannedSlots tracked=${trackedDrops.joinToString { it.key }}"
-    }
-
-    data class ChestProfitItem(
-        val itemId: String,
-        val amount: Int,
-        val essence: Boolean,
-        val trackedDrop: TrackedDrop? = null,
-    )
-
-    data class ProfileData(
-        val playerName: String,
-        val playerUuid: String,
-        val profileName: String,
-        val catacombsExperience: Long,
-    )
-
-    data class ProfileRequest(
-        val playerName: String,
-        val playerUuid: UUID,
-    )
-
-    data class ChestProfitStats(
-        val label: String,
-        val profit: Long,
-        val chests: Int,
-        val average: Long,
-    )
-
-    data class RunSummary(
-        val label: String,
-        val runs: Int,
-        val xp: Long,
-        val profit: Long,
-        val chests: Int,
-        val averageRunTimeSeconds: Int,
-        val profitPerRun: Long,
-        val profitPerChest: Long,
-        val profitPerHour: Long,
-        val xpPerHour: Long,
-    )
-
-    data class PendingCompletionState(
-        val timestamp: Long,
-        val floor: String,
-        val runTimeSeconds: Int,
-        val score: Int,
-        val grade: String,
-    )
-
-    data class ImportedDungeonRun(
-        val timestamp: Long,
-        val floorLabel: String,
-        val runTimeSeconds: Int,
-        val score: Int,
-        val grade: String,
-        val rawCataXp: Long,
-    )
-
-    data class ImportedParseResult(
-        val pending: PendingCompletionState,
-        val lastDedupeKey: String,
-        val lastDedupeAt: Long,
-        val run: ImportedDungeonRun?,
-    )
-
     private val cumulativeCatacombsXp = listOf(
         50L, 125L, 235L, 395L, 625L, 955L, 1425L, 2095L, 3045L, 4385L,
         6275L, 8940L, 12700L, 17960L, 25340L, 35640L, 50040L, 70040L, 97640L, 135640L,
@@ -3345,7 +2602,7 @@ class DungeonProgressHudFeature(
 
     private val chestNames = setOf("Wood", "Gold", "Diamond", "Emerald", "Obsidian", "Bedrock")
     private val runChestRegex = "^(?:Master )?Catacombs - Floor [IV]+$".toRegex()
-    private val costRegex = "^(\\d[\\d,]+) Coins$".toRegex()
+    private val costRegex = "^(\\d[\\d,]*) Coins$".toRegex()
     private val enchantedBookRegex = "^Enchanted Book \\(([\\w ]+) ([IV]+)\\)$".toRegex()
     private val essenceRegex = "^(Wither|Undead) Essence x(\\d+)$".toRegex()
     private val dungeonCompletionCataXpRegex = "\\+([\\d,]+)\\s+Cata EXP".toRegex()

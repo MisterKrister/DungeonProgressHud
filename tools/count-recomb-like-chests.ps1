@@ -15,6 +15,7 @@ $hits = @($samples | Where-Object {
     [int64]$_.profit -ge $MinProfit -and [int64]$_.profit -le $MaxProfit
 })
 
+Write-Host "Heuristic only: profit range over retained records does not identify Recombobulators. Older history may be incomplete."
 Write-Host "File: $Path"
 Write-Host "Total chest samples: $($samples.Count)"
 Write-Host "Profit range: $MinProfit to $MaxProfit"

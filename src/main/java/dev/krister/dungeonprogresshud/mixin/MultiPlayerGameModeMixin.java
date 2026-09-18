@@ -13,6 +13,6 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 public abstract class MultiPlayerGameModeMixin {
     @Inject(method = "handleContainerInput", at = @At("HEAD"))
     private void dungeonprogresshud$trackChestClaim(int containerId, int slotId, int button, ContainerInput input, Player player, CallbackInfo ci) {
-        DungeonProgressHudAddon.INSTANCE.onInventoryClick(slotId, button, input);
+        DungeonProgressHudAddon.INSTANCE.onInventoryClick(containerId, slotId, button, input);
     }
 }

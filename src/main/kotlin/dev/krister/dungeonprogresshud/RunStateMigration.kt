@@ -1,10 +1,10 @@
 package dev.krister.dungeonprogresshud
 
 internal object RunStateMigration {
-    fun migrate(state: DungeonProgressHudFeature.RunState) {
+    fun migrate(state: RunState) {
         state.chestProfits.filter { it.detailsVersion <= 0 }.forEach { old ->
-            // Historical profit is authoritative. New fields must never trigger repricing.
-            old.pricingComplete = true
+            // Preserve historical amounts without inventing itemized pricing provenance.
+            old.pricingComplete = false
             old.missingItemIds = mutableListOf()
             old.pricedItems = mutableListOf()
         }
