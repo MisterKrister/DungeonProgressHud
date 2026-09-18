@@ -74,9 +74,9 @@ internal class DungeonSessionTracker(
 }
 
 internal object DungeonActivityDetector {
-    private val shortFloorRegex = "\\b([FM])\\s*([1-7])\\b".toRegex(RegexOption.IGNORE_CASE)
-    private val masterFloorRegex = "master (?:mode|catacombs)\\s*(?:-|:)?\\s*(?:floor\\s*)?([ivx]+|[1-7])".toRegex(RegexOption.IGNORE_CASE)
-    private val normalFloorRegex = "(?:the )?catacombs\\s*(?:-|:)?\\s*(?:floor\\s*)?([ivx]+|[1-7])".toRegex(RegexOption.IGNORE_CASE)
+    private val shortFloorRegex = "^([FM])\\s*([1-7])$".toRegex(RegexOption.IGNORE_CASE)
+    private val dungeonFloorRegex = ("(?:master\\s+(?:mode\\s+)?(?:the\\s+)?catacombs|master\\s+mode|(?:the\\s+)?catacombs)" +
+        "\\s*[-,:(]*\\s*(?:\\[MM]\\s*)?(?:floor\\s*)?([FM]?[1-7]|VII|VI|IV|V|III|II|I)\\b").toRegex(RegexOption.IGNORE_CASE)
 
     fun isActiveDungeon(area: String?, subarea: String?, scoreboard: String, tabList: List<String>): Boolean {
         val location = listOfNotNull(area, subarea).joinToString("\n").lowercase()
@@ -103,9 +103,13 @@ internal object DungeonActivityDetector {
     }
 
     private fun detectFloorInText(text: String): String? {
-        shortFloorRegex.find(text)?.let { return "${it.groupValues[1].uppercase()}${it.groupValues[2]}" }
-        masterFloorRegex.find(text)?.let { return romanFloor("M", it.groupValues[1]) }
-        normalFloorRegex.find(text)?.let { return romanFloor("F", it.groupValues[1]) }
+        val clean = text.replace(Regex("§."), "").replace('\u00a0', ' ')
+        dungeonFloorRegex.find(clean)?.let {
+            val value = it.groupValues[1].uppercase()
+            if (value.startsWith("M") || value.startsWith("F")) return value
+            return romanFloor(if (it.value.startsWith("master", true)) "M" else "F", value)
+        }
+        shortFloorRegex.matchEntire(clean.trim())?.let { return "${it.groupValues[1].uppercase()}${it.groupValues[2]}" }
         return null
     }
 

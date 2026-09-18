@@ -84,6 +84,14 @@ class DungeonSessionTrackerTest {
 }
 
 class DungeonActivityDetectorTest {
+    @Test fun `live formatted scoreboard wins over stale location and unrelated floor strings`() {
+        assertEquals("F7", DungeonActivityDetector.detectFloor("Catacombs - Floor V", null,
+            "§7[F5] Player\n§cThe Catacombs §7(§eF7§7)", listOf("Party: F5")))
+        assertNull(DungeonActivityDetector.detectFloor(null, null, "Player F5", listOf("Party: M7")))
+        assertEquals("M7", DungeonActivityDetector.detectFloor(null, null, "Master Mode The Catacombs - Floor VII Stats", emptyList()))
+        assertEquals("M7", DungeonActivityDetector.detectFloor(null, null, "Master Mode The Catacombs - [MM] Floor VII", emptyList()))
+    }
+
     @Test
     fun `catacombs scoreboard or tab markers detect active dungeon`() {
         assertTrue(DungeonActivityDetector.isActiveDungeon(null, null, "The Catacombs (M7)", emptyList()))

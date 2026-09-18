@@ -17,6 +17,8 @@ data class RunState(
     var lastPlayerUuid: String = "",
     var runs: MutableList<DungeonRunRecord> = mutableListOf(),
     var chestProfits: MutableList<ChestProfitSample> = mutableListOf(),
+    var pendingChestClaims: MutableList<PendingChestClaim> = mutableListOf(),
+    var medianPricingDefaultApplied: Boolean = false,
     var lastChestName: String = "",
     var lastChestProfit: Long = 0,
     var totalChestProfit: Long = 0,

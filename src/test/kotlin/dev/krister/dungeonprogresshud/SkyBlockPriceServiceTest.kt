@@ -28,9 +28,9 @@ class SkyBlockPriceServiceTest {
         var options = PricingOptions()
         val service = SkyBlockPriceService(provider, { options }, devonianPrice = { 0.0 })
 
-        assertEquals(500.0, service.quote("ITEM").unitPrice)
-        options = options.copy(auctionValuation = AuctionValuation.MEDIAN)
         assertEquals(600.0, service.quote("ITEM").unitPrice)
+        options = options.copy(auctionValuation = AuctionValuation.LOWEST_BIN)
+        assertEquals(500.0, service.quote("ITEM").unitPrice)
         options = options.copy(auctionValuation = AuctionValuation.MEAN)
         assertEquals(700.0, service.quote("ITEM").unitPrice)
     }

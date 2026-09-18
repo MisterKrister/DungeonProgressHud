@@ -5,6 +5,29 @@ import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 class HistoryQueriesTest {
+    @Test fun `total restores the saved lifetime remainder without adding it to sessions`() {
+        val state = RunState(totalChestProfit = 5_616_579_005L, totalChestsOpened = 922,
+            chestProfits = MutableList(250) { ChestProfitSample(timestamp = 1, profit = 2_000_000) }
+                .apply { add(ChestProfitSample(timestamp = 2, profit = 18_595_581)) })
+        val total = HistoryQueries.profitStats(state, "a", "p", "total", true) { true }
+        assertEquals(5_616_579_005L, total.profit)
+        assertEquals(922, total.chests)
+        assertEquals(5_616_579_005L / 922, total.average)
+        assertEquals(18_595_581, HistoryQueries.profitStats(state, "a", "p", "session", false) { it >= 2 }.profit)
+        state.chestProfits.add(ChestProfitSample(accountId = "other", profileId = "p", profit = 10))
+        state.totalChestsOpened++
+        state.totalChestProfit += 10
+        assertEquals(total, HistoryQueries.profitStats(state, "a", "p", "total", true) { true })
+    }
+
+    @Test fun `truncated losses and complete history are not inflated`() {
+        val state = RunState(totalChestProfit = -100, totalChestsOpened = 2,
+            chestProfits = mutableListOf(ChestProfitSample(profit = 10)))
+        assertEquals(-100, HistoryQueries.profitStats(state, "a", "p", "total", true) { true }.profit)
+        state.totalChestsOpened = 1
+        assertEquals(10, HistoryQueries.profitStats(state, "a", "p", "total", true) { true }.profit)
+    }
+
     @Test fun `legacy chest profit is visible without assigning ownership or mixing known profiles`() {
         val legacy = ChestProfitSample(timestamp = 10, profit = 61069)
         val state = RunState(chestProfits = mutableListOf(legacy,

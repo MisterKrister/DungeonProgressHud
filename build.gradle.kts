@@ -6,7 +6,7 @@ plugins {
     kotlin("plugin.serialization") version "2.3.20"
 }
 
-version = "1.0.12"
+version = "1.0.14"
 group = "dev.krister"
 
 base {

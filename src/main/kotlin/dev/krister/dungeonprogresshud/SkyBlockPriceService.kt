@@ -1,6 +1,14 @@
 package dev.krister.dungeonprogresshud
 
 import com.github.synnerz.devonian.api.SkyblockPrices
+import com.google.gson.JsonObject
+import com.google.gson.JsonParser
+import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
+import java.time.Duration
+import java.util.concurrent.CompletableFuture
 import tech.thatgravyboat.skyblockapi.api.remote.hypixel.pricing.BazaarAPI
 import tech.thatgravyboat.skyblockapi.api.remote.hypixel.pricing.LowestBinAPI
 
@@ -35,7 +43,7 @@ enum class MissingPriceBehavior { MARK_INCOMPLETE, COUNT_AS_ZERO }
 
 data class PricingOptions(
     val bazaarValuation: BazaarValuation = BazaarValuation.INSTANT_BUY,
-    val auctionValuation: AuctionValuation = AuctionValuation.LOWEST_BIN,
+    val auctionValuation: AuctionValuation = AuctionValuation.MEDIAN,
     val allowDevonianWhileLoading: Boolean = true,
 )
 
@@ -64,17 +72,60 @@ data class PricingHealth(
 }
 
 object SkyBlockApiPriceDataProvider : PriceDataProvider {
-    override fun bazaar(itemId: String): BazaarPrice? = BazaarAPI.getProduct(itemId)?.let {
-        // Hypixel's sellPrice is the current instant-buy price; buyPrice is instant-sell.
-        BazaarPrice(instantBuy = it.sellPrice, instantSell = it.buyPrice)
+    @Volatile private var bazaarPrices: Map<String, BazaarPrice> = emptyMap()
+    @Volatile private var auctionPrices: Map<String, AuctionPrice> = emptyMap()
+    @Volatile var refreshedAt: Long = 0L
+        private set
+    private val http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build()
+
+    // The bundled API has no refresh method and polls only every two hours.
+    // Fetch the same public feeds off the game thread; publish only complete snapshots.
+    fun refresh(): CompletableFuture<Void> {
+        fun fetch(url: String) = http.sendAsync(HttpRequest.newBuilder(URI.create(url))
+            .timeout(Duration.ofSeconds(25)).header("User-Agent", "DungeonProgressHud").GET().build(),
+            HttpResponse.BodyHandlers.ofString()).thenApply { response ->
+                check(response.statusCode() == 200) { "Price feed HTTP ${response.statusCode()}" }
+                JsonParser.parseString(response.body()).asJsonObject
+            }
+        val bazaar = fetch("https://api.hypixel.net/v2/skyblock/bazaar").thenApply(PriceFeedParser::bazaar)
+        val auctions = fetch("https://skyblock-pv.thatgravyboat.tech/auctions").thenApply(PriceFeedParser::auctions)
+        return CompletableFuture.allOf(bazaar, auctions).thenRun {
+            bazaarPrices = bazaar.join()
+            auctionPrices = auctions.join()
+            refreshedAt = System.currentTimeMillis()
+        }
     }
 
-    override fun auction(itemId: String): AuctionPrice? = LowestBinAPI.getPrice(itemId)?.let {
+    override fun bazaar(itemId: String): BazaarPrice? = bazaarPrices[itemId] ?: BazaarAPI.getProduct(itemId)?.let {
+        // quick_status contains volume-weighted averages for each in-game transaction side.
+        BazaarPrice(instantBuy = it.buyPrice, instantSell = it.sellPrice)
+    }
+
+    override fun auction(itemId: String): AuctionPrice? = auctionPrices[itemId] ?: LowestBinAPI.getPrice(itemId)?.let {
         AuctionPrice(it.lowest.toDouble(), it.median.toDouble(), it.mean)
     }
 
-    override fun bazaarItemCount(): Int = BazaarAPI.products.size
-    override fun auctionItemCount(): Int = LowestBinAPI.items.size
+    override fun bazaarItemCount(): Int = bazaarPrices.size.takeIf { it > 0 } ?: BazaarAPI.products.size
+    override fun auctionItemCount(): Int = auctionPrices.size.takeIf { it > 0 } ?: LowestBinAPI.items.size
+}
+
+internal object PriceFeedParser {
+    fun bazaar(json: JsonObject): Map<String, BazaarPrice> {
+        require(json["success"]?.asBoolean == true) { "Bazaar feed unsuccessful" }
+        return json.getAsJsonObject("products").entrySet().associate { (id, product) ->
+            val status = product.asJsonObject.getAsJsonObject("quick_status")
+            id to BazaarPrice(number(status, "buyPrice"), number(status, "sellPrice"))
+        }.also { require(it.isNotEmpty()) { "Empty Bazaar feed" } }
+    }
+
+    fun auctions(json: JsonObject): Map<String, AuctionPrice> = json.entrySet().associate { (id, item) ->
+        val price = item.asJsonObject
+        id to AuctionPrice(number(price, "lowest"), number(price, "median"), number(price, "mean"))
+    }.also { require(it.isNotEmpty()) { "Empty auction feed" } }
+
+    private fun number(json: JsonObject, key: String): Double = json[key]?.asDouble?.also {
+        require(it.isFinite() && it >= 0) { "Invalid $key price" }
+    } ?: 0.0
 }
 
 class SkyBlockPriceService(
@@ -144,6 +195,7 @@ private val SKYBLOCK_ID_ALIASES = mapOf(
     "SHADOW_WARP" to "SHADOW_WARP_SCROLL",
     "WARPED_STONE" to "AOTE_STONE",
     "SPIRIT_STONE" to "SPIRIT_DECOY",
+    "NECRONS_HANDLE" to "NECRON_HANDLE",
 )
 
 internal fun normalizeSkyBlockId(itemId: String): String {

@@ -9,7 +9,6 @@ import com.github.synnerz.devonian.config.Categories
 import com.github.synnerz.devonian.config.Config
 import com.github.synnerz.devonian.config.ConfigData
 import com.github.synnerz.devonian.hud.texthud.TextHudFeature
-import com.github.synnerz.devonian.utils.StringUtils
 import com.google.gson.GsonBuilder
 import com.google.gson.JsonArray
 import com.google.gson.JsonObject
@@ -464,8 +463,8 @@ class DungeonProgressHudFeature(
     private val includeEssenceProfit = addSwitch("36_includeEssenceProfit", true, "Include essence value in chest profit.", "Include Essence", emptySet(), false, configTab)
     private val includeDungeonKeyCost = addSwitch("37_includeDungeonKeyCost", false, "Subtract Dungeon Chest Key value when a reward chest requires one.", "Count Dungeon Key Cost", emptySet(), false, configTab)
     private val bazaarValuation = addSelection("38_bazaarValuation", 0, listOf("Instant Buy", "Instant Sell"), "Choose the Bazaar side used to value rewards.", "Bazaar Valuation", emptySet(), configTab)
-    private val auctionValuation = addSelection("39_auctionValuation", 0, listOf("Lowest BIN", "Median", "Mean"), "Choose the auction statistic used to value non-Bazaar rewards.", "Auction Valuation", emptySet(), configTab)
-    private val missingPriceBehavior = addSelection("3a_missingPriceBehavior", 0, listOf("Mark Chest Incomplete", "Count Missing As Zero"), "Choose whether incomplete pricing blocks a DPH chest record.", "Missing Prices", emptySet(), configTab)
+    private val auctionValuation = addSelection("39_auctionValuation", 1, listOf("Lowest BIN", "Median", "Mean"), "Median limits the effect of extreme listings; choose the statistic used for auction rewards.", "Auction Valuation", emptySet(), configTab)
+    private val missingPriceBehavior = addSelection("3a_missingPriceBehavior", 0, listOf("Mark Chest Incomplete", "Count Missing As Zero"), "Incomplete confirmed chests are saved and retried when prices load.", "Missing Prices", emptySet(), configTab)
     private val allowDevonianPriceFallback = addSwitch("3b_allowDevonianPriceFallback", true, "Use Devonian prices only while a SkyBlockAPI cache is still loading.", "Devonian Loading Fallback", emptySet(), false, configTab)
     private val includeKismetCost = addSwitch("3c_includeKismetCost", true, "Subtract Kismet Feather value from the associated chest.", "Count Kismet Cost", emptySet(), false, configTab)
 
@@ -531,6 +530,10 @@ class DungeonProgressHudFeature(
     private val sessionStartedAt: Long
         get() = sessionTracker.startedAt
     private var detectedFloorLabel = ""
+    private var nextPriceRefreshAt = 0L
+    private var priceRefreshInProgress = false
+    private var priceRefreshError: String? = null
+    private var nextPendingPriceRetryAt = 0L
     private var draggedHudLineId: String? = null
     private var hoveredHudLineId: String? = null
     private var settingsLoaded = false
@@ -547,7 +550,6 @@ class DungeonProgressHudFeature(
                     allowDevonianWhileLoading = allowDevonianPriceFallback.get(),
                 )
             },
-            hardcodedPrices = hardcodedItemPrices.mapValues { it.value.toDouble() },
         )
     }
     private val chestProfitCalculator by lazy { ChestProfitCalculator(priceService) }
@@ -588,6 +590,7 @@ class DungeonProgressHudFeature(
             return
         }
         lastServerJoinEventAt = joinedAt
+        nextPriceRefreshAt = joinedAt + 10_000L
         joinRefreshStartedAt = joinedAt
         joinRefreshAttempts = 0
         nextJoinRefreshAttemptAt = 0L
@@ -715,9 +718,17 @@ class DungeonProgressHudFeature(
         val now = System.currentTimeMillis()
         val scoreboard = getScoreboardText()
         val tabList = tabListLines()
-        DungeonActivityDetector.detectFloor(Location.area, Location.subarea, scoreboard, tabList)?.let {
+        val completionFloor = pendingCompletionFloor.takeIf { it.isNotBlank() && now - pendingCompletionAt in 0..30_000 }
+        (DungeonActivityDetector.detectFloor(null, null, scoreboard, emptyList()) ?: completionFloor
+            ?: DungeonActivityDetector.detectFloor(Location.area, Location.subarea, "", tabList))?.let {
             detectedFloorLabel = it
         }
+        if (settingsLoaded && !state.medianPricingDefaultApplied) {
+            auctionValuation.set(1)
+            state.medianPricingDefaultApplied = true
+            saveState()
+        }
+        maybeRefreshPrices(now)
         sessionTracker.observeDungeon(isActiveDungeon(scoreboard, tabList), now)
         val refreshedForSkyBlockJoin = maybeRefreshAfterSkyBlockJoin()
         val refreshedForJoin = if (!refreshedForSkyBlockJoin) maybeRefreshAfterServerJoin() else false
@@ -739,6 +750,30 @@ class DungeonProgressHudFeature(
         }
         wasVisible = visible
         setLines(buildLines())
+    }
+
+    private fun maybeRefreshPrices(now: Long) {
+        if (!isEnabled() || !sessionReady()) return
+        if (nextPriceRefreshAt == 0L) nextPriceRefreshAt = now + 10_000L
+        if (!priceRefreshInProgress && now >= nextPriceRefreshAt) {
+            priceRefreshInProgress = true
+            SkyBlockApiPriceDataProvider.refresh().whenComplete { _, error ->
+                mc.execute {
+                    priceRefreshInProgress = false
+                    priceRefreshError = error?.let(::profileFailureMessage)
+                    nextPriceRefreshAt = System.currentTimeMillis() + if (error == null) 300_000L else 30_000L
+                    nextPendingPriceRetryAt = 0L
+                    lastChestScanKey = ""
+                    log("Price refresh ${priceRefreshError ?: "complete"}")
+                }
+            }
+        }
+        if (trackChestProfit.get() && now >= nextPendingPriceRetryAt && state.pendingChestClaims.isNotEmpty()) {
+            nextPendingPriceRetryAt = now + 5_000L
+            val recorded = ChestRecorder.retryPending(state, priceService)
+            if (recorded > 0) log("Resolved pricing for $recorded saved chest claims")
+            saveState()
+        }
     }
 
     private fun maybeRefreshAfterSkyBlockJoin(): Boolean {
@@ -999,6 +1034,8 @@ class DungeonProgressHudFeature(
         val last = health.lastQuote
         send("Prices: ${health.status}; Bazaar ${health.bazaarItemCount} items (${bazaarValuation.options[bazaarValuation.get().coerceIn(bazaarValuation.options.indices)]}), auction ${health.auctionItemCount} items (${auctionValuation.options[auctionValuation.get().coerceIn(auctionValuation.options.indices)]}).")
         send("Devonian loading fallback: ${if (allowDevonianPriceFallback.get()) "enabled" else "disabled"}${if (health.fallbackActive) " (active)" else ""}.")
+        val refreshedAt = SkyBlockApiPriceDataProvider.refreshedAt
+        send("Refresh: ${if (priceRefreshInProgress) "in progress" else if (refreshedAt > 0) "${(System.currentTimeMillis() - refreshedAt) / 1000}s ago" else "waiting"}${priceRefreshError?.let { "; $it" }.orEmpty()}. Pending chests: ${state.pendingChestClaims.size}.")
         if (state.lastMissingItemIds.isNotEmpty()) send("Last chest missing: ${state.lastMissingItemIds.joinToString()}.")
         if (last != null) send("Last quote: ${last.itemId} via ${last.source} at ${LocalDateTime.ofInstant(java.time.Instant.ofEpochMilli(last.quotedAt), ZoneId.systemDefault()).format(DateTimeFormatter.ISO_LOCAL_TIME)}.")
     }
@@ -1006,7 +1043,7 @@ class DungeonProgressHudFeature(
     fun onInventoryClick(containerId: Int, slotId: Int, button: Int, clickType: ContainerInput) {
         if (!isEnabled() || !trackChestProfit.get()) return
         val screen = currentChestScreen() ?: return
-        if (screen.menu.containerId != containerId || button != 0 || clickType != ContainerInput.PICKUP) return
+        if (screen.menu.containerId != containerId || !ChestConfirmation.acceptsClick(button, clickType.name)) return
         val title = screen.title.string
         if (title == "Croesus") {
             clearPendingChestTracking()
@@ -1060,13 +1097,7 @@ class DungeonProgressHudFeature(
                 ChestConfirmation.rerolled(plainLore(it))
             } == true
         }
-        if (reroll != null) {
-            val (name, quote) = reroll.value
-            val cost = quote.unitPrice?.roundToLong()?.coerceAtLeast(0) ?: 0L
-            state.totalKismetsUsed++
-            state.kismetUses.add(KismetUseSample(now, name, cost, data?.profileName.orEmpty(), chestContextFloor, currentAccountId(), currentProfileId(), reroll.claimId, quote.available, quote.source))
-            saveState()
-        }
+        reroll?.let(::recordConfirmedKismet)
         claimAttempts.confirm(containerId, now) { candidate ->
             stacks.any { stack ->
                 val sameChest = screen.title.string == candidate.chestName ||
@@ -1075,6 +1106,17 @@ class DungeonProgressHudFeature(
             }
         }?.let { recordChestProfit(it.value, "server-confirmed", it.claimId) }
         lastChestScanKey = ""
+    }
+
+    private fun recordConfirmedKismet(attempt: ChestAttemptTracker.Attempt<Pair<String, PriceQuote>>) {
+        val (name, quote) = attempt.value
+        val now = System.currentTimeMillis()
+        val cost = quote.unitPrice?.roundToLong()?.coerceAtLeast(0) ?: 0L
+        state.totalKismetsUsed++
+        state.kismetUses.add(KismetUseSample(now, name, cost, data?.profileName.orEmpty(), chestContextFloor,
+            currentAccountId(), currentProfileId(), attempt.claimId, quote.available, quote.source))
+        ensureSessionStarted(now, "kismet-use")
+        saveState()
     }
 
     fun onFakeOpenKey(screen: AbstractContainerScreen<*>): Boolean {
@@ -1123,7 +1165,7 @@ class DungeonProgressHudFeature(
                     chestContextFloor = DungeonActivityDetector.detectFloor(null, null, title, emptyList()) ?: "N/A"
                     val candidates = parseCroesusCandidatesFromScreen(screen)
                     selectedCroesusCandidate?.chestName?.let { candidates[it] }
-                        ?: candidates.values.filter { it.canRecordDirectly() }.maxByOrNull { it.profit }
+                        ?: candidates.values.maxByOrNull { it.profit }
                 }
                 else -> null
             }
@@ -1412,12 +1454,15 @@ class DungeonProgressHudFeature(
 
         val costs = chestCosts(plainLore) ?: return null
         val parsedItems = mutableListOf<ChestProfitItem>()
+        val unknownItems = mutableListOf<String>()
         val trackedDrops = mutableListOf<TrackedDrop>()
         val containerSlotCount = chestContainerSlotCount(items.size)
 
         for (stack in (9..18).mapNotNull(items::getOrNull)) {
             if (stack.isEmpty || stack.item == Items.GRAY_STAINED_GLASS_PANE || stack.item == Items.BLACK_STAINED_GLASS_PANE) continue
-            parseChestItem(stack)?.let {
+            val parsed = parseChestItem(stack)
+            if (parsed == null) unknownItems.add("UNPARSED_REWARD:${stack.hoverName.string.cleanMc()}")
+            parsed?.let {
                 parsedItems.add(it)
                 it.trackedDrop?.let(trackedDrops::add)
                 if (verbose) {
@@ -1426,8 +1471,9 @@ class DungeonProgressHudFeature(
             }
         }
 
-        if (parsedItems.isEmpty()) return null
-        return calculateChestCandidate(title, parsedItems, costs, containerSlotCount, trackedDrops)
+        if (parsedItems.isEmpty() && unknownItems.isEmpty()) return null
+        val candidate = calculateChestCandidate(title, parsedItems, costs, containerSlotCount, trackedDrops)
+        return candidate.copy(missingItemIds = candidate.missingItemIds + unknownItems)
     }
 
     private fun chestScreenScanKey(screen: AbstractContainerScreen<*>): String {
@@ -1487,7 +1533,7 @@ class DungeonProgressHudFeature(
     }
 
     private fun parseCroesusChestItem(chestName: String, stack: ItemStack, slot: Int): ChestProfitCandidate? {
-        val parsed = ChestLoreParser.parse(plainLore(stack)) { parseCroesusLoreItem(it, it) }
+        val parsed = ChestLoreParser.parse(plainLore(stack), ::parseCroesusLoreItem)
         if (parsed.error != null) { log("$chestName: ${parsed.error}"); return null }
         if (parsed.rewards.isEmpty() && parsed.unknownRewards.isEmpty()) return null
         val candidate = calculateChestCandidate(chestName, parsed.rewards,
@@ -1496,30 +1542,9 @@ class DungeonProgressHudFeature(
             missingItemIds = candidate.missingItemIds + parsed.unknownRewards.map { "UNPARSED_REWARD:$it" })
     }
 
-    private fun parseCroesusLoreItem(line: String, formattedLine: String): ChestProfitItem? {
-        enchantedBookRegex.matchEntire(line)?.groupValues?.drop(1)?.let { match ->
-            val enchantName = match[0].replace(" ", "_").uppercase(Locale.ROOT)
-            val tier = StringUtils.parseRoman(match[1])
-            val id = resolveEnchantedBookId(enchantName, tier, priceService)
-            return ChestProfitItem(id, 1, essence = false)
-        }
-
-        essenceRegex.matchEntire(line)?.groupValues?.drop(1)?.let { match ->
-            val type = match[0].uppercase(Locale.ROOT)
-            val amount = match[1].toIntOrNull() ?: return null
-            val id = "ESSENCE_$type"
-            return ChestProfitItem(id, amount, essence = true)
-        }
-
-        var id = line.uppercase(Locale.ROOT)
-            .replace("- ", "")
-            .replace("'", "")
-            .replace(" ", "_")
-        id = normalizeItemId(id)
-
-        if (tech.thatgravyboat.skyblockapi.api.remote.hypixel.itemdata.ItemData.getItemData(id) == null) return null
-        val trackedDrop = trackedDropFor(id, line)
-        return ChestProfitItem(id, 1, essence = false, trackedDrop = trackedDrop)
+    private fun parseCroesusLoreItem(line: String): ChestProfitItem? {
+        val item = DungeonRewardParser.parse(line) ?: return null
+        return ChestProfitItem(item.itemId, item.quantity, item.essence, trackedDropFor(item.itemId, line))
     }
 
     private fun chestContainerSlotCount(totalSlots: Int): Int {
@@ -1533,38 +1558,14 @@ class DungeonProgressHudFeature(
 
     private fun parseChestItem(stack: ItemStack): ChestProfitItem? {
         val name = stack.hoverName.string.cleanMc()
-        val plainLore = plainLore(stack)
-
-        enchantedBookRegex.matchEntire(name)?.groupValues?.drop(1)?.let { match ->
-            val enchantName = match[0].replace(" ", "_").uppercase(Locale.ROOT)
-            val tier = StringUtils.parseRoman(match[1])
-            val id = resolveEnchantedBookId(enchantName, tier, priceService)
-            return ChestProfitItem(id, 1, essence = false)
-        }
-
-        for (line in listOf(name) + plainLore) {
-            essenceRegex.matchEntire(line)?.groupValues?.drop(1)?.let { match ->
-                val type = match[0].uppercase(Locale.ROOT)
-                val amount = match[1].toIntOrNull() ?: return@let
-                val id = "ESSENCE_$type"
-                return ChestProfitItem(id, amount, essence = true)
-            }
-        }
-
-        var id = ItemUtils.skyblockId(stack).orEmpty()
-        if (id.isBlank()) {
-            id = name.uppercase(Locale.ROOT)
-                .replace("- ", "")
-                .replace("'", "")
-                .replace(" ", "_")
-        }
-        id = normalizeItemId(id)
-
-        val trackedDrop = trackedDropFor(id, name)
-        return ChestProfitItem(id, stack.count.coerceAtLeast(1), essence = false, trackedDrop = trackedDrop)
+        val lore = plainLore(stack)
+        val item = DungeonRewardParser.parse(name, stack.count.coerceAtLeast(1), ItemUtils.skyblockId(stack), lore) ?: return null
+        val essence = if (item.essence && item.quantity == 1) lore.firstNotNullOfOrNull {
+            DungeonRewardParser.parse(it)?.takeIf { reward -> reward.essence }
+        } else null
+        val reward = essence ?: item
+        return ChestProfitItem(reward.itemId, reward.quantity, reward.essence, trackedDropFor(reward.itemId, name))
     }
-
-    private fun normalizeItemId(id: String): String = normalizeSkyBlockId(id)
 
     private fun trackedDropFor(itemId: String, displayName: String): TrackedDrop? {
         val definition = TRACKED_DROPS_BY_ALIAS[normalizeTrackedAlias(itemId)]
@@ -1625,7 +1626,12 @@ class DungeonProgressHudFeature(
                 ensureSessionStarted(now, "chest-profit-$source")
                 saveState()
             }
-            is ClaimResult.Incomplete -> send("Chest pricing incomplete; not recorded. Missing: ${result.missing.joinToString()}.")
+            is ClaimResult.Incomplete -> {
+                ensureSessionStarted(now, "chest-awaiting-prices-$source")
+                state.lastMissingItemIds = result.missing.toMutableList()
+                saveState()
+                send("Chest saved; waiting for prices: ${result.missing.joinToString()}.")
+            }
             ClaimResult.Duplicate -> log("Duplicate claim ignored: $claimKey")
         }
     }
@@ -1674,7 +1680,10 @@ class DungeonProgressHudFeature(
     fun parseDungeonCompletionMessage(message: String) {
         if (!isEnabled()) return
         message.cleanMc().lines().forEach { line ->
-            ChestConfirmation.claimedTier(line)?.let { tier ->
+            if (trackChestProfit.get() && ChestConfirmation.kismetUsed(line)) {
+                rerollAttempts.confirmChat(System.currentTimeMillis()) { true }?.let(::recordConfirmedKismet)
+            }
+            if (trackChestProfit.get()) ChestConfirmation.claimedTier(line)?.let { tier ->
                 claimAttempts.confirmChat(System.currentTimeMillis()) { it.chestName.equals(tier, true) }
                     ?.let { recordChestProfit(it.value, "server-chat", it.claimId) }
             }
@@ -1691,6 +1700,7 @@ class DungeonProgressHudFeature(
         pendingCompletionTimeSeconds = parsed.state.seconds
         pendingCompletionScore = parsed.state.score
         pendingCompletionGrade = parsed.state.grade
+        if (parsed.state.floor.isNotBlank()) detectedFloorLabel = parsed.state.floor
         val cataXp = parsed.completion?.xp ?: return false
 
         val floor = pendingCompletionFloor.ifBlank { floorValue() }
@@ -1823,14 +1833,10 @@ class DungeonProgressHudFeature(
         return line.substring(index + marker.length).trim()
     }
 
-    private fun effectiveXpPerRun(): Long {
+    private fun effectiveXpPerRun(): Long? {
         if (xpModeValue() == "Hardcoded") return hardcodedXpPerRunValue()
         return scopedObservedXp().takeIf { it.isNotEmpty() }?.map { it.second }?.average()?.roundToLong()
-            ?: hardcodedXpPerRunValue()
     }
-
-    private fun ChestProfitCandidate.canRecordDirectly(): Boolean =
-        pricingComplete || selectedMissingPricePolicy() == MissingPriceBehavior.COUNT_AS_ZERO
 
     private fun currentAccountId(): String = mc.player?.uuid?.toString()?.replace("-", "").orEmpty()
     private fun currentProfileId(): String = activeSkyBlockProfile()?.first?.toString()?.replace("-", "").orEmpty()
@@ -1850,25 +1856,8 @@ class DungeonProgressHudFeature(
         return ownedRuns().filter { it.timestamp >= sessionStartedAt }
     }
 
-    private fun scopedXpRuns(): List<DungeonRunRecord> {
-        val floor = floorValue()
-        return scopedRuns().filter { it.floorLabel.equals(floor, true) && it.rawCataXp > 0L }
-    }
-
-    private fun scopedXpSamples(now: Long = System.currentTimeMillis()): List<RunSample> {
-        val floor = floorValue()
-        return state.samples.filter {
-            it.floorLabel.equals(floor, true) && it.rawXpDelta > 0L && isInSelectedTrackerScope(it.timestamp, now)
-        }
-    }
-
-    /**
-     * Completion-chat records are the authoritative run list. Profile refreshes can also observe an
-     * XP delta when that chat is unavailable, so retain those samples after removing duplicates.
-     */
-    private fun scopedObservedXp(now: Long = System.currentTimeMillis()): List<Pair<Long, Long>> =
-        scopedXpRuns().filter { it.timestamp >= state.averagingResetAt }
-            .map { it.timestamp to it.rawCataXp }.sortedBy { it.first }
+    private fun scopedObservedXp(): List<Pair<Long, Long>> =
+        HistoryQueries.observedXp(scopedRuns(), floorValue(), state.averagingResetAt)
 
     private fun isInSelectedTrackerScope(timestamp: Long, now: Long): Boolean = when {
         timestamp > now -> false
@@ -1881,6 +1870,10 @@ class DungeonProgressHudFeature(
     private fun scopedKismetUses(now: Long = System.currentTimeMillis()): List<KismetUseSample> =
         HistoryQueries.kismets(state, currentAccountId(), currentProfileId()).filter { isInSelectedTrackerScope(it.timestamp, now) }
 
+    private fun pendingChestCount(): Int = state.pendingChestClaims.count {
+        owns(it.context.accountId, it.context.profileId) && isInSelectedTrackerScope(it.timestamp, System.currentTimeMillis())
+    }
+
     private fun scopedRunCount(): Int = scopedRuns().size
 
     private fun scopedRunScopeLabel(): String = when {
@@ -1891,10 +1884,8 @@ class DungeonProgressHudFeature(
 
     private fun chestProfitStats(): ChestProfitStats {
         val now = System.currentTimeMillis()
-        val samples = ownedChests().filter { isInSelectedTrackerScope(it.timestamp, now) }
-        val profit = samples.sumOf { it.profit }
-        val label = scopedRunScopeLabel()
-        return ChestProfitStats(label, profit, samples.size, if (samples.isEmpty()) 0 else profit / samples.size)
+        return HistoryQueries.profitStats(state, currentAccountId(), currentProfileId(), scopedRunScopeLabel(),
+            trackerModeValue() == "Total" && state.chestProfitWindowMillis == 0L) { isInSelectedTrackerScope(it, now) }
     }
 
     private fun runSummary(scope: String): RunSummary {
@@ -2101,7 +2092,7 @@ class DungeonProgressHudFeature(
         val observedXp = scopedObservedXp()
         val last = observedXp.lastOrNull()
         val remaining = profile?.let { xpRemaining(it.catacombsExperience, targetLevelValue()) } ?: 0L
-        val runs = xpPerRun.takeIf { it > 0 }?.let { ceil(remaining.toDouble() / it.toDouble()).toLong() }
+        val runs = xpPerRun?.takeIf { it > 0 }?.let { ceil(remaining.toDouble() / it.toDouble()).toLong() }
         val currentLevel = profile?.let { currentCataLevel(it.catacombsExperience) } ?: 0
         return orderProfitRows(
             buildList {
@@ -2114,7 +2105,7 @@ class DungeonProgressHudFeature(
                 if (showCurrentXp.get()) add(ProfitHudRow("currentXp", "Cata XP", profile?.catacombsExperience?.formatCompact() ?: "N/A"))
                 if (showRemaining.get()) add(ProfitHudRow("remaining", "Remaining", if (profile == null) "N/A" else remaining.formatCompact()))
                 if (showFloor.get()) add(ProfitHudRow("floor", "Floor", floorValue()))
-                if (showXpPerRun.get()) add(ProfitHudRow("xpPerRun", "XP/Run", xpPerRun.formatCompact(), xpPerHourSuffix()))
+                if (showXpPerRun.get()) add(ProfitHudRow("xpPerRun", "XP/Run", xpPerRun?.formatCompact() ?: "N/A", xpPerHourSuffix()))
                 if (showProfile.get()) add(ProfitHudRow("profile", "Profile", profile?.profileName ?: "N/A"))
                 if (showLastRun.get()) add(ProfitHudRow("lastRun", "Last Run", last?.second?.formatCompact() ?: "N/A"))
                 if (showObservedCount.get()) add(ProfitHudRow("observedCount", "Runs", scopedRunCount().toString()))
@@ -2131,6 +2122,7 @@ class DungeonProgressHudFeature(
                     add(ProfitHudRow("avgChest", "Avg Chest", stats.average.formatCompactCoins()))
                 }
                 if (showChestCount.get()) add(ProfitHudRow("chestsOpened", "Chests", stats.chests.toString()))
+                if (pendingChestCount() > 0) add(ProfitHudRow("pendingPrices", "Pending Prices", pendingChestCount().toString()))
                 add(ProfitHudRow("kismets", "Kismets", scopedKismetUses().size.toString()))
                 add(ProfitHudRow("croesus", "Croesus", croesusUnopenedCountText()))
                 if (showLastChest.get()) {
@@ -2144,6 +2136,7 @@ class DungeonProgressHudFeature(
         val stats = chestProfitStats()
         return buildList {
             if (showChestCount.get()) add(ProfitHudRow("chestsOpened", "Chests", stats.chests.toString()))
+            if (pendingChestCount() > 0) add(ProfitHudRow("pendingPrices", "Pending Prices", pendingChestCount().toString()))
             if (showChestProfit.get()) {
                 add(ProfitHudRow("profit", "Profit", stats.profit.formatCompactCoins()))
                 add(ProfitHudRow("avgChest", "Avg Chest", stats.average.formatCompactCoins()))
@@ -2350,12 +2343,12 @@ class DungeonProgressHudFeature(
         val scoreboard = mc.level?.scoreboard ?: return ""
         val objective = scoreboard.getDisplayObjective(DisplaySlot.SIDEBAR) ?: return ""
         val lines = scoreboard.listPlayerScores(objective)
+            .filterNot { it.isHidden }
             .sortedByDescending { it.value }
             .take(15)
             .map { score ->
-                val name = score.ownerName().string
-                val team = scoreboard.getPlayersTeam(name)
-                PlayerTeam.formatNameForTeam(team, Component.literal(name)).string
+                val team = scoreboard.getPlayersTeam(score.owner())
+                PlayerTeam.formatNameForTeam(team, score.ownerName()).string.cleanMc()
             }
 
         return (listOf(objective.displayName.string) + lines).joinToString("\n")
@@ -2415,6 +2408,7 @@ class DungeonProgressHudFeature(
             runs = state.runs.map { it.copy() }.toMutableList(),
             samples = state.samples.map { it.copy() }.toMutableList(),
             xpIntervals = state.xpIntervals.toMutableList(),
+            pendingChestClaims = state.pendingChestClaims.toMutableList(),
             importedLogFiles = state.importedLogFiles.toMutableMap(),
             chestProfits = state.chestProfits.map { it.copy(
                 missingItemIds = it.missingItemIds.toMutableList(),
@@ -2602,15 +2596,4 @@ class DungeonProgressHudFeature(
 
     private val chestNames = setOf("Wood", "Gold", "Diamond", "Emerald", "Obsidian", "Bedrock")
     private val runChestRegex = "^(?:Master )?Catacombs - Floor [IV]+$".toRegex()
-    private val costRegex = "^(\\d[\\d,]*) Coins$".toRegex()
-    private val enchantedBookRegex = "^Enchanted Book \\(([\\w ]+) ([IV]+)\\)$".toRegex()
-    private val essenceRegex = "^(Wither|Undead) Essence x(\\d+)$".toRegex()
-    private val dungeonCompletionCataXpRegex = "\\+([\\d,]+)\\s+Cata EXP".toRegex()
-    private val dungeonCompletionFloorRegex = "(Master Mode|The Catacombs|Catacombs)\\s*-\\s*([MF]?\\d+)".toRegex(RegexOption.IGNORE_CASE)
-    private val dungeonCompletionTimeRegex = "\\bin\\s+(\\d{1,2})m\\s*(\\d{1,2})s\\b".toRegex(RegexOption.IGNORE_CASE)
-    private val dungeonCompletionScoreRegex = "Score:\\s*(\\d+)\\s*\\(([A-Z+]+)\\)".toRegex(RegexOption.IGNORE_CASE)
-    private val hardcodedItemPrices = mapOf(
-        "SHARD_POWER_DRAGON" to 450_000,
-        "SHARD_APEX_DRAGON" to 500_000,
-    )
 }

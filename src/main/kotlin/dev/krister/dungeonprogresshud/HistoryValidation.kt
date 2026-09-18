@@ -25,6 +25,9 @@ internal object HistoryValidation {
                     }
                 }
                 is Map<*, *> -> require(child.keys.none { it == null } && child.values.none { it == null }) { "$path.${field.name} contains null" }
+                else -> if (child.javaClass.packageName == RunState::class.java.packageName && child !is Enum<*>) {
+                    validateObject(child, "$path.${field.name}")
+                }
             }
         }
     }

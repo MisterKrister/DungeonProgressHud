@@ -25,7 +25,16 @@ internal class ChestAttemptTracker<T>(private val timeoutMillis: Long = 15_000) 
 }
 
 internal object ChestConfirmation {
+    // Inventory mods can translate a physical left-click into CLONE (middle-click).
+    // These only start an attempt; server confirmation still controls accounting.
+    fun acceptsClick(button: Int, input: String): Boolean = when (input) {
+        "PICKUP", "QUICK_MOVE" -> button in 0..1
+        "CLONE" -> button == 2
+        else -> false
+    }
+
     private val rewards = "^(BEDROCK|OBSIDIAN|EMERALD|DIAMOND|GOLD|WOOD) CHEST REWARDS$".toRegex()
     fun claimedTier(message: String): String? = rewards.matchEntire(message.trim())?.groupValues?.get(1)
+    fun kismetUsed(message: String): Boolean = message.trim() == "You used a Kismet Feather!"
     fun rerolled(lore: List<String>): Boolean = lore.any { it == "You already rerolled a chest!" }
 }
