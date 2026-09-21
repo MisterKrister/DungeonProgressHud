@@ -84,12 +84,37 @@ class DungeonSessionTrackerTest {
 }
 
 class DungeonActivityDetectorTest {
+    @Test fun `leaving M7 keeps class estimates despite the RNG floor label and stale location metadata`() {
+        val run = DungeonRunRecord(floorLabel = "M7", dungeonClass = "mage", rawCataXp = 705_600,
+            partyClasses = setOf("mage", "healer", "berserk", "archer"),
+            classExperience = mapOf("mage" to 588_000L, "healer" to 147_000L, "berserk" to 147_000L, "archer" to 147_000L))
+        var floor = DungeonActivityDetector.detectFloor(null, null, "The Catacombs (M7)", emptyList())!!
+        val before = DungeonClasses.xpPerRun(emptyList(), listOf(run), run.partyClasses)
+        for (island in listOf("Dungeon Hub", "Hub", "Private Island", "Garden")) {
+            val tab = listOf("§r§bArea: $island", "RNG Meter", " Catacombs Floor VII")
+            // Location metadata can still refer to the dungeon for a tick after warping out.
+            val detected = DungeonActivityDetector.detectFloor("The Catacombs", "Catacombs - Floor VII", "SKYBLOCK $island", tab)
+            assertNull(detected)
+            floor = detected ?: floor
+            assertEquals("M7", floor)
+            val rates = DungeonClasses.xpPerRun(emptyList(), listOf(run).filter { it.floorLabel == floor }, run.partyClasses)
+            assertEquals(before, rates)
+            assertEquals(147_000.0, rates["healer"])
+            assertNull(rates["tank"])
+        }
+        assertNull(DungeonActivityDetector.detectFloor("Dungeon Hub", null, "SKYBLOCK", listOf(" Catacombs Floor VII")))
+        // A real new floor still takes precedence, even before the tab list catches up.
+        assertEquals("F5", DungeonActivityDetector.detectFloor("Dungeon Hub", null, "The Catacombs (F5)",
+            listOf("Area: Dungeon Hub", " Catacombs Floor VII")))
+    }
+
     @Test fun `live formatted scoreboard wins over stale location and unrelated floor strings`() {
         assertEquals("F7", DungeonActivityDetector.detectFloor("Catacombs - Floor V", null,
             "§7[F5] Player\n§cThe Catacombs §7(§eF7§7)", listOf("Party: F5")))
         assertNull(DungeonActivityDetector.detectFloor(null, null, "Player F5", listOf("Party: M7")))
         assertEquals("M7", DungeonActivityDetector.detectFloor(null, null, "Master Mode The Catacombs - Floor VII Stats", emptyList()))
         assertEquals("M7", DungeonActivityDetector.detectFloor(null, null, "Master Mode The Catacombs - [MM] Floor VII", emptyList()))
+        assertEquals("M7", DungeonActivityDetector.detectFloor("Catacombs - [MM] Floor VII", null, "", emptyList()))
     }
 
     @Test

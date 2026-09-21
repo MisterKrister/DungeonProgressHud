@@ -52,6 +52,7 @@ class DungeonRewardParserTest {
         val auctions = PriceFeedParser.auctions(json("""{"WITHER_CHESTPLATE":{"lowest":5,"median":10,"mean":100}}"""))
         assertEquals(AuctionPrice(5.0, 10.0, 100.0), auctions["WITHER_CHESTPLATE"])
         assertFails { PriceFeedParser.bazaar(json("""{"success":false}""")) }
+        assertFails { PriceFeedParser.bazaar(json("""{"success":true,"products":{"BOOK":{"quick_status":{"buyPrice":0}}}}""")) }
         assertFails { PriceFeedParser.auctions(json("{}")) }
         assertFails { PriceFeedParser.auctions(json("""{"ITEM":{"lowest":-1}}""")) }
     }

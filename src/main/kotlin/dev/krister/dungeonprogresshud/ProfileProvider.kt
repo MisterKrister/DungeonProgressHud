@@ -93,6 +93,8 @@ internal class ProfileProvider(private val log: (String) -> Unit) {
             profileName = profileName,
             profileId = skyBlockPvProfileIdentity(selected)?.first?.toString().orEmpty(),
             catacombsExperience = catacombsExperience,
+            classExperience = DungeonClasses.experience(invokeProfileMethod(dungeonData, "getClassExperience") as? Map<*, *>),
+            selectedDungeonClass = DungeonClasses.key(invokeProfileMethod(dungeonData, "getSelectedClass") as? String),
         )
     }
 
@@ -113,8 +115,8 @@ internal class ProfileProvider(private val log: (String) -> Unit) {
         val member = members.getAsJsonObject(uuid)
             ?: members.getAsJsonObject(request.playerUuid.toString())
             ?: error("Selected profile missing player")
-        val catacombsExperience = member.getAsJsonObject("dungeons")
-            ?.getAsJsonObject("dungeon_types")
+        val dungeons = member.getAsJsonObject("dungeons")
+        val catacombsExperience = dungeons?.getAsJsonObject("dungeon_types")
             ?.getAsJsonObject("catacombs")
             ?.get("experience")
             ?.asLong
@@ -126,7 +128,18 @@ internal class ProfileProvider(private val log: (String) -> Unit) {
             profileName = profileName,
             profileId = selected.get("profile_id")?.asString.orEmpty(),
             catacombsExperience = catacombsExperience,
+            classExperience = skyBlockerClassExperience(dungeons),
+            selectedDungeonClass = DungeonClasses.key(dungeons.get("selected_dungeon_class")
+                ?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }?.asString),
         )
+    }
+
+    internal fun skyBlockerClassExperience(dungeons: JsonObject?): Map<String, Long> {
+        val classes = dungeons?.get("player_classes")?.takeIf { it.isJsonObject }?.asJsonObject
+        return DungeonClasses.experience(classes?.entrySet()?.associate { (name, value) ->
+            name to value.takeIf { it.isJsonObject }?.asJsonObject?.get("experience")
+                ?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isNumber }?.asNumber
+        })
     }
 
     private fun selectSkyBlockerProfile(profiles: JsonArray, request: ProfileRequest): JsonObject {

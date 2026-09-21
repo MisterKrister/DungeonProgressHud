@@ -1,456 +1,319 @@
 import dev.krister.dungeonprogresshud.HudGeometry;
-import java.awt.BasicStroke;
 import java.awt.Color;
 import java.awt.Dimension;
-import java.awt.Font;
 import java.awt.Graphics;
 import java.awt.Graphics2D;
 import java.awt.RenderingHints;
-import java.awt.event.WindowAdapter;
-import java.awt.event.WindowEvent;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
+import java.awt.image.BufferedImage;
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.nio.file.StandardWatchEventKinds;
-import java.nio.file.WatchEvent;
-import java.nio.file.WatchKey;
-import java.nio.file.WatchService;
+import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
-import java.util.Set;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+import java.util.zip.ZipFile;
+import javax.imageio.ImageIO;
 import javax.swing.JFrame;
 import javax.swing.JPanel;
 import javax.swing.SwingUtilities;
-import javax.swing.Timer;
 
+/** Uses the game's ASCII font and the production layout, including inventory drag targets. */
 public final class HudPreview {
-    private static final Path HUD_SOURCE = Paths.get(
-        "src", "main", "kotlin", "dev", "krister", "dungeonprogresshud", "DungeonProgressHudAddon.kt"
+    private static final List<Row> TOP = List.of(
+        new Row("sessionTime", "Session time", "10m 30s"),
+        new Row("observedCount", "Runs", "90"),
+        new Row("lastRun", "Last run", "N/A"),
+        new Row("currentLevel", "Cata level", "52"),
+        new Row("target", "Target", "53"),
+        new Row("levelProgress", "Next level", "12.0%"),
+        new Row("classProgress", "Classes", "Next level"),
+        new Row("currentXp", "Cata XP", "993.84m"),
+        new Row("remaining", "Remaining XP", "175.97m"),
+        new Row("runsLeft", "Runs left", "876"),
+        new Row("xpPerRun", "XP/run", "201k"),
+        new Row("xpPerHour", "XP/h (session)", "378k")
     );
-    private static final int BUTTON_WIDTH = 46;
-    private static final int BUTTON_HEIGHT = 14;
-    private static final int BUTTON_MARGIN = 5;
-    private static final Set<String> PROFIT_IDS = Set.of("profit", "chestsOpened", "lastChest", "avgChest");
-    private static final Set<String> ACCENT_IDS = Set.of("runsLeft", "profit", "lastChest", "avgChest");
-    private static final List<Row> PROFIT_TOP_ROWS = List.of(
-        new Row("sessionTime", "Session Time", "1m 28s", "", item("", 0)),
-        new Row("currentLevel", "Cata Level", "50", "", item("", 0)),
-        new Row("target", "Target", "51", "", item("", 0)),
-        new Row("levelProgress", "Next Level", "28.9%", "", item("", 0)),
-        new Row("runsLeft", "Runs Left", "252", "", item("", 0)),
-        new Row("currentXp", "Cata XP", "627.58m", "", item("", 0)),
-        new Row("lastRun", "Last Run", "491k", "(22.1m/h)", item("", 0)),
-        new Row("observedCount", "Runs", "100", "", item("", 0))
+    private static final List<Row> BOTTOM = List.of(
+        new Row("profit", "Profit", "518.60m"),
+        new Row("avgChest", "Avg chest", "2.07m"),
+        new Row("kismets", "Kismets", "304"),
+        new Row("croesus", "Croesus", "1")
     );
-    private static final List<Row> PROFIT_BOTTOM_ROWS = List.of(
-        new Row("profit", "Profit", "21m", "", item("", 0)),
-        new Row("avgChest", "Avg Chest", "7m", "", item("", 0)),
-        new Row("chestsOpened", "Chests", "3", "", item("", 0)),
-        new Row("kismets", "Kismets", "0", "", item("", 0)),
-        new Row("croesus", "Croesus", "20", "", item("", 0))
+    private static final List<Row> ITEMS = List.of(
+        new Row("itemHandle", "Handle", "1"),
+        new Row("itemImplosion", "Implosion", "2"),
+        new Row("itemWitherShield", "Wither Shield", "1"),
+        new Row("itemShadowWarp", "Shadow Warp", "1"),
+        new Row("itemRecomb", "Recomb", "17"),
+        new Row("itemAutoRecomb", "Auto Recomb", "2"),
+        new Row("itemClaymore", "Claymore", "0"),
+        new Row("itemFifthStar", "5th Star", "3"),
+        new Row("itemChestplate", "Chestplate", "1"),
+        new Row("itemSkullT5", "Skull T5", "0"),
+        new Row("itemNecronDye", "Necron Dye", "2")
     );
-    private static final List<Row> ITEM_TOP_ROWS = List.of(
-        new Row("chestsOpened", "Chests", "3", "", item("", 0)),
-        new Row("profit", "Profit", "21m", "", item("", 0)),
-        new Row("avgChest", "Avg Chest", "7m", "", item("", 0)),
-        new Row("kismets", "Kismets", "0", "", item("", 0)),
-        new Row("croesus", "Croesus", "20", "", item("", 0))
-    );
-    private static final List<Row> ITEM_ROWS = List.of(
-        new Row("itemHandle", "Handle", "1", "", item("", 0)),
-        new Row("itemImplosion", "Implosion", "2", "", item("", 0)),
-        new Row("itemWitherShield", "Wither Shield", "1", "", item("", 0)),
-        new Row("itemShadowWarp", "Shadow Warp", "1", "", item("", 0)),
-        new Row("itemRecomb", "Recomb", "17", "", item("", 0)),
-        new Row("itemAutoRecomb", "Auto Recomb", "2", "", item("", 0)),
-        new Row("itemClaymore", "Claymore", "0", "", item("", 0)),
-        new Row("itemFifthStar", "5th Star", "3", "", item("", 0)),
-        new Row("itemChestplate", "Chestplate", "1", "", item("", 0)),
-        new Row("itemSkullT5", "Skull T5", "0", "", item("", 0)),
-        new Row("itemNecronDye", "Necron Dye", "2", "", item("", 0))
-    );
+    private record Row(String id, String label, String value) {}
+    private static final BufferedImage FONT = loadFont();
+    private static boolean level50;
+    private static boolean runs;
 
-    private HudPreview() {
-    }
-
-    public static void main(String[] args) {
+    public static void main(String[] args) throws IOException {
+        level50 = List.of(args).contains("--level-50");
+        runs = List.of(args).contains("--runs");
+        PreviewPanel panel = new PreviewPanel();
+        if (args.length >= 2 && args[0].equals("--screenshot")) {
+            panel.setSize(panel.getPreferredSize());
+            BufferedImage image = new BufferedImage(panel.getWidth(), panel.getHeight(), BufferedImage.TYPE_INT_RGB);
+            Graphics2D graphics = image.createGraphics();
+            panel.paint(graphics);
+            graphics.dispose();
+            ImageIO.write(image, "png", Path.of(args[1]).toFile());
+            return;
+        }
         SwingUtilities.invokeLater(() -> {
-            PreviewPanel panel = new PreviewPanel();
-            JFrame frame = new JFrame("Dungeon Progress HUD Preview");
+            JFrame frame = new JFrame("Dungeon HUD - current class, all classes, items");
             frame.setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
             frame.setContentPane(panel);
             frame.pack();
             frame.setLocationRelativeTo(null);
             frame.setVisible(true);
-
-            SourceWatcher watcher = new SourceWatcher(panel);
-            frame.addWindowListener(new WindowAdapter() {
-                @Override
-                public void windowClosed(WindowEvent event) {
-                    watcher.close();
-                }
-            });
-            watcher.start();
         });
     }
 
-    private static Item item(String label, int color) {
-        return new Item(label, new Color(color));
+    private static HudGeometry.Layout measurePreview(List<Row> top, List<Row> bottom, boolean items) {
+        return measurePreview(top, bottom, items, false, "session");
     }
 
-    private record Row(String id, String label, String value, String suffix, Item item) {
-    }
-
-    private record Item(String text, Color color) {
-    }
-
-    private static final class Layout {
-        int rowHeight = 20;
-        int titleHeight = 28;
-        int topPadding = 9;
-        int sidePadding = 13;
-        int profitGap = 13;
-        int iconSize = 12;
-        int iconX = 6;
-        int iconSepX = 23;
-        int labelX = 32;
-        int minValueSepX = 96;
-        int labelGap = 6;
-        int valueGap = 7;
-        int rightPadding = 7;
-        int minContentWidth = 166;
-        int cyan = 0xff42f3ff;
-        int cyanDim = 0xff147b84;
-        int green = 0xff63ff57;
-        int white = 0xffffffff;
-        int muted = 0xffc8c8c8;
-        int line = 0x663dfaff;
-        int black = 0xff000000;
-        int outerDark = 0xff061014;
-        int innerDark = 0xff020405;
-        int panel = 0xd00a0f11;
-        int profitPanel = 0x88101010;
-        int sketchWhite = 0xffe8e8e8;
+    private static HudGeometry.Layout measurePreview(List<Row> top, List<Row> bottom, boolean items, boolean allClasses, String scope) {
+        List<Row> all = new ArrayList<>(TOP);
+        all.addAll(BOTTOM);
+        all.addAll(ITEMS);
+        int labels = all.stream().mapToInt(row -> textWidth(row.label(), false)).max().orElse(0);
+        int values = all.stream().mapToInt(row -> (int) Math.ceil(textWidth(row.value(),
+            HudGeometry.isLevel(row.id()) || row.id().equals("profit")) * HudGeometry.valueScale(row.id()))).max().orElse(0);
+        int title = (int) Math.ceil(Math.max(textWidth("Dungeon Profit", true), textWidth("Dungeon Items", true)) * HudGeometry.TITLE_SCALE);
+        return HudGeometry.measure(labels, values, title, (int) Math.ceil(textWidth("F5", true) * HudGeometry.FLOOR_SCALE),
+            top.stream().map(Row::id).toList(), bottom.stream().map(Row::id).toList(), items, scope, allClasses);
     }
 
     private static final class PreviewPanel extends JPanel {
-        private final Font font = new Font(Font.MONOSPACED, Font.BOLD, 13);
-        private Layout layout = loadLayout();
-        private long lastLoadedAt = System.currentTimeMillis();
+        private static final int SCALE = 2;
+        private static final int GAP = 18;
+        private List<String> order = new ArrayList<>();
+        private String dragged;
+        private String hovered;
+        private boolean editorItems;
 
         PreviewPanel() {
-            setPreferredSize(new Dimension(980, 560));
-            setBackground(new Color(0x2d3131));
-            new Timer(250, ignored -> {
-                long modified = modifiedTime();
-                if (modified > lastLoadedAt) {
-                    reload();
+            TOP.forEach(row -> order.add(row.id()));
+            BOTTOM.forEach(row -> order.add(row.id()));
+            HudGeometry.Layout profit = measurePreview(TOP, BOTTOM, false);
+            HudGeometry.Layout items = measurePreview(BOTTOM, ITEMS, true);
+            setPreferredSize(new Dimension((profit.width() * 3 + GAP * 4) * SCALE,
+                (Math.max(editorLayout().height(), items.height()) + 36) * SCALE));
+            setBackground(new Color(0x151B21));
+            MouseAdapter mouse = new MouseAdapter() {
+                @Override public void mousePressed(MouseEvent event) {
+                    double x = event.getX() / (double) SCALE - editorX();
+                    double y = event.getY() / (double) SCALE - 24;
+                    HudGeometry.Layout current = editorLayout();
+                    int buttonY = current.sections().getLast().y() - 2;
+                    if (x >= current.right() - HudGeometry.BUTTON_WIDTH && x < current.right()
+                        && y >= buttonY && y < buttonY + HudGeometry.BUTTON_HEIGHT) {
+                        editorItems = !editorItems;
+                        repaint();
+                    } else if (event.isShiftDown() && !editorItems) {
+                        dragged = hit(event);
+                    }
                 }
-            }).start();
+                @Override public void mouseDragged(MouseEvent event) {
+                    hovered = hit(event);
+                    repaint();
+                }
+                @Override public void mouseReleased(MouseEvent event) {
+                    String target = hit(event);
+                    if (dragged != null && target != null) order = HudGeometry.move(order, dragged, target);
+                    dragged = null;
+                    hovered = null;
+                    repaint();
+                }
+            };
+            addMouseListener(mouse);
+            addMouseMotionListener(mouse);
         }
 
-        void reload() {
-            layout = loadLayout();
-            lastLoadedAt = System.currentTimeMillis();
-            repaint();
+        private List<Row> ordered(List<Row> rows) {
+            return order.stream().flatMap(id -> rows.stream().filter(row -> row.id().equals(id))).toList();
         }
-
-        @Override
-        protected void paintComponent(Graphics graphics) {
+        private int editorX() { return measurePreview(TOP, BOTTOM, false).width() + GAP * 2; }
+        private HudGeometry.Layout editorLayout() {
+            return editorItems ? measurePreview(BOTTOM, ITEMS, true, false, "last 4 days")
+                : measurePreview(ordered(TOP), ordered(BOTTOM), false, true, "last 4 days");
+        }
+        private String hit(MouseEvent event) {
+            if (editorItems) return null;
+            double x = event.getX() / (double) SCALE - editorX();
+            double y = event.getY() / (double) SCALE - 24;
+            return editorLayout().rows().stream().filter(row -> row.contains(x, y)).map(HudGeometry.Row::id).findFirst().orElse(null);
+        }
+        @Override protected void paintComponent(Graphics graphics) {
             super.paintComponent(graphics);
             Graphics2D g = (Graphics2D) graphics.create();
-            g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_OFF);
-            g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_OFF);
-            drawBackground(g);
-
-            int scale = 2;
-            int profitWidth = panelWidth(g, layout, "Dungeon Profit Hud", PROFIT_TOP_ROWS, PROFIT_BOTTOM_ROWS);
-            int profitHeight = panelHeight(layout, PROFIT_TOP_ROWS, PROFIT_BOTTOM_ROWS);
-            int itemWidth = panelWidth(g, layout, "Dungeon Item Tracker", ITEM_TOP_ROWS, ITEM_ROWS);
-            int itemHeight = panelHeight(layout, ITEM_TOP_ROWS, ITEM_ROWS);
-            int panelGap = 20;
-            int totalWidth = profitWidth + panelGap + itemWidth;
-            int totalHeight = Math.max(profitHeight, itemHeight);
-            int originX = Math.max(24, (getWidth() - totalWidth * scale) / 2);
-            int originY = Math.max(24, (getHeight() - totalHeight * scale) / 2);
-
-            g.translate(originX, originY);
-            g.scale(scale, scale);
-            drawHud(g, layout, "Dungeon Profit Hud", "Items", PROFIT_TOP_ROWS, PROFIT_BOTTOM_ROWS, profitWidth, profitHeight);
-            g.translate(profitWidth + panelGap, 0);
-            drawHud(g, layout, "Dungeon Item Tracker", "Profit", ITEM_TOP_ROWS, ITEM_ROWS, itemWidth, itemHeight);
+            g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);
+            g.scale(SCALE, SCALE);
+            int width = measurePreview(TOP, BOTTOM, false).width();
+            text(g, "CURRENT CLASS", GAP, 8, HudGeometry.MUTED, 1, false, false);
+            text(g, "ALL CLASSES: SHIFT + DRAG", editorX(), 8, HudGeometry.ACCENT, 1, false, false);
+            text(g, "ITEM TRACKER", GAP * 3 + width * 2, 8, HudGeometry.MUTED, 1, false, false);
+            g.translate(GAP, 24);
+            drawHud(g, TOP, BOTTOM, false, false, false, "session");
+            g.translate(width + GAP, 0);
+            drawHud(g, editorItems ? BOTTOM : ordered(TOP), editorItems ? ITEMS : ordered(BOTTOM), editorItems, true, true, "last 4 days");
+            if (!editorItems) for (HudGeometry.Row box : editorLayout().rows()) {
+                if (box.id().equals(dragged) || box.id().equals(hovered)) {
+                    fill(g, box.x(), box.y(), box.width(), box.height(), box.id().equals(dragged) ? 0x556ECAFD : 0x556FF4C6);
+                }
+            }
+            g.translate(width + GAP, 0);
+            drawHud(g, BOTTOM, ITEMS, true, false, false, "session");
             g.dispose();
         }
+    }
 
-        private void drawBackground(Graphics2D g) {
-            int tile = 48;
-            for (int y = 0; y < getHeight(); y += tile) {
-                for (int x = 0; x < getWidth(); x += tile) {
-                    int shade = ((x / tile + y / tile) & 1) == 0 ? 0x3b3f40 : 0x313535;
-                    g.setColor(new Color(shade));
-                    g.fillRect(x, y, tile, tile);
-                    g.setColor(new Color(255, 255, 255, 20));
-                    g.fillPolygon(new int[] { x, x + tile, x + tile }, new int[] { y, y, y + 12 }, 3);
+    private static void drawHud(Graphics2D g, List<Row> top, List<Row> bottom, boolean items, boolean inventory, boolean allClasses, String scope) {
+        HudGeometry.Layout layout = measurePreview(top, bottom, items, allClasses, scope);
+        fill(g, 0, 0, layout.width(), layout.height(), HudGeometry.PANEL);
+        int left = HudGeometry.SIDE_PADDING;
+        int topY = HudGeometry.TOP_PADDING;
+        fill(g, left, topY, 3, 13, HudGeometry.ACCENT);
+        text(g, items ? "Dungeon Items" : "Dungeon Profit", left + 9, topY, HudGeometry.WHITE, HudGeometry.TITLE_SCALE, false, true);
+        text(g, "F5", layout.right(), topY + 2, HudGeometry.ACCENT, HudGeometry.FLOOR_SCALE, true, true);
+        for (int y : layout.dividers()) fill(g, left, y, layout.right() - left, 1, HudGeometry.LINE);
+        for (HudGeometry.Section section : layout.sections()) {
+            text(g, section.title(), left, section.y(), HudGeometry.ACCENT, 1, false, false);
+            int scopeRight = layout.right() - (inventory && section.equals(layout.sections().getLast()) ? HudGeometry.BUTTON_WIDTH + 6 : 0);
+            text(g, section.scope(), scopeRight, section.y(), HudGeometry.ACCENT, 1, true, false);
+        }
+        List<Row> rows = new ArrayList<>(top);
+        rows.addAll(bottom);
+        for (HudGeometry.Row box : layout.rows()) {
+            Row row = rows.stream().filter(r -> r.id().equals(box.id())).findFirst().orElseThrow();
+            if (row.id().equals("classProgress")) {
+                drawClasses(g, box, allClasses);
+            } else if (HudGeometry.isLevel(row.id())) {
+                boolean right = box.x() > left;
+                int x = right ? box.right() : box.x();
+                text(g, row.label(), x, box.y(), HudGeometry.MUTED, 1, right, false);
+                text(g, row.value(), x, box.y() + 12, HudGeometry.WHITE, HudGeometry.valueScale(row.id()), right, true);
+            } else {
+                boolean profit = row.id().equals("profit");
+                String label = !scope.equals("session") && row.id().equals("sessionTime") ? "Run time"
+                    : !scope.equals("session") && row.id().equals("xpPerHour") ? "XP/h (runs)" : row.label();
+                text(g, label, box.x(), box.y() + (profit ? 4 : 2), HudGeometry.labelColor(row.id()), 1, false, false);
+                text(g, row.value(), box.right(), box.y() + 2, profit ? HudGeometry.PROFIT : HudGeometry.WHITE,
+                    HudGeometry.valueScale(row.id()), true, profit);
+                if (row.id().equals("levelProgress")) {
+                    fill(g, box.x(), box.y() + 14, box.width(), 7, HudGeometry.LINE);
+                    fill(g, box.x(), box.y() + 14, HudGeometry.progressWidth(box.width(), 12.0), 7, HudGeometry.ACCENT);
                 }
             }
         }
-
-        private void drawHud(Graphics2D g, Layout l, String title, String buttonLabel, List<Row> topRows, List<Row> bottomRows, int width, int height) {
-            g.setFont(font);
-            int dividerY = dividerY(l, topRows);
-            drawRoundedPanel(g, l, width, height);
-            fill(g, 0, dividerY, width, dividerY + 1, l.sketchWhite);
-
-            int buttonX = width - BUTTON_WIDTH - BUTTON_MARGIN;
-            int buttonY = l.topPadding + (g.getFontMetrics().getHeight() - BUTTON_HEIGHT) / 2;
-            int titleRight = buttonX - 4;
-            drawShadowed(g, title, Math.max(l.sidePadding, (titleRight - g.getFontMetrics().stringWidth(title)) / 2), l.topPadding + 10, new Color(l.sketchWhite, true));
-            drawButton(g, l, buttonX, buttonY, buttonLabel);
-
-            int labelWidth = labelWidth(g, topRows, bottomRows);
-            int separatorX = l.sidePadding + labelWidth + 8;
-            int valueX = separatorX + 8;
-            int yOffset = l.topPadding + l.titleHeight;
-            yOffset = drawRows(g, l, topRows, separatorX, valueX, yOffset);
-            drawScopeLabel(g, l, bottomRows == ITEM_ROWS ? l.topPadding + l.titleHeight + 1 : dividerY + 2, width);
-            yOffset = dividerY + 1 + l.profitGap;
-            drawRows(g, l, bottomRows, separatorX, valueX, yOffset);
-        }
-
-        private void drawScopeLabel(Graphics2D g, Layout l, int y, int width) {
-            String label = "(session)";
-            drawShadowed(g, label, width - l.sidePadding - g.getFontMetrics().stringWidth(label), y + 8, new Color(l.sketchWhite, true));
-        }
-
-        private int drawRows(Graphics2D g, Layout l, List<Row> rows, int separatorX, int valueX, int yOffset) {
-            for (Row row : rows) {
-                int textY = yOffset + (l.rowHeight - 9) / 2 + 8;
-                drawShadowed(g, row.label(), l.sidePadding, textY, new Color(l.sketchWhite, true));
-                drawShadowed(g, "|", separatorX, textY, new Color(l.sketchWhite, true));
-                drawShadowed(g, row.value(), valueX, textY, new Color(l.sketchWhite, true));
-                if (!row.suffix().isBlank()) {
-                    drawShadowed(g, row.suffix(), valueX + g.getFontMetrics().stringWidth(row.value()) + 10, textY, new Color(l.sketchWhite, true));
-                }
-                yOffset += l.rowHeight;
-            }
-            return yOffset;
-        }
-
-        private void drawButton(Graphics2D g, Layout l, int x, int y, String label) {
-            roundedFill(g, x, y, BUTTON_WIDTH, BUTTON_HEIGHT, 0x99101010);
-            roundedBorder(g, x, y, BUTTON_WIDTH, BUTTON_HEIGHT, l.sketchWhite);
-            drawShadowed(g, label, x + (BUTTON_WIDTH - g.getFontMetrics().stringWidth(label)) / 2, y + 9, new Color(l.sketchWhite, true));
-        }
-
-        private void drawRoundedPanel(Graphics2D g, Layout l, int width, int height) {
-            roundedFill(g, 0, 0, width, height, l.profitPanel);
-            roundedBorder(g, 0, 0, width, height, l.sketchWhite);
-        }
-
-        private void roundedFill(Graphics2D g, int x, int y, int width, int height, int color) {
-            fill(g, x + 4, y, x + width - 4, y + 1, color);
-            fill(g, x + 2, y + 1, x + width - 2, y + 2, color);
-            fill(g, x + 1, y + 2, x + width - 1, y + 4, color);
-            fill(g, x, y + 4, x + width, y + height - 4, color);
-            fill(g, x + 1, y + height - 4, x + width - 1, y + height - 2, color);
-            fill(g, x + 2, y + height - 2, x + width - 2, y + height - 1, color);
-            fill(g, x + 4, y + height - 1, x + width - 4, y + height, color);
-        }
-
-        private void roundedBorder(Graphics2D g, int x, int y, int width, int height, int color) {
-            fill(g, x + 4, y, x + width - 4, y + 1, color);
-            fill(g, x + 2, y + 1, x + 4, y + 2, color);
-            fill(g, x + width - 4, y + 1, x + width - 2, y + 2, color);
-            fill(g, x + 1, y + 2, x + 2, y + 4, color);
-            fill(g, x + width - 2, y + 2, x + width - 1, y + 4, color);
-            fill(g, x, y + 4, x + 1, y + height - 4, color);
-            fill(g, x + width - 1, y + 4, x + width, y + height - 4, color);
-            fill(g, x + 1, y + height - 4, x + 2, y + height - 2, color);
-            fill(g, x + width - 2, y + height - 4, x + width - 1, y + height - 2, color);
-            fill(g, x + 2, y + height - 2, x + 4, y + height - 1, color);
-            fill(g, x + width - 4, y + height - 2, x + width - 2, y + height - 1, color);
-            fill(g, x + 4, y + height - 1, x + width - 4, y + height, color);
-        }
-
-        private void drawItem(Graphics2D g, Item item, int x, int y, int size) {
-            g.setColor(Color.BLACK);
-            g.fillRect(x + 1, y + 1, size, size);
-            g.setColor(item.color());
-            g.fillRect(x, y, size, size);
-            g.setColor(new Color(255, 255, 255, 100));
-            g.fillRect(x + 2, y + 2, Math.max(3, size / 3), Math.max(2, size / 5));
-            g.setColor(new Color(0, 0, 0, 90));
-            g.fillRect(x + size - 5, y + size - 5, 3, 3);
-            g.setColor(Color.BLACK);
-            g.setFont(new Font(Font.MONOSPACED, Font.BOLD, 7));
-            String text = item.text().substring(0, 1).toUpperCase(Locale.ROOT);
-            g.drawString(text, x + Math.max(3, size / 3), y + Math.max(8, size - 3));
-            g.setFont(font);
-        }
-
-        private void drawShadowed(Graphics2D g, String text, int x, int baseline, Color color) {
-            g.setColor(Color.BLACK);
-            g.drawString(text, x + 1, baseline + 1);
-            g.drawString(text, x + 2, baseline + 2);
-            g.setColor(color);
-            g.drawString(text, x, baseline);
-        }
-
-        private int panelWidth(Graphics2D g, Layout l, String title, List<Row> topRows, List<Row> bottomRows) {
-            g.setFont(font);
-            int labelWidth = labelWidth(g, topRows, bottomRows);
-            int separatorX = l.sidePadding + labelWidth + 8;
-            int valueX = separatorX + 8;
-            int valueWidth = valueWidth(g, topRows, bottomRows);
-            int titleWidth = Math.max(g.getFontMetrics().stringWidth("Dungeon Profit Hud"),
-                g.getFontMetrics().stringWidth("Dungeon Item Tracker"));
-            return HudGeometry.measure(labelWidth, valueWidth, titleWidth, topRows.size(), bottomRows.size(), true).width();
-        }
-
-        private int panelHeight(Layout l, List<Row> topRows, List<Row> bottomRows) {
-            return HudGeometry.measure(0, 0, 0, topRows.size(), bottomRows.size(), true).height();
-        }
-
-        private int labelWidth(Graphics2D g, List<Row> topRows, List<Row> bottomRows) {
-            int max = 0;
-            for (List<Row> rows : List.of(PROFIT_TOP_ROWS, PROFIT_BOTTOM_ROWS, ITEM_TOP_ROWS, ITEM_ROWS))
-                for (Row row : rows) max = Math.max(max, g.getFontMetrics().stringWidth(row.label()));
-            return max;
-        }
-
-        private int valueWidth(Graphics2D g, List<Row> topRows, List<Row> bottomRows) {
-            int max = 0;
-            for (List<Row> rows : List.of(PROFIT_TOP_ROWS, PROFIT_BOTTOM_ROWS, ITEM_TOP_ROWS, ITEM_ROWS))
-                for (Row row : rows) max = Math.max(max, rowValueWidth(g, row));
-            return max;
-        }
-
-        private int rowValueWidth(Graphics2D g, Row row) {
-            return g.getFontMetrics().stringWidth(row.value()) + (row.suffix().isBlank() ? 0 : 10 + g.getFontMetrics().stringWidth(row.suffix()));
-        }
-
-        private int dividerY(Layout l, List<Row> topRows) {
-            return HudGeometry.measure(0, 0, 0, topRows.size(), 0, true).dividerY();
-        }
-
-        private void drawDashedVertical(Graphics2D g, int x, int top, int bottom, int color) {
-            g.setColor(new Color(color, true));
-            int y = top;
-            while (y < bottom) {
-                g.fillRect(x, y, 1, Math.min(5, bottom - y));
-                y += 8;
-            }
-        }
-
-        private void fill(Graphics2D g, int x1, int y1, int x2, int y2, int argb) {
-            g.setColor(new Color(argb, true));
-            g.fillRect(x1, y1, x2 - x1, y2 - y1);
+        List<HudGeometry.Row> levels = layout.rows().stream().filter(row -> HudGeometry.isLevel(row.id())).toList();
+        if (levels.size() == 2) text(g, levels.getFirst().id().equals("currentLevel") ? ">" : "<",
+            layout.width() / 2 - 5, levels.getFirst().y() + 12, HudGeometry.ACCENT, 2, false, false);
+        if (inventory) {
+            String label = items ? "Profit" : "Items";
+            int x = layout.right() - HudGeometry.BUTTON_WIDTH;
+            int y = layout.sections().getLast().y() - 2;
+            fill(g, x, y, HudGeometry.BUTTON_WIDTH, HudGeometry.BUTTON_HEIGHT, HudGeometry.LINE);
+            text(g, label, x + (HudGeometry.BUTTON_WIDTH - textWidth(label, false)) / 2, y + 2, HudGeometry.ACCENT, 1, false, false);
         }
     }
 
-    private static final class SourceWatcher {
-        private final PreviewPanel panel;
-        private volatile boolean running = true;
-        private WatchService watchService;
-
-        SourceWatcher(PreviewPanel panel) {
-            this.panel = panel;
-        }
-
-        void start() {
-            Thread thread = new Thread(this::watch, "hud-preview-watch");
-            thread.setDaemon(true);
-            thread.start();
-        }
-
-        void close() {
-            running = false;
-            try {
-                if (watchService != null) watchService.close();
-            } catch (IOException ignored) {
+    private static void drawClasses(Graphics2D g, HudGeometry.Row box, boolean all) {
+        int y = box.y() + 4;
+        if (!all) {
+            text(g, "Mage level", box.x(), y, HudGeometry.MUTED, 1, false, false);
+            text(g, "Target", box.right(), y, HudGeometry.MUTED, 1, true, false);
+            text(g, "50", box.x(), y + 12, HudGeometry.WHITE, 2, false, true);
+            text(g, "51", box.right(), y + 12, HudGeometry.WHITE, 2, true, true);
+            text(g, ">", box.x() + box.width() / 2 - 5, y + 12, HudGeometry.ACCENT, 2, false, false);
+            text(g, "Target progress", box.x(), y + HudGeometry.LEVEL_HEIGHT + 2, HudGeometry.MUTED, 1, false, false);
+            text(g, "20.2%", box.right(), y + HudGeometry.LEVEL_HEIGHT + 2, HudGeometry.WHITE, 1, true, false);
+            progress(g, box.x(), y + HudGeometry.LEVEL_HEIGHT + 14, box.width(), 20.2);
+        } else {
+            text(g, "CLASSES", box.x(), y, HudGeometry.ACCENT, 1, false, false);
+            text(g, runs ? (level50 ? "Runs to 50" : "Runs to next") : (level50 ? "Level 50" : "Next level"), box.right(), y, HudGeometry.MUTED, 1, true, false);
+            List<String> labels = List.of("Healer 35", "Mage 50", "Berserk 41", "Archer 38", "Tank 50");
+            double[] values = level50 ? new double[]{2.5, 100.0, 14.0, 5.9, 100.0} : new double[]{22.0, 20.2, 68.0, 35.0, 12.0};
+            List<String> amounts = runs ? (level50 ? List.of("1,234", "0", "12,345", "123,456", "0")
+                : List.of("8", "1,234", "99", "12,345", "1,000"))
+                : java.util.Arrays.stream(values).mapToObj(value -> String.format(java.util.Locale.US, "%.1f%%", value)).toList();
+            int barX = box.x() + labels.stream().mapToInt(label -> textWidth(label, false)).max().orElse(0) + 6;
+            int valueWidth = Math.max(textWidth("100.0%", false), amounts.stream().mapToInt(value -> textWidth(value, false)).max().orElse(0));
+            int barRight = box.right() - valueWidth - 6;
+            if (barRight - barX < 40) throw new IllegalStateException("Class values leave too little room for the bars");
+            for (int i = 0; i < labels.size(); i++) {
+                int lineY = y + HudGeometry.SECTION_HEIGHT + i * HudGeometry.ROW_HEIGHT + 2;
+                text(g, labels.get(i), box.x(), lineY, HudGeometry.MUTED, 1, false, false);
+                progress(g, barX, lineY, barRight - barX, values[i]);
+                text(g, amounts.get(i), box.right(), lineY, HudGeometry.WHITE, 1, true, false);
             }
         }
+    }
 
-        private void watch() {
-            try {
-                watchService = FileSystems.getDefault().newWatchService();
-                HUD_SOURCE.getParent().register(watchService, StandardWatchEventKinds.ENTRY_MODIFY);
-                while (running) {
-                    WatchKey key = watchService.take();
-                    for (WatchEvent<?> event : key.pollEvents()) {
-                        if (HUD_SOURCE.getFileName().equals(event.context())) {
-                            SwingUtilities.invokeLater(panel::reload);
-                        }
+    private static void progress(Graphics2D g, int x, int y, int width, double percent) {
+        fill(g, x, y, width, 7, HudGeometry.LINE);
+        fill(g, x, y, HudGeometry.progressWidth(width, percent), 7, HudGeometry.ACCENT);
+    }
+
+    private static void fill(Graphics2D g, int x, int y, int width, int height, int color) {
+        g.setColor(new Color(color, true));
+        g.fillRect(x, y, width, height);
+    }
+    private static int glyphWidth(char c) {
+        if (c == ' ') return 3;
+        for (int x = 7; x >= 0; x--) for (int y = 0; y < 8; y++) {
+            if ((FONT.getRGB(c % 16 * 8 + x, c / 16 * 8 + y) >>> 24) != 0) return x + 1;
+        }
+        return 0;
+    }
+    private static int textWidth(String text, boolean bold) {
+        int width = 0;
+        for (char c : text.toCharArray()) width += glyphWidth(c) + (bold ? 2 : 1);
+        return width;
+    }
+    private static void text(Graphics2D graphics, String text, int x, int y, int color, float scale, boolean right, boolean bold) {
+        Graphics2D g = (Graphics2D) graphics.create();
+        g.translate(right ? x - textWidth(text, bold) * scale : x, y);
+        g.scale(scale, scale);
+        for (int pass = 1; pass >= 0; pass--) {
+            g.setColor(new Color(pass == 1 ? 0xFF000000 | ((color & 0xFCFCFC) >> 2) : color, true));
+            int cursor = pass;
+            for (char c : text.toCharArray()) {
+                if (c != ' ') for (int gy = 0; gy < 8; gy++) for (int gx = 0; gx < 8; gx++) {
+                    if ((FONT.getRGB(c % 16 * 8 + gx, c / 16 * 8 + gy) >>> 24) != 0) {
+                        g.fillRect(cursor + gx, gy + pass, bold ? 2 : 1, 1);
                     }
-                    key.reset();
                 }
-            } catch (IOException | InterruptedException ignored) {
-                Thread.currentThread().interrupt();
+                cursor += glyphWidth(c) + (bold ? 2 : 1);
             }
         }
+        g.dispose();
     }
-
-    private static Layout loadLayout() {
-        Layout layout = new Layout();
-        try {
-            String source = Files.readString(HUD_SOURCE, StandardCharsets.UTF_8);
-            layout.rowHeight = intValue(source, "HUD_ROW_HEIGHT\\s*=\\s*(\\d+)", layout.rowHeight);
-            layout.titleHeight = intValue(source, "HUD_TITLE_HEIGHT\\s*=\\s*(\\d+)", layout.titleHeight);
-            layout.topPadding = intValue(source, "HUD_TOP_PADDING\\s*=\\s*(\\d+)", layout.topPadding);
-            layout.sidePadding = intValue(source, "HUD_SIDE_PADDING\\s*=\\s*(\\d+)", layout.sidePadding);
-            layout.profitGap = intValue(source, "HUD_PROFIT_GAP\\s*=\\s*(\\d+)", layout.profitGap);
-            layout.iconSize = intValue(source, "HUD_ICON_SIZE\\s*=\\s*(\\d+)", layout.iconSize);
-            layout.iconX = intValue(source, "val\\s+iconX\\s*=\\s*(\\d+)", layout.iconX);
-            layout.iconSepX = intValue(source, "val\\s+iconSepX\\s*=\\s*(\\d+)", layout.iconSepX);
-            layout.labelX = intValue(source, "val\\s+labelX\\s*=\\s*(\\d+)", layout.labelX);
-            layout.minValueSepX = intValue(source, "val\\s+valueSepX\\s*=\\s*max\\((\\d+),", layout.minValueSepX);
-            layout.labelGap = intValue(source, "valueSepX\\s*=\\s*max\\(\\d+,\\s*labelX\\s*\\+\\s*labelWidth\\s*\\+\\s*(\\d+)\\)", layout.labelGap);
-            layout.valueGap = intValue(source, "val\\s+valueX\\s*=\\s*valueSepX\\s*\\+\\s*(\\d+)", layout.valueGap);
-            layout.rightPadding = intValue(source, "return\\s+max\\(valueX\\s*\\+\\s*valueWidth\\s*\\+\\s*(\\d+),", layout.rightPadding);
-            layout.minContentWidth = intValue(source, "return\\s+max\\(valueX\\s*\\+\\s*valueWidth\\s*\\+\\s*\\d+,\\s*(\\d+)\\)", layout.minContentWidth);
-            layout.cyan = colorValue(source, "HUD_CYAN", layout.cyan);
-            layout.cyanDim = colorValue(source, "HUD_CYAN_DIM", layout.cyanDim);
-            layout.green = colorValue(source, "HUD_GREEN", layout.green);
-            layout.white = colorValue(source, "HUD_WHITE", layout.white);
-            layout.muted = colorValue(source, "HUD_MUTED", layout.muted);
-            layout.line = colorValue(source, "HUD_LINE", layout.line);
-            layout.black = colorValue(source, "HUD_BLACK", layout.black);
-            layout.outerDark = colorValue(source, "HUD_OUTER_DARK", layout.outerDark);
-            layout.innerDark = colorValue(source, "HUD_INNER_DARK", layout.innerDark);
-            layout.panel = colorValue(source, "HUD_PANEL", layout.panel);
-            layout.profitPanel = colorValue(source, "HUD_PROFIT_PANEL", layout.profitPanel);
-            layout.sketchWhite = colorValue(source, "HUD_SKETCH_WHITE", layout.sketchWhite);
+    private static BufferedImage loadFont() {
+        Path cache = Path.of(".gradle", "loom-cache", "minecraftMaven");
+        try (var files = Files.walk(cache)) {
+            for (Path jar : files.filter(p -> p.toString().endsWith("26.1.2.jar")).toList()) {
+                try (ZipFile zip = new ZipFile(jar.toFile())) {
+                    var entry = zip.getEntry("assets/minecraft/textures/font/ascii.png");
+                    if (entry != null) try (var stream = zip.getInputStream(entry)) { return ImageIO.read(stream); }
+                }
+            }
         } catch (IOException failure) {
-            throw new IllegalStateException("HUD source could not be loaded: " + HUD_SOURCE.toAbsolutePath(), failure);
+            throw new IllegalStateException("Build the mod first to make Minecraft's font available.", failure);
         }
-        layout.rowHeight = HudGeometry.ROW_HEIGHT;
-        layout.titleHeight = HudGeometry.TITLE_HEIGHT;
-        layout.topPadding = HudGeometry.TOP_PADDING;
-        layout.sidePadding = HudGeometry.SIDE_PADDING;
-        layout.profitGap = HudGeometry.PROFIT_GAP;
-        return layout;
-    }
-
-    private static int intValue(String source, String regex, int fallback) {
-        Matcher matcher = Pattern.compile(regex).matcher(source);
-        return matcher.find() ? Integer.parseInt(matcher.group(1)) : fallback;
-    }
-
-    private static int colorValue(String source, String name, int fallback) {
-        Matcher matcher = Pattern.compile(name + "\\s*=\\s*0x([0-9a-fA-F]{8})").matcher(source);
-        return matcher.find() ? (int) Long.parseLong(matcher.group(1), 16) : fallback;
-    }
-
-    private static long modifiedTime() {
-        try {
-            return Files.getLastModifiedTime(HUD_SOURCE).toMillis();
-        } catch (IOException ignored) {
-            return 0L;
-        }
+        throw new IllegalStateException("Minecraft font missing; build the mod before opening the preview.");
     }
 }

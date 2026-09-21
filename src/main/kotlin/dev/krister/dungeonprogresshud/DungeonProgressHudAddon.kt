@@ -1,5 +1,7 @@
 package dev.krister.dungeonprogresshud
 
+import dev.krister.dungeonprogresshud.DungeonLevels.level as currentCataLevel
+import dev.krister.dungeonprogresshud.DungeonLevels.targetXp
 import com.github.synnerz.devonian.Devonian
 import com.github.synnerz.devonian.api.ItemUtils
 import com.github.synnerz.devonian.api.Location
@@ -8,11 +10,15 @@ import com.github.synnerz.devonian.api.events.ChatEvent
 import com.github.synnerz.devonian.config.Categories
 import com.github.synnerz.devonian.config.Config
 import com.github.synnerz.devonian.config.ConfigData
-import com.github.synnerz.devonian.hud.texthud.TextHudFeature
+import com.github.synnerz.devonian.hud.HudFeature
+import com.github.synnerz.devonian.hud.HudManager
+import com.github.synnerz.devonian.utils.BoundingBox
 import com.google.gson.GsonBuilder
 import com.google.gson.JsonArray
 import com.google.gson.JsonObject
 import com.mojang.authlib.GameProfile
+import com.mojang.brigadier.arguments.IntegerArgumentType
+import com.mojang.brigadier.arguments.LongArgumentType
 import com.mojang.brigadier.arguments.StringArgumentType
 import net.fabricmc.api.ClientModInitializer
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents
@@ -41,6 +47,7 @@ import net.minecraft.world.scores.DisplaySlot
 import net.minecraft.world.scores.PlayerTeam
 import org.lwjgl.glfw.GLFW
 import org.slf4j.LoggerFactory
+import tech.thatgravyboat.skyblockapi.api.area.dungeon.DungeonAPI
 import java.io.File
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
@@ -101,6 +108,11 @@ object DungeonProgressHudAddon : ClientModInitializer {
             feature?.flushHistory()
         }
         ClientTickEvents.END_CLIENT_TICK.register { client ->
+            val serverKey = detectedServerKey(client)
+            if (serverKey != lastTickDetectedServerKey) {
+                lastTickDetectedServerKey = serverKey
+                if (serverKey.isNotBlank()) feature?.onServerJoin()
+            }
             feature?.onFabricClientTick()
         }
     }
@@ -177,7 +189,7 @@ object DungeonProgressHudAddon : ClientModInitializer {
     fun matchesFakeOpenKey(event: KeyEvent): Boolean = feature?.matchesFakeOpenKey(event) ?: false
 
     fun onChatMessage(message: Component) {
-        feature?.parseDungeonCompletionMessage(message.string)
+        feature?.parseDungeonCompletionMessage(message)
     }
 
     private fun registerCommands() {
@@ -276,6 +288,43 @@ object DungeonProgressHudAddon : ClientModInitializer {
                             withFeature { it.sendTrackerStatus() }
                             1
                         }
+                        .then(literal("prices").executes {
+                            withFeature { it.sendTrackedItemPrices() }
+                            1
+                        })
+                        .then(literal("add")
+                            .executes {
+                                withFeature { it.sendTrackedItemPrices() }
+                                1
+                            }
+                            .then(argument("item", StringArgumentType.string())
+                                .suggests { _, builder ->
+                                    TrackedDungeonItems.all.map { it.command }
+                                        .filter { it.startsWith(builder.remainingLowerCase) }
+                                        .forEach { builder.suggest(it) }
+                                    builder.buildFuture()
+                                }
+                                .executes { context ->
+                                    withFeature { it.addTrackedItem(StringArgumentType.getString(context, "item")) }
+                                    1
+                                }
+                                .then(argument("count", IntegerArgumentType.integer(1, ChestRecorder.MAX_MANUAL_ITEM_COUNT))
+                                    .executes { context ->
+                                        withFeature { it.addTrackedItem(StringArgumentType.getString(context, "item"),
+                                            IntegerArgumentType.getInteger(context, "count")) }
+                                        1
+                                    }
+                                    .then(argument("chestCost", LongArgumentType.longArg(0))
+                                        .executes { context ->
+                                            withFeature { it.addTrackedItem(StringArgumentType.getString(context, "item"),
+                                                IntegerArgumentType.getInteger(context, "count"),
+                                                LongArgumentType.getLong(context, "chestCost")) }
+                                            1
+                                        }
+                                    )
+                                )
+                            )
+                        )
                         .then(literal("toggle").executes {
                             withFeature { it.toggleTrackerMode() }
                             1
@@ -329,7 +378,7 @@ object DungeonProgressHudAddon : ClientModInitializer {
 class DungeonProgressHudFeature(
     configCategory: Categories,
     private val configTab: String,
-) : TextHudFeature(
+) : HudFeature(
     "dungeonProgressHud",
     "Shows Catacombs XP progress and estimated runs left.",
     configCategory,
@@ -351,54 +400,14 @@ class DungeonProgressHudFeature(
         private const val CROESUS_TAB_REFRESH_INTERVAL_MILLIS = 1_000L
         private const val MAX_TRACKED_ITEM_DROPS = 5_000
         private const val HUD_LINE_GAP = 2
-        private const val HUD_ROW_HEIGHT = HudGeometry.ROW_HEIGHT
-        private const val HUD_TITLE_HEIGHT = HudGeometry.TITLE_HEIGHT
         private const val HUD_TOP_PADDING = HudGeometry.TOP_PADDING
         private const val HUD_SIDE_PADDING = HudGeometry.SIDE_PADDING
-        private const val HUD_PROFIT_GAP = HudGeometry.PROFIT_GAP
-        private const val HUD_ORDER_HINT = "&eHold Shift to drag HUD lines"
+        private const val HUD_ORDER_HINT = "Shift + drag to reorder"
         private const val STATUS_LINE_ID = "status"
-        private const val JOIN_SKYBLOCK_DETECTION_TIMEOUT_MILLIS = 300_000L
         private val JOIN_REFRESH_RETRY_DELAYS = longArrayOf(10_000L, 30_000L, 90_000L, 180_000L)
-        private val DEFAULT_HUD_LINE_ORDER = listOf(
-            "sessionTime",
-            "currentLevel",
-            "target",
-            "levelProgress",
-            "runsLeft",
-            "currentXp",
-            "remaining",
-            "floor",
-            "xpPerRun",
-            "profile",
-            "lastRun",
-            "observedCount",
-            "profit",
-            "avgChest",
-            "chestsOpened",
-            "kismets",
-            "croesus",
-            "lastChest",
-        )
-        private val PROFIT_HUD_LINE_IDS = setOf("profit", "avgChest", "chestsOpened", "croesus", "lastChest")
-        private val ACCENT_VALUE_HUD_LINE_IDS = setOf("runsLeft", "profit", "lastChest", "avgChest")
-        private const val HUD_CYAN = 0xFF42F3FF.toInt()
-        private const val HUD_CYAN_DIM = 0xFF147B84.toInt()
-        private const val HUD_GREEN = 0xFF63FF57.toInt()
-        private const val HUD_WHITE = 0xFFFFFFFF.toInt()
-        private const val HUD_MUTED = 0xFFC8C8C8.toInt()
-        private const val HUD_LINE = 0x663DFAFF
-        private const val HUD_BLACK = 0xFF000000.toInt()
-        private const val HUD_OUTER_DARK = 0xFF061014.toInt()
-        private const val HUD_INNER_DARK = 0xFF020405.toInt()
-        private const val HUD_PANEL = 0xD00A0F11.toInt()
-        private const val HUD_PROFIT_PANEL = 0x88101010.toInt()
-        private const val HUD_SKETCH_WHITE = 0xFFE8E8E8.toInt()
+        private val DEFAULT_HUD_LINE_ORDER = HudGeometry.DEFAULT_ORDER
         private const val HUD_MODE_PROFIT = "profit"
         private const val HUD_MODE_ITEMS = "items"
-        private const val HUD_MODE_BUTTON_WIDTH = 46
-        private const val HUD_MODE_BUTTON_HEIGHT = 14
-        private const val HUD_MODE_BUTTON_MARGIN = 5
         private val CROESUS_TAB_COUNT_REGEXES = listOf(
             Regex("\\bunclaimed\\s+chests?\\s*:\\s*(\\d+)", RegexOption.IGNORE_CASE),
             Regex("\\bunopened\\s+chests?\\s*:\\s*(\\d+)", RegexOption.IGNORE_CASE),
@@ -407,27 +416,6 @@ class DungeonProgressHudFeature(
             Regex("\\bcroesus\\b.*\\bchests?\\b.*?(\\d+)", RegexOption.IGNORE_CASE),
             Regex("\\b(\\d+)\\b.*\\bcroesus\\b.*\\bchests?\\b", RegexOption.IGNORE_CASE),
         )
-        private val TRACKED_DROPS = listOf(
-            TrackedDropDefinition("NECRON_HANDLE", "Handle", setOf("NECRON_HANDLE", "NECRON'S_HANDLE", "NECRONS_HANDLE")),
-            TrackedDropDefinition("IMPLOSION_SCROLL", "Implosion", setOf("IMPLOSION_SCROLL", "IMPLOSION")),
-            TrackedDropDefinition("WITHER_SHIELD_SCROLL", "Wither Shield", setOf("WITHER_SHIELD_SCROLL", "WITHER_SHIELD")),
-            TrackedDropDefinition("SHADOW_WARP_SCROLL", "Shadow Warp", setOf("SHADOW_WARP_SCROLL", "SHADOW_WARP")),
-            TrackedDropDefinition("RECOMBOBULATOR_3000", "Recomb", setOf("RECOMBOBULATOR_3000", "RECOMBOBULATOR")),
-            TrackedDropDefinition("AUTO_RECOMBOBULATOR", "Auto Recomb", setOf("AUTO_RECOMBOBULATOR", "AUTO_RECOMBOBULATOR_3000")),
-            TrackedDropDefinition("DARK_CLAYMORE", "Claymore", setOf("DARK_CLAYMORE")),
-            TrackedDropDefinition("FIFTH_MASTER_STAR", "5th Star", setOf("FIFTH_MASTER_STAR", "5TH_MASTER_STAR", "MASTER_STAR_TIER_5")),
-            TrackedDropDefinition("WITHER_CHESTPLATE", "Chestplate", setOf("WITHER_CHESTPLATE")),
-            TrackedDropDefinition("MASTER_SKULL_TIER_5", "Skull T5", setOf("MASTER_SKULL_TIER_5", "MASTER_SKULL_5")),
-            TrackedDropDefinition("NECRON_DYE", "Necron Dye", setOf("NECRON_DYE", "NECRONS_DYE", "NECRON'S_DYE")),
-        )
-        private val TRACKED_DROPS_BY_ALIAS = TRACKED_DROPS
-            .flatMap { drop -> drop.aliases.map { normalizeTrackedAlias(it) to drop } }
-            .toMap()
-
-        private fun normalizeTrackedAlias(value: String): String =
-            value.uppercase(Locale.ROOT)
-                .replace(Regex("[^A-Z0-9]+"), "_")
-                .trim('_')
     }
 
     private val PREFIX = "&6[&bDPH&6]&r "
@@ -451,15 +439,19 @@ class DungeonProgressHudFeature(
     private val showRunsLeft = addSwitch("1c_showRunsLeft", true, "Show estimated runs left.", "Runs Left", emptySet(), false, configTab)
     private val showProfile = addSwitch("1d_showProfile", false, "Show selected SkyBlock profile.", "Profile", emptySet(), false, configTab)
     private val showLastRun = addSwitch("1e_showLastRun", true, "Show the most recent recorded run XP in the selected tracker scope.", "Last Run XP", emptySet(), false, configTab)
-    private val showObservedCount = addSwitch("1f_showObservedCount", false, "Show persisted runs for the selected tracker scope.", "Run Count", emptySet(), false, configTab)
+    private val showObservedCount = addSwitch("1f_showObservedCount", true, "Show persisted runs for the selected tracker scope.", "Run Count", emptySet(), false, configTab)
+    private val classProgressMode = addSelection("1g_classProgressMode", 0, listOf("Off", "Current Class", "All Classes"), "Show the current class toward your target, or progress bars for all five classes.", "Class Progress", emptySet(), configTab)
+    private val classTargetLevel = addTextInput("1h_classTargetLevel", "50", "Target level for the Current Class view (1-1000, including virtual levels above 50).", "Class Target Level", emptySet(), configTab)
+    private val allClassesGoal = addSelection("1i_allClassesGoal", 0, listOf("Next Level", "Level 50"), "Choose what the All Classes progress bars measure.", "All Classes Goal", emptySet(), configTab)
+    private val showClassRuns = addSwitch("1j_showClassRuns", false, "Replace All Classes percentages with estimated runs remaining while continuing your current class. Uses measured class XP gains, including passive XP, on the displayed floor.", "Class Runs Remaining", emptySet(), false, configTab)
 
     private val xpMode = addSelection("21_xpMode", 0, listOf("Observed Average", "Hardcoded"), "XP/run source.", "XP/Run Mode", emptySet(), configTab)
     private val hardcodedXpPerRun = addTextInput("22_hardcodedXpPerRun", "450000", "Fallback XP per run.", "Hardcoded XP/Run", emptySet(), configTab)
     private val trackChestProfit = addSwitch("31_trackChestProfit", true, "Track profit when claiming dungeon reward chests.", "Track Chest Profit", emptySet(), false, configTab)
     private val showChestProfit = addSwitch("32_showChestProfit", true, "Show tracked dungeon chest profit.", "Chest Profit", emptySet(), false, configTab)
     private val chestProfitMode = addSelection("33_chestProfitMode", 0, listOf("Session", "Total"), "Choose whether profit and item tracker lines use this session or all tracked chests.", "Tracker Mode", emptySet(), configTab)
-    private val showChestCount = addSwitch("34_showChestCount", true, "Show tracked dungeon reward chest count.", "Chest Count", emptySet(), false, configTab)
-    private val showLastChest = addSwitch("35_showLastChest", true, "Show the last opened dungeon reward chest and its profit.", "Last Chest Opened", emptySet(), false, configTab)
+    private val showChestCount = addSwitch("34_showChestCount", false, "Show tracked dungeon reward chest count.", "Chest Count", emptySet(), false, configTab)
+    private val showLastChest = addSwitch("35_showLastChest", false, "Show the last opened dungeon reward chest and its profit.", "Last Chest Opened", emptySet(), false, configTab)
     private val includeEssenceProfit = addSwitch("36_includeEssenceProfit", true, "Include essence value in chest profit.", "Include Essence", emptySet(), false, configTab)
     private val includeDungeonKeyCost = addSwitch("37_includeDungeonKeyCost", false, "Subtract Dungeon Chest Key value when a reward chest requires one.", "Count Dungeon Key Cost", emptySet(), false, configTab)
     private val bazaarValuation = addSelection("38_bazaarValuation", 0, listOf("Instant Buy", "Instant Sell"), "Choose the Bazaar side used to value rewards.", "Bazaar Valuation", emptySet(), configTab)
@@ -530,6 +522,8 @@ class DungeonProgressHudFeature(
     private val sessionStartedAt: Long
         get() = sessionTracker.startedAt
     private var detectedFloorLabel = ""
+    private var completedDungeon: Pair<net.minecraft.client.multiplayer.ClientLevel, String>? = null
+    private var detectedDungeonClass: String? = null
     private var nextPriceRefreshAt = 0L
     private var priceRefreshInProgress = false
     private var priceRefreshError: String? = null
@@ -579,6 +573,8 @@ class DungeonProgressHudFeature(
             if (bazaarValuation.get() !in bazaarValuation.options.indices) bazaarValuation.set(0)
             if (auctionValuation.get() !in auctionValuation.options.indices) auctionValuation.set(0)
             if (missingPriceBehavior.get() !in missingPriceBehavior.options.indices) missingPriceBehavior.set(0)
+            if (classProgressMode.get() !in classProgressMode.options.indices) classProgressMode.set(0)
+            if (allClassesGoal.get() !in allClassesGoal.options.indices) allClassesGoal.set(0)
             settingsLoaded = true
         }
     }
@@ -590,7 +586,12 @@ class DungeonProgressHudFeature(
             return
         }
         lastServerJoinEventAt = joinedAt
-        nextPriceRefreshAt = joinedAt + 10_000L
+        scheduleJoinRefresh(joinedAt)
+        log("Server join refresh scheduled user=${mc.user.name} uuid=${mc.user.profileId}")
+    }
+
+    private fun scheduleJoinRefresh(joinedAt: Long) {
+        nextPriceRefreshAt = joinedAt
         joinRefreshStartedAt = joinedAt
         joinRefreshAttempts = 0
         nextJoinRefreshAttemptAt = 0L
@@ -598,12 +599,13 @@ class DungeonProgressHudFeature(
         skyBlockJoinRefreshAttempted = false
         skyBlockJoinRefreshCompleted = false
         startupRefreshAttempted = true
-        log("Server join refresh scheduled user=${mc.user.name} uuid=${mc.user.profileId}")
     }
 
     fun onServerDisconnect() {
         clearPendingChestTracking()
+        completedDungeon = null
         detectedFloorLabel = ""
+        detectedDungeonClass = null
         pendingCompletionAt = 0L
         pendingCompletionFloor = ""
         pendingCompletionTimeSeconds = 0
@@ -614,6 +616,7 @@ class DungeonProgressHudFeature(
         refreshGeneration++
         refreshing = false
         lastRefresh = 0L
+        lastServerJoinEventAt = 0L
         pauseSessionTimer("disconnect")
         joinRefreshStartedAt = 0L
         joinRefreshAttempts = 0
@@ -623,46 +626,23 @@ class DungeonProgressHudFeature(
         skyBlockJoinRefreshCompleted = false
     }
 
-    override fun getEditText(): List<String> {
-        val topRows = orderProfitRows(
-            buildList {
-                add(ProfitHudRow("sessionTime", "Time", "Not started"))
-                if (showCurrentLevel.get()) add(ProfitHudRow("currentLevel", "Cata", "50"))
-                if (showTarget.get()) add(ProfitHudRow("target", "Target", targetLevelValue().toString()))
-                if (showLevelProgress.get()) add(ProfitHudRow("levelProgress", "Next", "28.9%"))
-                if (showRunsLeft.get()) add(ProfitHudRow("runsLeft", "Left", "252"))
-                if (showCurrentXp.get()) add(ProfitHudRow("currentXp", "XP", "627.58m"))
-                if (showRemaining.get()) add(ProfitHudRow("remaining", "Remaining", "113.4m"))
-                if (showFloor.get()) add(ProfitHudRow("floor", "Floor", floorValue()))
-                if (showXpPerRun.get()) add(ProfitHudRow("xpPerRun", "XP/Run", hardcodedXpPerRunValue().formatCompact()))
-                if (showProfile.get()) add(ProfitHudRow("profile", "Profile", "Selected"))
-                if (showLastRun.get()) add(ProfitHudRow("lastRun", "Last", "491k", "(4.83m/h)"))
-                if (showObservedCount.get()) add(ProfitHudRow("observedCount", "Runs", "100"))
-            }
-        )
-        val bottomRows = orderProfitRows(
-            buildList {
-                if (showChestCount.get()) add(ProfitHudRow("chestsOpened", "Chests", "359"))
-                if (showChestProfit.get()) {
-                    add(ProfitHudRow("profit", "Profit", "2.79b"))
-                    add(ProfitHudRow("avgChest", "Avg Chest", "7.77m"))
-                }
-                add(ProfitHudRow("kismets", "Kismets", "0"))
-                add(ProfitHudRow("croesus", "Croesus", "0"))
-                if (showLastChest.get()) add(ProfitHudRow("lastChest", "Last Chest", "Obsidian", "1.2m"))
-            }
-        )
-        return listOf("&fDungeon Profit Hud", "&f") +
-            topRows.map(::editPreviewLine) +
-            listOf("&f", "&f----------------", "&f") +
-            bottomRows.map(::editPreviewLine)
+    override fun drawImpl(ctx: GuiGraphicsExtractor) = drawDirect(ctx)
+
+    override fun sampleDraw(ctx: GuiGraphicsExtractor, mx: Int, my: Int, selected: Boolean) {
+        drawDirect(ctx)
+        super.sampleDraw(ctx, mx, my, selected)
     }
 
-    private fun editPreviewLine(row: ProfitHudRow): String {
-        val paddedLabel = row.label.padEnd(7)
-        val suffix = if (row.suffix.isBlank()) "" else " ${row.suffix}"
-        return "&f$paddedLabel | ${row.value}$suffix"
+    override fun getBounds(): BoundingBox {
+        val (_, top, bottom) = currentHudContent()
+        val layout = hudPanelLayout(top, bottom)
+        val renderScale = hudRenderScale()
+        return BoundingBox(hudX(), hudY(), layout.width() * renderScale.toDouble(), layout.height() * renderScale.toDouble())
     }
+
+    private fun hudX() = if (x.isFinite()) x else 10.0
+    private fun hudY() = if (y.isFinite()) y else 10.0
+    private fun hudRenderScale() = scale.takeIf { it.isFinite() && it > 0f } ?: 1f
 
     private fun clearPendingChestTracking() {
         pendingChestProfit = null
@@ -689,10 +669,13 @@ class DungeonProgressHudFeature(
         val owner = "$account:$profile"
         if (account.isNotBlank() && profile.isNotBlank() && owner != trackingOwner) {
             trackingOwner = owner
+            completedDungeon = null
+            detectedFloorLabel = ""
             clearPendingChestTracking()
             refreshGeneration++
             refreshing = false
             data = null
+            detectedDungeonClass = null
             lastRefresh = 0L
             state.croesusUnclaimedCount = -1
             pendingCompletionAt = 0L
@@ -702,6 +685,13 @@ class DungeonProgressHudFeature(
             pendingCompletionGrade = ""
             lastDungeonCompletionChat = ""
             sessionTracker = DungeonSessionTracker()
+            // Profile identity can arrive after the first join refresh already completed.
+            scheduleJoinRefresh(System.currentTimeMillis())
+        }
+        if (data == null) {
+            data = HistoryQueries.savedProfile(state, account, profile, mc.player?.name?.string.orEmpty(),
+                activeSkyBlockProfile()?.second.orEmpty())
+            if (data != null) status = "Loaded saved ${data!!.profileName}"
         }
         clientTick()
     }
@@ -718,9 +708,13 @@ class DungeonProgressHudFeature(
         val now = System.currentTimeMillis()
         val scoreboard = getScoreboardText()
         val tabList = tabListLines()
-        val completionFloor = pendingCompletionFloor.takeIf { it.isNotBlank() && now - pendingCompletionAt in 0..30_000 }
-        (DungeonActivityDetector.detectFloor(null, null, scoreboard, emptyList()) ?: completionFloor
-            ?: DungeonActivityDetector.detectFloor(Location.area, Location.subarea, "", tabList))?.let {
+        DungeonClasses.key(DungeonAPI.dungeonClass?.name)?.let {
+            detectedDungeonClass = it
+        }
+        // A completion is authoritative for this dungeon world, including normal/master mode.
+        if (completedDungeon?.first !== mc.level) completedDungeon = null
+        val completionFloor = completedDungeon?.second
+        (completionFloor ?: DungeonActivityDetector.detectFloor(Location.area, Location.subarea, scoreboard, tabList))?.let {
             detectedFloorLabel = it
         }
         if (settingsLoaded && !state.medianPricingDefaultApplied) {
@@ -749,7 +743,6 @@ class DungeonProgressHudFeature(
             maybeAutoRefresh()
         }
         wasVisible = visible
-        setLines(buildLines())
     }
 
     private fun maybeRefreshPrices(now: Long) {
@@ -781,14 +774,9 @@ class DungeonProgressHudFeature(
         if (!sessionReady()) return false
 
         val now = System.currentTimeMillis()
-        if (now - joinRefreshStartedAt > JOIN_SKYBLOCK_DETECTION_TIMEOUT_MILLIS) {
-            skyBlockJoinRefreshCompleted = true
-            log("SkyBlock join refresh timed out waiting for scoreboard")
-            return false
-        }
         if (!isSkyBlockArea()) return false
 
-        if (data != null && lastRefresh >= joinRefreshStartedAt) {
+        if (skyBlockJoinRefreshAttempted && data != null && lastRefresh >= joinRefreshStartedAt) {
             skyBlockJoinRefreshCompleted = true
             log("SkyBlock detected after server join; profile already refreshed")
             return false
@@ -838,7 +826,7 @@ class DungeonProgressHudFeature(
 
     fun renderHud(graphics: GuiGraphicsExtractor) {
         val enabled = isEnabled()
-        if (mc.screen is AbstractContainerScreen<*>) {
+        if (mc.screen is AbstractContainerScreen<*> || HudManager.isEditing) {
             return
         }
         val visible = shouldRenderCached()
@@ -923,6 +911,8 @@ class DungeonProgressHudFeature(
     fun resetSamples() {
         state.averagingResetAt = System.currentTimeMillis()
         state.samples.clear()
+        state.classXpSamples.clear()
+        state.lastClassExperience = data?.classExperience.orEmpty()
         state.lastCatacombsXp = data?.catacombsExperience ?: 0L
         state.lastPlayerUuid = data?.playerUuid.orEmpty()
         saveState()
@@ -999,6 +989,43 @@ class DungeonProgressHudFeature(
         val stats = chestProfitStats()
         send("Tracker view: ${stats.label}, ${stats.profit.formatCoins()} across ${stats.chests} chests.")
         send("Includes current profile and older local chest history with unknown ownership. /dph legacy shows historical lifetime counters; discarded records cannot be assigned to a time window.")
+        send("Add tracked drops: /dph items add <item> [count] [chestCost]. List items and costs: /dph items prices.")
+    }
+
+    fun sendTrackedItemPrices() {
+        send("Use /dph items add <item> [count] [chestCost]. Count defaults to 1; optional cost is coins per chest.")
+        send("Standard M7 opening costs (each item counts as one chest):")
+        TrackedDungeonItems.all.forEach { item -> send("${item.command}: ${item.chestCoinCost.formatCoins()} coins.") }
+    }
+
+    fun addTrackedItem(input: String, count: Int = 1, chestCoinCost: Long? = null) {
+        startRuntime("manual item command")
+        val item = TrackedDungeonItems.find(input)
+        if (item == null) {
+            send("Unknown tracked item. Use /dph items prices or Tab to see the item names.")
+            return
+        }
+        if (!historyRepository.writable || historyRepository.error != null) {
+            send("History cannot be saved. Nothing added; /dph shows the history error.")
+            return
+        }
+        val profile = activeSkyBlockProfile()
+        val context = ClaimContext("", currentAccountId(), profile?.first?.toString()?.replace("-", "").orEmpty(),
+            profile?.second.orEmpty(), "M7")
+        val now = System.currentTimeMillis()
+        val candidate = try {
+            ChestRecorder.recordManualItems(state, item, count, chestCoinCost ?: item.chestCoinCost, priceService, context, now)
+        } catch (error: IllegalArgumentException) {
+            send(error.message ?: "Invalid item entry. Nothing added.")
+            return
+        } catch (_: ArithmeticException) {
+            send("That entry would exceed the history's number limits. Nothing added.")
+            return
+        }
+        ensureSessionStarted(now, "manual item")
+        saveState()
+        send("Added $count x ${item.displayName}: ${(candidate.grossValue * count).formatCoins()} value - ${(candidate.chestCoinCost * count).formatCoins()} chest cost = ${(candidate.profit * count).formatCoins()} profit.")
+        log("Manual item added item=${item.key} count=$count ${candidate.summary()}")
     }
 
     fun resetTrackedItems() {
@@ -1198,90 +1225,51 @@ class DungeonProgressHudFeature(
         log("Selected Croesus chest from click title=${screen.title.string} slot=$slotId ${candidate.summary()}")
     }
 
-    private data class HudLine(
-        val id: String,
-        val text: String,
-    )
-
     private data class ProfitHudRow(
         val id: String,
         val label: String,
         val value: String,
         val suffix: String = "",
+        val classes: List<ClassProgress> = emptyList(),
     )
 
-    private data class TrackedDropDefinition(
-        val key: String,
-        val displayName: String,
-        val aliases: Set<String>,
-    )
-
-    private data class HudPanelLayout(
-        val width: Int,
-        val dividerY: Int,
-        val height: Int,
-        val separatorX: Int,
-        val valueX: Int,
-    )
-
-    private data class HudLineBounds(
-        val id: String,
-        val text: String,
-        val left: Double,
-        val top: Double,
-        val right: Double,
-        val bottom: Double,
-    )
-
-    private fun buildLines(): List<String> = orderedHudLines(buildHudLines()).map { it.text }
-
-    private fun buildHudLines(): List<HudLine> {
-        val (_, top, bottom) = currentHudContent()
-        return (top + bottom).map { HudLine(it.id, "${it.label}: ${it.value} ${it.suffix}".trim()) }
-    }
-
-    private fun orderedHudLines(lines: List<HudLine>): List<HudLine> {
-        if (lines.isEmpty()) return lines
-        val byId = lines.associateBy { it.id }
-        val orderedIds = normalizedHudLineOrder() + lines.map { it.id }.filter { it !in DEFAULT_HUD_LINE_ORDER }
-        return orderedIds.mapNotNull { byId[it] }
-    }
-
-    private fun normalizedHudLineOrder(): List<String> {
-        val normalized = state.hudLineOrder.orEmpty()
-            .filter { it in DEFAULT_HUD_LINE_ORDER }
-            .distinct()
-            .toMutableList()
-        DEFAULT_HUD_LINE_ORDER.filterTo(normalized) { it !in normalized }
-        return normalized
-    }
+    private fun normalizedHudLineOrder(): List<String> = HudGeometry.normalizeOrder(state.hudLineOrder.orEmpty())
 
     fun renderHudOrderOverlay(graphics: GuiGraphicsExtractor, mouseX: Double, mouseY: Double) {
         if (!renderHud.get() || !isEnabled()) return
+        drawDirect(graphics)
+        val rows = editableHudLineBounds()
+        if (rows.isEmpty()) return
         val dragging = draggedHudLineId != null
-        val lines = editableHudLines()
-        if (lines.isEmpty()) {
-            drawDirect(graphics)
-            return
-        }
-
-        val shiftDown = isShiftDown()
-        val hoverId = if (shiftDown || dragging) hudLineAt(mouseX, mouseY, lines)?.id else null
+        val hoverId = if (isShiftDown() || dragging) hudLineAt(mouseX, mouseY)?.id() else null
         if (dragging) hoveredHudLineId = hoverId
-        drawHudOrderOverlay(graphics, lines, hoverId)
+        graphics.drawString(mc.font, Component.literal(HUD_ORDER_HINT), hudX().toInt(),
+            (hudY() - (mc.font.lineHeight + HUD_LINE_GAP + 2) * hudRenderScale()).toInt().coerceAtLeast(2), HudGeometry.ACCENT, true)
+        graphics.pose().pushMatrix()
+        graphics.pose().translate(hudX().toFloat(), hudY().toFloat())
+        graphics.pose().scale(hudRenderScale(), hudRenderScale())
+        for (row in rows) {
+            val highlight = when {
+                row.id() == draggedHudLineId -> 0x556ECAFD
+                dragging && row.id() == hoveredHudLineId -> 0x556FF4C6
+                !dragging && row.id() == hoverId -> 0x33FFFFFF
+                else -> continue
+            }
+            graphics.fill(row.x(), row.y(), row.right(), row.bottom(), highlight)
+        }
+        graphics.pose().popMatrix()
     }
 
     fun onHudOrderMouseClicked(screen: AbstractContainerScreen<*>, event: MouseButtonEvent, shiftDown: Boolean): Boolean {
         if (!shiftDown || event.button() != GLFW.GLFW_MOUSE_BUTTON_LEFT) return false
-        val hit = hudLineAt(event.x(), event.y(), editableHudLines()) ?: return false
-        draggedHudLineId = hit.id
-        hoveredHudLineId = hit.id
+        val hit = hudLineAt(event.x(), event.y()) ?: return false
+        draggedHudLineId = hit.id()
+        hoveredHudLineId = hit.id()
         return true
     }
 
     fun onHudModeButtonPressed(): Boolean {
-        val screen = mc.screen
-        if (screen !is AbstractContainerScreen<*>) return false
+        if (mc.screen !is AbstractContainerScreen<*>) return false
         val mouse = currentScaledMousePosition()
         if (!hudModeButtonContains(mouse.first, mouse.second)) return false
         toggleHudViewMode()
@@ -1290,113 +1278,39 @@ class DungeonProgressHudFeature(
 
     fun onHudOrderMouseDragged(screen: AbstractContainerScreen<*>, event: MouseButtonEvent, dragX: Double, dragY: Double): Boolean {
         if (draggedHudLineId == null) return false
-        hoveredHudLineId = hudLineAt(event.x(), event.y(), editableHudLines())?.id
+        hoveredHudLineId = hudLineAt(event.x(), event.y())?.id()
         return true
     }
 
     fun onHudOrderMouseReleased(screen: AbstractContainerScreen<*>, event: MouseButtonEvent): Boolean {
         val draggedId = draggedHudLineId ?: return false
-        val targetId = hudLineAt(event.x(), event.y(), editableHudLines())?.id ?: hoveredHudLineId
+        val targetId = hudLineAt(event.x(), event.y())?.id() ?: hoveredHudLineId
         draggedHudLineId = null
         hoveredHudLineId = null
-
         if (targetId != null && targetId != draggedId && moveHudLine(draggedId, targetId)) {
             log("HUD line order changed dragged=$draggedId target=$targetId order=${normalizedHudLineOrder().joinToString(",")}")
         }
         return true
     }
 
-    private fun editableHudLines(): List<HudLine> {
-        if (!renderHud.get() || !isEnabled()) return emptyList()
-        if (currentHudMode() == HUD_MODE_ITEMS) return emptyList()
-        return (buildProfitHudTopRows() + buildProfitHudBottomRows()).map { HudLine(it.id, it.label) }
+    private fun editableHudLineBounds(): List<HudGeometry.Row> {
+        if (!renderHud.get() || !isEnabled() || currentHudMode() == HUD_MODE_ITEMS) return emptyList()
+        return hudPanelLayout(buildProfitHudTopRows(), buildProfitHudBottomRows()).rows()
+            .filter { it.id() in DEFAULT_HUD_LINE_ORDER }
     }
 
-    private fun hudLineAt(mouseX: Double, mouseY: Double, lines: List<HudLine>): HudLineBounds? =
-        hudLineBounds(lines).firstOrNull { mouseX >= it.left && mouseX <= it.right && mouseY >= it.top && mouseY <= it.bottom }
-
-    private fun hudLineBounds(lines: List<HudLine>): List<HudLineBounds> {
-        if (lines.isEmpty()) return emptyList()
-        val drawX = if (x.isFinite()) x else 10.0
-        val drawY = if (y.isFinite()) y else 10.0
-        val renderScale = scale.takeIf { it.isFinite() && it > 0f } ?: 1f
-        val topRows = buildProfitHudTopRows()
-        val bottomRows = buildProfitHudBottomRows()
-        val layout = hudPanelLayout(topRows, bottomRows)
-        val left = drawX
-        val right = drawX + layout.width * renderScale
-
-        val bounds = mutableListOf<HudLineBounds>()
-        var yOffset = HUD_TOP_PADDING + HUD_TITLE_HEIGHT
-        for (row in topRows) {
-            val top = drawY + yOffset * renderScale
-            val bottom = drawY + (yOffset + HUD_ROW_HEIGHT) * renderScale
-            bounds.add(HudLineBounds(row.id, row.label, left, top, right, bottom))
-            yOffset += HUD_ROW_HEIGHT
+    private fun hudLineAt(mouseX: Double, mouseY: Double): HudGeometry.Row? =
+        editableHudLineBounds().firstOrNull {
+            it.contains((mouseX - hudX()) / hudRenderScale(), (mouseY - hudY()) / hudRenderScale())
         }
-        yOffset = layout.dividerY + 1 + HUD_PROFIT_GAP
-        for (row in bottomRows) {
-            val top = drawY + yOffset * renderScale
-            val bottom = drawY + (yOffset + HUD_ROW_HEIGHT) * renderScale
-            bounds.add(HudLineBounds(row.id, row.label, left, top, right, bottom))
-            yOffset += HUD_ROW_HEIGHT
-        }
-        return bounds
-    }
-
-    private fun drawHudOrderOverlay(graphics: GuiGraphicsExtractor, lines: List<HudLine>, hoverId: String?) {
-        val drawX = if (x.isFinite()) x.toFloat() else 10f
-        val drawY = if (y.isFinite()) y.toFloat() else 10f
-        val renderScale = scale.takeIf { it.isFinite() && it > 0f } ?: 1f
-        val hintY = (drawY - (mc.font.lineHeight + HUD_LINE_GAP + 2) * renderScale).coerceAtLeast(2f)
-        graphics.drawString(mc.font, Component.literal(HUD_ORDER_HINT.colorize()), drawX.toInt(), hintY.toInt(), 0xFFFFFFFF.toInt(), true)
-
-        drawDirect(graphics)
-
-        graphics.pose().pushMatrix()
-        graphics.pose().translate(drawX, drawY)
-        graphics.pose().scale(renderScale, renderScale)
-
-        val draggedId = draggedHudLineId
-        val targetId = if (draggedId != null) hoveredHudLineId ?: hoverId else hoverId
-        val topRows = buildProfitHudTopRows()
-        val bottomRows = buildProfitHudBottomRows()
-        val layout = hudPanelLayout(topRows, bottomRows)
-        val panelWidth = layout.width
-
-        fun highlightRows(rows: List<ProfitHudRow>, startY: Int) {
-            var yOffset = startY
-            for (row in rows) {
-                val highlight = when {
-                    row.id == draggedId -> 0x663399FF
-                    draggedId != null && row.id == targetId -> 0x6644CC66
-                    draggedId == null && row.id == hoverId -> 0x33FFFFFF
-                    else -> null
-                }
-                if (highlight != null) {
-                    graphics.fill(8, yOffset, panelWidth - 8, yOffset + HUD_ROW_HEIGHT, highlight)
-                }
-                yOffset += HUD_ROW_HEIGHT
-            }
-        }
-        highlightRows(topRows, HUD_TOP_PADDING + HUD_TITLE_HEIGHT)
-        val dividerY = HUD_TOP_PADDING + HUD_TITLE_HEIGHT + topRows.size * HUD_ROW_HEIGHT + HUD_PROFIT_GAP / 2
-        highlightRows(bottomRows, dividerY + 1 + HUD_PROFIT_GAP)
-
-        graphics.pose().popMatrix()
-    }
 
     private fun moveHudLine(draggedId: String, targetId: String): Boolean {
         if (draggedId !in DEFAULT_HUD_LINE_ORDER || targetId !in DEFAULT_HUD_LINE_ORDER) return false
-        val order = normalizedHudLineOrder().toMutableList()
-        val targetIndex = order.indexOf(targetId)
-        if (targetIndex < 0) return false
-        if (!order.remove(draggedId)) return false
-        order.add(targetIndex.coerceAtMost(order.size), draggedId)
-        if (order == state.hudLineOrder) return false
-        state.hudLineOrder = order
+        val previous = normalizedHudLineOrder()
+        val order = HudGeometry.move(previous, draggedId, targetId)
+        if (order == previous) return false
+        state.hudLineOrder = order.toMutableList()
         saveState()
-        setLines(buildLines())
         return true
     }
 
@@ -1568,8 +1482,8 @@ class DungeonProgressHudFeature(
     }
 
     private fun trackedDropFor(itemId: String, displayName: String): TrackedDrop? {
-        val definition = TRACKED_DROPS_BY_ALIAS[normalizeTrackedAlias(itemId)]
-            ?: TRACKED_DROPS_BY_ALIAS[normalizeTrackedAlias(displayName.cleanMc())]
+        val definition = TrackedDungeonItems.find(itemId)
+            ?: TrackedDungeonItems.find(displayName.cleanMc())
             ?: return null
         return TrackedDrop(definition.key, definition.displayName)
     }
@@ -1653,6 +1567,7 @@ class DungeonProgressHudFeature(
     private fun recordSample(profile: ProfileData, recordObservedSample: Boolean) {
         val profileId = profile.profileId.replace("-", "")
         val now = System.currentTimeMillis()
+        DungeonClasses.recordXpSample(state, profile, now)
         val previousAt = state.lastBaselineAt
         state.lastBaselineAt = now
         if (profileId.isBlank() || state.lastProfileId != profileId || state.lastPlayerUuid != profile.playerUuid) {
@@ -1677,9 +1592,10 @@ class DungeonProgressHudFeature(
         saveState()
     }
 
-    fun parseDungeonCompletionMessage(message: String) {
+    fun parseDungeonCompletionMessage(message: Component) {
         if (!isEnabled()) return
-        message.cleanMc().lines().forEach { line ->
+        val text = message.string.cleanMc()
+        text.lines().forEach { line ->
             if (trackChestProfit.get() && ChestConfirmation.kismetUsed(line)) {
                 rerollAttempts.confirmChat(System.currentTimeMillis()) { true }?.let(::recordConfirmedKismet)
             }
@@ -1688,6 +1604,12 @@ class DungeonProgressHudFeature(
                     ?.let { recordChestProfit(it.value, "server-chat", it.claimId) }
             }
             parseDungeonCompletionLine(line)
+        }
+        // Class rewards can follow the Cata XP in another server message.
+        val run = ownedRuns().lastOrNull { it.timestamp == lastDungeonCompletionChatAt }
+        if (CompletionParser.recordClassExperience(message, run, System.currentTimeMillis())) {
+            saveState()
+            log("Recorded class XP floor=${run!!.floorLabel} played=${run.dungeonClass} classes=${run.classExperience}")
         }
     }
 
@@ -1715,6 +1637,8 @@ class DungeonProgressHudFeature(
         }
 
         clearPendingChestTracking()
+        completedDungeon = mc.level?.let { it to floor }
+        CompletionParser.dungeonClass(message)?.let { detectedDungeonClass = it }
         chestContextFloor = floor
         lastDungeonCompletionChat = dedupeKey
         lastDungeonCompletionChatAt = timestamp
@@ -1738,6 +1662,8 @@ class DungeonProgressHudFeature(
                 grade = pendingCompletionGrade,
                 rawCataXp = cataXp,
                 normalizedCataXp = lastDungeonCompletionNormalizedXp,
+                dungeonClass = CompletionParser.dungeonClass(message) ?: detectedDungeonClass ?: data?.selectedDungeonClass.orEmpty(),
+                partyClasses = currentPartyClasses(),
             )
         )
         incrementCroesusUnclaimedCount("dungeon-completion")
@@ -1856,8 +1782,15 @@ class DungeonProgressHudFeature(
         return ownedRuns().filter { it.timestamp >= sessionStartedAt }
     }
 
+    private fun progressionRuns(runs: List<DungeonRunRecord> = ownedRuns(), useLastRun: Boolean = isSessionScope()): List<DungeonRunRecord> {
+        val now = System.currentTimeMillis()
+        return HistoryQueries.progressionRuns(runs, floorValue(), state.averagingResetAt, now, useLastRun) {
+            isInSelectedTrackerScope(it, now)
+        }
+    }
+
     private fun scopedObservedXp(): List<Pair<Long, Long>> =
-        HistoryQueries.observedXp(scopedRuns(), floorValue(), state.averagingResetAt)
+        HistoryQueries.observedXp(progressionRuns(), floorValue(), state.averagingResetAt)
 
     private fun isInSelectedTrackerScope(timestamp: Long, now: Long): Boolean = when {
         timestamp > now -> false
@@ -1964,33 +1897,113 @@ class DungeonProgressHudFeature(
 
     private fun drawDirect(graphics: GuiGraphicsExtractor) {
         val (title, topRows, bottomRows) = currentHudContent()
-        if (topRows.isEmpty() && bottomRows.isEmpty()) return
-
-        graphics.pose().pushMatrix()
-        val drawX = if (x.isFinite()) x.toFloat() else 10f
-        val drawY = if (y.isFinite()) y.toFloat() else 10f
-        val renderScale = scale.takeIf { it.isFinite() && it > 0f } ?: 1f
-        graphics.pose().translate(drawX, drawY)
-        graphics.pose().scale(renderScale, renderScale)
-
-        val fontHeight = mc.font.lineHeight
         val layout = hudPanelLayout(topRows, bottomRows)
-
-        drawProfitPanel(graphics, layout.width, layout.height, layout.dividerY)
-
-        val buttonX = layout.width - HUD_MODE_BUTTON_WIDTH - HUD_MODE_BUTTON_MARGIN
-        val titleRight = if (mc.screen is AbstractContainerScreen<*>) buttonX - 4 else layout.width
-        val titleX = ((titleRight - mc.font.width(title)) / 2).coerceAtLeast(HUD_SIDE_PADDING)
-        graphics.drawString(mc.font, Component.literal(title), titleX, HUD_TOP_PADDING, HUD_SKETCH_WHITE, true)
-        if (mc.screen is AbstractContainerScreen<*>) {
-            drawHudModeButton(graphics, layout.width)
+        val byId = (topRows + bottomRows).associateBy { it.id }
+        graphics.pose().pushMatrix()
+        graphics.pose().translate(hudX().toFloat(), hudY().toFloat())
+        graphics.pose().scale(hudRenderScale(), hudRenderScale())
+        graphics.fill(0, 0, layout.width(), layout.height(), HudGeometry.PANEL)
+        graphics.fill(HUD_SIDE_PADDING, HUD_TOP_PADDING, HUD_SIDE_PADDING + 3, HUD_TOP_PADDING + 13, HudGeometry.ACCENT)
+        drawHudText(graphics, title, HUD_SIDE_PADDING + 9, HUD_TOP_PADDING, HudGeometry.WHITE, HudGeometry.TITLE_SCALE, bold = true)
+        if (showFloor.get()) {
+            drawHudText(graphics, floorValue(), layout.right(), HUD_TOP_PADDING + 2, HudGeometry.ACCENT,
+                HudGeometry.FLOOR_SCALE, rightAligned = true, bold = true)
         }
-        var yOffset = HUD_TOP_PADDING + HUD_TITLE_HEIGHT
-        yOffset = drawProfitRows(graphics, topRows, HUD_SIDE_PADDING, layout.separatorX, layout.valueX, yOffset, HUD_ROW_HEIGHT, fontHeight)
-        drawProfitScopeLabel(graphics, layout)
-        yOffset = layout.dividerY + 1 + HUD_PROFIT_GAP
-        drawProfitRows(graphics, bottomRows, HUD_SIDE_PADDING, layout.separatorX, layout.valueX, yOffset, HUD_ROW_HEIGHT, fontHeight)
+        for (dividerY in layout.dividers()) {
+            graphics.fill(HUD_SIDE_PADDING, dividerY, layout.right(), dividerY + 1, HudGeometry.LINE)
+        }
+        for (section in layout.sections()) {
+            drawHudText(graphics, section.title(), HUD_SIDE_PADDING, section.y(), HudGeometry.ACCENT)
+            if (section.scope().isNotEmpty()) {
+                val right = layout.right() - if (mc.screen is AbstractContainerScreen<*> && section == layout.sections().last()) HudGeometry.BUTTON_WIDTH + 6 else 0
+                drawHudText(graphics, section.scope(), right, section.y(), HudGeometry.ACCENT, rightAligned = true)
+            }
+        }
+        for (box in layout.rows()) {
+            val row = byId[box.id()] ?: continue
+            if (row.id == "classProgress") {
+                drawClassProgress(graphics, box, row)
+            } else if (HudGeometry.isLevel(row.id)) {
+                val rightAligned = box.x() > HUD_SIDE_PADDING
+                val textX = if (rightAligned) box.right() else box.x()
+                drawHudText(graphics, row.label, textX, box.y(), HudGeometry.MUTED, rightAligned = rightAligned)
+                drawHudText(graphics, row.value, textX, box.y() + 12, HudGeometry.WHITE,
+                    HudGeometry.valueScale(row.id), rightAligned, bold = true)
+            } else {
+                val valueScale = HudGeometry.valueScale(row.id)
+                val valueY = box.y() + 2
+                val labelY = if (row.id == "profit") box.y() + 4 else valueY
+                drawHudText(graphics, row.label, box.x(), labelY, HudGeometry.labelColor(row.id))
+                drawHudText(graphics, row.displayValue(), box.right(), valueY,
+                    if (row.id == "profit") HudGeometry.PROFIT else HudGeometry.WHITE,
+                    valueScale, rightAligned = true, bold = row.id == "profit")
+                if (row.id == "levelProgress") {
+                    val progress = row.value.removeSuffix("%").toDoubleOrNull() ?: 0.0
+                    drawProgressBar(graphics, box.x(), box.y() + 14, box.width(), progress)
+                }
+            }
+        }
+        val levels = layout.rows().filter { HudGeometry.isLevel(it.id()) }
+        if (levels.size == 2) {
+            val arrow = if (levels.first().id() == "currentLevel") ">" else "<"
+            drawHudText(graphics, arrow, layout.width() / 2 - 5, levels.first().y() + 12, HudGeometry.ACCENT, 2f)
+        }
+        if (mc.screen is AbstractContainerScreen<*>) drawHudModeButton(graphics, layout)
+        graphics.pose().popMatrix()
+    }
 
+    private fun drawProgressBar(graphics: GuiGraphicsExtractor, x: Int, y: Int, width: Int, percent: Double?) {
+        graphics.fill(x, y, x + width, y + 7, HudGeometry.LINE)
+        val fill = HudGeometry.progressWidth(width, percent ?: 0.0)
+        if (fill > 0) graphics.fill(x, y, x + fill, y + 7, HudGeometry.ACCENT)
+    }
+
+    private fun Double?.percentText(): String = this?.let { "%.1f%%".format(Locale.US, it) } ?: "N/A"
+
+    private fun drawClassProgress(graphics: GuiGraphicsExtractor, box: HudGeometry.Row, row: ProfitHudRow) {
+        val y = box.y() + 4
+        if (row.classes.size == 1) {
+            val progress = row.classes.single()
+            drawHudText(graphics, "${progress.name} level", box.x(), y, HudGeometry.MUTED)
+            drawHudText(graphics, "Target", box.right(), y, HudGeometry.MUTED, rightAligned = true)
+            drawHudText(graphics, progress.level?.toString() ?: "N/A", box.x(), y + 12, HudGeometry.WHITE, 2f, bold = true)
+            drawHudText(graphics, progress.target.toString(), box.right(), y + 12, HudGeometry.WHITE, 2f, rightAligned = true, bold = true)
+            drawHudText(graphics, ">", box.x() + box.width() / 2 - 5, y + 12, HudGeometry.ACCENT, 2f)
+            drawHudText(graphics, "Target progress", box.x(), y + HudGeometry.LEVEL_HEIGHT + 2, HudGeometry.MUTED)
+            drawHudText(graphics, progress.percent.percentText(), box.right(), y + HudGeometry.LEVEL_HEIGHT + 2, HudGeometry.WHITE, rightAligned = true)
+            drawProgressBar(graphics, box.x(), y + HudGeometry.LEVEL_HEIGHT + 14, box.width(), progress.percent)
+        } else {
+            drawHudText(graphics, row.label, box.x(), y, HudGeometry.ACCENT)
+            drawHudText(graphics, row.value, box.right(), y, HudGeometry.MUTED, rightAligned = true)
+            val labels = row.classes.map { "${it.name} ${it.level ?: "?"}" }
+            val barX = box.x() + (labels.maxOfOrNull { mc.font.width(it) } ?: 0) + 6
+            val values = row.classes.map { progress ->
+                if (!showClassRuns.get()) progress.percent.percentText() else {
+                    val full = progress.runs?.let { "%,d".format(Locale.US, it) } ?: "N/A"
+                    if (mc.font.width(full) <= (box.right() - barX) / 2) full else progress.runs?.formatCompact() ?: "N/A"
+                }
+            }
+            val valueWidth = maxOf(mc.font.width("100.0%"), values.maxOfOrNull { mc.font.width(it) } ?: 0)
+            val barRight = box.right() - valueWidth - 6
+            row.classes.forEachIndexed { index, progress ->
+                val lineY = y + HudGeometry.SECTION_HEIGHT + index * HudGeometry.ROW_HEIGHT + 2
+                drawHudText(graphics, labels[index], box.x(), lineY, HudGeometry.MUTED)
+                drawProgressBar(graphics, barX, lineY, (barRight - barX).coerceAtLeast(0), progress.percent)
+                drawHudText(graphics, values[index], box.right(), lineY, HudGeometry.WHITE, rightAligned = true)
+            }
+        }
+    }
+
+    private fun ProfitHudRow.displayValue() = if (suffix.isBlank()) value else "$value $suffix"
+
+    private fun drawHudText(graphics: GuiGraphicsExtractor, text: String, x: Int, y: Int, color: Int,
+                            textScale: Float = 1f, rightAligned: Boolean = false, bold: Boolean = false) {
+        val component = Component.literal(text).withStyle { it.withBold(bold) }
+        val textX = if (rightAligned) x - mc.font.width(component) * textScale else x.toFloat()
+        graphics.pose().pushMatrix()
+        graphics.pose().translate(textX, y.toFloat())
+        graphics.pose().scale(textScale, textScale)
+        graphics.drawString(mc.font, component, 0, 0, color, true)
         graphics.pose().popMatrix()
     }
 
@@ -1998,16 +2011,16 @@ class DungeonProgressHudFeature(
         val key: List<Any?>,
         val profitTop: List<ProfitHudRow>, val profitBottom: List<ProfitHudRow>,
         val itemTop: List<ProfitHudRow>, val itemBottom: List<ProfitHudRow>,
-        val scopeLabel: String,
     )
     private var presentation: PresentationSnapshot? = null
     private fun presentationSnapshot(): PresentationSnapshot {
         val key = listOf<Any?>(stateRevision, System.currentTimeMillis() / 1000,
-            trackingOwner, floorValue(), data, state.hudViewMode,
+            trackingOwner, floorValue(), data, state.hudViewMode, detectedDungeonClass,
+            classProgressMode.get(), classTargetLevel.get(), allClassesGoal.get(), showClassRuns.get(),
             renderHud.get(), showEverywhere.get(), targetLevel.get(), showCurrentLevel.get(), showCurrentXp.get(), showLevelProgress.get(), showTarget.get(), showRemaining.get(), showFloor.get(), showXpPerRun.get(), showRunsLeft.get(), showProfile.get(), showLastRun.get(), showObservedCount.get(), xpMode.get(), hardcodedXpPerRun.get(), trackChestProfit.get(), showChestProfit.get(), chestProfitMode.get(), showChestCount.get(), showLastChest.get(), includeEssenceProfit.get(), includeDungeonKeyCost.get(), bazaarValuation.get(), auctionValuation.get(), missingPriceBehavior.get(), allowDevonianPriceFallback.get(), includeKismetCost.get())
         presentation?.takeIf { it.key == key }?.let { return it }
         return PresentationSnapshot(key, rawProfitHudTopRows(), rawProfitHudBottomRows(),
-            rawItemTrackerTopRows(), rawItemTrackerRows(), chestProfitStats().label).also { presentation = it }
+            rawItemTrackerTopRows(), rawItemTrackerRows()).also { presentation = it }
     }
     private fun buildProfitHudTopRows() = presentationSnapshot().profitTop
     private fun buildProfitHudBottomRows() = presentationSnapshot().profitBottom
@@ -2017,8 +2030,8 @@ class DungeonProgressHudFeature(
     private fun currentHudContent(): Triple<String, List<ProfitHudRow>, List<ProfitHudRow>> {
         val snapshot = presentationSnapshot()
         return if (currentHudMode() == HUD_MODE_ITEMS)
-            Triple("Dungeon Item Tracker", snapshot.itemTop, snapshot.itemBottom)
-        else Triple("Dungeon Profit Hud", snapshot.profitTop, snapshot.profitBottom)
+            Triple("Dungeon Items", snapshot.itemTop, snapshot.itemBottom)
+        else Triple("Dungeon Profit", snapshot.profitTop, snapshot.profitBottom)
     }
 
     private fun currentHudMode(): String =
@@ -2030,55 +2043,40 @@ class DungeonProgressHudFeature(
         log("HUD view mode toggled mode=${state.hudViewMode}")
     }
 
-    private fun hudPanelLayout(topRows: List<ProfitHudRow>, bottomRows: List<ProfitHudRow>): HudPanelLayout {
-        val allRows = sharedHudLayoutRows()
-        val labelWidth = allRows.maxOfOrNull { mc.font.width(it.label) } ?: 72
-        val valueWidth = allRows.maxOfOrNull { mc.font.width(it.value) + if (it.suffix.isBlank()) 0 else 10 + mc.font.width(it.suffix) } ?: 64
-        val titleWidth = maxOf(mc.font.width("Dungeon Profit Hud"), mc.font.width("Dungeon Item Tracker"),
-            mc.font.width("(${presentationSnapshot().scopeLabel})"))
-        val layout = HudGeometry.measure(labelWidth, valueWidth, titleWidth, topRows.size, bottomRows.size,
-            mc.screen is AbstractContainerScreen<*>)
-        return HudPanelLayout(layout.width(), layout.dividerY(), layout.height(), layout.separatorX(), layout.valueX())
-    }
-
-    private fun sharedHudLayoutRows(): List<ProfitHudRow> =
-        buildProfitHudTopRows() + buildProfitHudBottomRows() + buildItemTrackerTopRows() + buildItemTrackerRows()
-
-    private fun drawHudModeButton(graphics: GuiGraphicsExtractor, panelWidth: Int) {
-        val label = if (currentHudMode() == HUD_MODE_ITEMS) "Profit" else "Items"
-        val x = panelWidth - HUD_MODE_BUTTON_WIDTH - HUD_MODE_BUTTON_MARGIN
-        val y = HUD_TOP_PADDING + (mc.font.lineHeight - HUD_MODE_BUTTON_HEIGHT) / 2
-        drawRoundedFill(graphics, x, y, HUD_MODE_BUTTON_WIDTH, HUD_MODE_BUTTON_HEIGHT, 0x99101010.toInt())
-        drawRoundedBorder(graphics, x, y, HUD_MODE_BUTTON_WIDTH, HUD_MODE_BUTTON_HEIGHT, HUD_SKETCH_WHITE)
-        val textX = x + (HUD_MODE_BUTTON_WIDTH - mc.font.width(label)) / 2
-        val textY = y + (HUD_MODE_BUTTON_HEIGHT - mc.font.lineHeight) / 2
-        graphics.drawString(mc.font, Component.literal(label), textX, textY, HUD_SKETCH_WHITE, true)
-    }
-
-    private fun drawProfitScopeLabel(graphics: GuiGraphicsExtractor, layout: HudPanelLayout) {
-        val label = "(${presentationSnapshot().scopeLabel})"
-        val x = (layout.width - HUD_SIDE_PADDING - mc.font.width(label)).coerceAtLeast(HUD_SIDE_PADDING)
-        val y = if (currentHudMode() == HUD_MODE_ITEMS) {
-            HUD_TOP_PADDING + HUD_TITLE_HEIGHT - 8
-        } else {
-            layout.dividerY + 4
+    private fun hudPanelLayout(topRows: List<ProfitHudRow>, bottomRows: List<ProfitHudRow>): HudGeometry.Layout {
+        val allRows = buildProfitHudTopRows() + buildProfitHudBottomRows() + buildItemTrackerTopRows() + buildItemTrackerRows()
+        val labelWidth = allRows.maxOfOrNull { mc.font.width(it.label) } ?: 0
+        val valueWidth = allRows.maxOfOrNull {
+            ceil(mc.font.width(Component.literal(it.displayValue()).withStyle { style ->
+                style.withBold(HudGeometry.isLevel(it.id) || it.id == "profit")
+            }) * HudGeometry.valueScale(it.id)).toInt()
+        } ?: 0
+        val titleWidth = listOf("Dungeon Profit", "Dungeon Items").maxOf {
+            ceil(mc.font.width(Component.literal(it).withStyle { style -> style.withBold(true) }) * HudGeometry.TITLE_SCALE).toInt()
         }
-        graphics.drawString(mc.font, Component.literal(label), x, y, HUD_SKETCH_WHITE, true)
+        val floorWidth = if (showFloor.get()) ceil(mc.font.width(Component.literal(floorValue())
+            .withStyle { it.withBold(true) }) * HudGeometry.FLOOR_SCALE).toInt() else 0
+        return HudGeometry.measure(labelWidth, valueWidth, titleWidth, floorWidth,
+            topRows.map { it.id }, bottomRows.map { it.id }, currentHudMode() == HUD_MODE_ITEMS,
+            scopedRunScopeLabel(), classProgressMode.get() == 2)
+    }
+
+    private fun hudModeButtonBounds(layout: HudGeometry.Layout) = HudGeometry.Row("mode",
+        layout.right() - HudGeometry.BUTTON_WIDTH, (layout.sections().lastOrNull()?.y() ?: HUD_TOP_PADDING) - 2,
+        HudGeometry.BUTTON_WIDTH, HudGeometry.BUTTON_HEIGHT)
+
+    private fun drawHudModeButton(graphics: GuiGraphicsExtractor, layout: HudGeometry.Layout) {
+        val label = if (currentHudMode() == HUD_MODE_ITEMS) "Profit" else "Items"
+        val box = hudModeButtonBounds(layout)
+        graphics.fill(box.x(), box.y(), box.right(), box.bottom(), HudGeometry.LINE)
+        drawHudText(graphics, label, box.x() + (box.width() - mc.font.width(label)) / 2, box.y() + 2, HudGeometry.ACCENT)
     }
 
     private fun hudModeButtonContains(mouseX: Double, mouseY: Double): Boolean {
-        if (mc.screen !is AbstractContainerScreen<*>) return false
-        if (!renderHud.get() || !isEnabled()) return false
-        val (title, topRows, bottomRows) = currentHudContent()
-        val layout = hudPanelLayout(topRows, bottomRows)
-        val drawX = if (x.isFinite()) x else 10.0
-        val drawY = if (y.isFinite()) y else 10.0
-        val renderScale = scale.takeIf { it.isFinite() && it > 0f } ?: 1f
-        val left = drawX + (layout.width - HUD_MODE_BUTTON_WIDTH - HUD_MODE_BUTTON_MARGIN - 6) * renderScale
-        val top = drawY + (HUD_TOP_PADDING - 3) * renderScale
-        val right = drawX + layout.width * renderScale
-        val bottom = drawY + (HUD_TOP_PADDING + HUD_MODE_BUTTON_HEIGHT + 3) * renderScale
-        return mouseX >= left && mouseX <= right && mouseY >= top && mouseY <= bottom
+        if (mc.screen !is AbstractContainerScreen<*> || !renderHud.get() || !isEnabled()) return false
+        val (_, topRows, bottomRows) = currentHudContent()
+        return hudModeButtonBounds(hudPanelLayout(topRows, bottomRows))
+            .contains((mouseX - hudX()) / hudRenderScale(), (mouseY - hudY()) / hudRenderScale())
     }
 
     private fun currentScaledMousePosition(): Pair<Double, Double> {
@@ -2097,17 +2095,28 @@ class DungeonProgressHudFeature(
         return orderProfitRows(
             buildList {
                 if (!historyRepository.writable || historyRepository.error != null) add(ProfitHudRow("historyError", "History", "Save blocked: /dph"))
-                add(ProfitHudRow("sessionTime", "Session Time", sessionDurationText()))
-                if (showCurrentLevel.get()) add(ProfitHudRow("currentLevel", "Cata Level", if (profile == null) "Unknown" else currentLevel.toString()))
+                add(if (isSessionScope()) ProfitHudRow("sessionTime", "Session time", sessionDurationText())
+                    else ProfitHudRow("sessionTime", "Run time", HistoryQueries.runTimeSeconds(scopedRuns())
+                        .takeIf { it > 0 }?.let(::formatSessionDuration) ?: "N/A"))
+                if (showCurrentLevel.get()) add(ProfitHudRow("currentLevel", "Cata level", if (profile == null) "N/A" else currentLevel.toString()))
                 if (showTarget.get()) add(ProfitHudRow("target", "Target", targetLevelValue().toString()))
-                if (showLevelProgress.get()) add(ProfitHudRow("levelProgress", "Next Level", profile?.let { "${levelProgressPercent(it.catacombsExperience)}%" } ?: "N/A"))
-                if (showRunsLeft.get()) add(ProfitHudRow("runsLeft", "Runs Left", runs?.takeIf { profile != null }?.formatCompact() ?: "N/A"))
+                if (showLevelProgress.get()) add(ProfitHudRow("levelProgress", "Next level", profile?.let { DungeonLevels.nextLevelProgress(it.catacombsExperience) }.percentText()))
+                if (classProgressMode.get() in 1..2) add(ProfitHudRow("classProgress", "CLASSES",
+                    if (showClassRuns.get()) { if (allClassesGoal.get() == 1) "Runs to 50" else "Runs to next" }
+                    else if (allClassesGoal.get() == 1) "Level 50" else "Next level", classes = DungeonClasses.progress(
+                        profile?.classExperience.orEmpty(), dungeonClassValue(),
+                        classProgressMode.get() == 2, classTargetLevel.get().toIntOrNull() ?: 50, allClassesGoal.get() != 1,
+                        if (showClassRuns.get()) classXpPerRun() else emptyMap())))
+                if (showRunsLeft.get()) add(ProfitHudRow("runsLeft", "Runs left", runs?.takeIf { profile != null }?.formatCompact() ?: "N/A"))
                 if (showCurrentXp.get()) add(ProfitHudRow("currentXp", "Cata XP", profile?.catacombsExperience?.formatCompact() ?: "N/A"))
-                if (showRemaining.get()) add(ProfitHudRow("remaining", "Remaining", if (profile == null) "N/A" else remaining.formatCompact()))
+                if (showRemaining.get()) add(ProfitHudRow("remaining", "Remaining XP", if (profile == null) "N/A" else remaining.formatCompact()))
                 if (showFloor.get()) add(ProfitHudRow("floor", "Floor", floorValue()))
-                if (showXpPerRun.get()) add(ProfitHudRow("xpPerRun", "XP/Run", xpPerRun?.formatCompact() ?: "N/A", xpPerHourSuffix()))
+                if (showXpPerRun.get()) {
+                    add(ProfitHudRow("xpPerRun", "XP/run", xpPerRun?.formatCompact() ?: "N/A"))
+                    add(ProfitHudRow("xpPerHour", if (isSessionScope()) "XP/h (session)" else "XP/h (runs)", xpPerHourText()))
+                }
                 if (showProfile.get()) add(ProfitHudRow("profile", "Profile", profile?.profileName ?: "N/A"))
-                if (showLastRun.get()) add(ProfitHudRow("lastRun", "Last Run", last?.second?.formatCompact() ?: "N/A"))
+                if (showLastRun.get()) add(ProfitHudRow("lastRun", "Last run", last?.second?.formatCompact() ?: "N/A"))
                 if (showObservedCount.get()) add(ProfitHudRow("observedCount", "Runs", scopedRunCount().toString()))
             }
         )
@@ -2119,7 +2128,7 @@ class DungeonProgressHudFeature(
             buildList {
                 if (showChestProfit.get()) {
                     add(ProfitHudRow("profit", "Profit", stats.profit.formatCompactCoins()))
-                    add(ProfitHudRow("avgChest", "Avg Chest", stats.average.formatCompactCoins()))
+                    add(ProfitHudRow("avgChest", "Avg chest", stats.average.formatCompactCoins()))
                 }
                 if (showChestCount.get()) add(ProfitHudRow("chestsOpened", "Chests", stats.chests.toString()))
                 if (pendingChestCount() > 0) add(ProfitHudRow("pendingPrices", "Pending Prices", pendingChestCount().toString()))
@@ -2132,6 +2141,23 @@ class DungeonProgressHudFeature(
         )
     }
 
+    private fun currentPartyClasses(): Set<String> =
+        if (DungeonAPI.dungeonFloor == null) emptySet()
+        else DungeonAPI.teammates.mapNotNull { DungeonClasses.key(it.dungeonClass?.name) }.toSet()
+
+    private fun classXpPerRun(): Map<String, Double> {
+        val selected = dungeonClassValue() ?: return emptyMap()
+        val now = System.currentTimeMillis()
+        val samples = HistoryQueries.classXp(state, currentAccountId(), currentProfileId()).filter {
+            it.floorLabel.equals(floorValue(), true) && it.dungeonClass == selected &&
+                it.timestamp >= state.averagingResetAt && isInSelectedTrackerScope(it.timestamp, now)
+        }
+        val runs = progressionRuns(ownedRuns().filter { it.dungeonClass == selected },
+            useLastRun = isSessionScope() && samples.isEmpty())
+        val partyClasses = currentPartyClasses().ifEmpty { runs.maxByOrNull { it.timestamp }?.partyClasses.orEmpty() }
+        return DungeonClasses.xpPerRun(samples, runs, partyClasses)
+    }
+
     private fun rawItemTrackerTopRows(): List<ProfitHudRow> {
         val stats = chestProfitStats()
         return buildList {
@@ -2139,7 +2165,7 @@ class DungeonProgressHudFeature(
             if (pendingChestCount() > 0) add(ProfitHudRow("pendingPrices", "Pending Prices", pendingChestCount().toString()))
             if (showChestProfit.get()) {
                 add(ProfitHudRow("profit", "Profit", stats.profit.formatCompactCoins()))
-                add(ProfitHudRow("avgChest", "Avg Chest", stats.average.formatCompactCoins()))
+                add(ProfitHudRow("avgChest", "Avg chest", stats.average.formatCompactCoins()))
             }
             add(ProfitHudRow("kismets", "Kismets", scopedKismetUses().size.toString()))
             add(ProfitHudRow("croesus", "Croesus", croesusUnopenedCountText()))
@@ -2243,62 +2269,7 @@ class DungeonProgressHudFeature(
 
     private fun orderProfitRows(rows: List<ProfitHudRow>): List<ProfitHudRow> {
         val byId = rows.associateBy { it.id }
-        return normalizedHudLineOrder().mapNotNull { byId[it] }
-    }
-
-    private fun drawProfitRows(
-        graphics: GuiGraphicsExtractor,
-        rows: List<ProfitHudRow>,
-        labelX: Int,
-        separatorX: Int,
-        valueX: Int,
-        startY: Int,
-        rowHeight: Int,
-        fontHeight: Int,
-    ): Int {
-        var yOffset = startY
-        for (row in rows) {
-            val textY = yOffset + (rowHeight - fontHeight) / 2
-            graphics.drawString(mc.font, Component.literal(row.label), labelX, textY, HUD_SKETCH_WHITE, true)
-            graphics.drawString(mc.font, Component.literal("|"), separatorX, textY, HUD_SKETCH_WHITE, true)
-            graphics.drawString(mc.font, Component.literal(row.value), valueX, textY, HUD_SKETCH_WHITE, true)
-            if (row.suffix.isNotBlank()) {
-                graphics.drawString(mc.font, Component.literal(row.suffix), valueX + mc.font.width(row.value) + 10, textY, HUD_SKETCH_WHITE, true)
-            }
-            yOffset += rowHeight
-        }
-        return yOffset
-    }
-
-    private fun drawProfitPanel(graphics: GuiGraphicsExtractor, width: Int, height: Int, dividerY: Int) {
-        drawRoundedFill(graphics, 0, 0, width, height, HUD_PROFIT_PANEL)
-        drawRoundedBorder(graphics, 0, 0, width, height, HUD_SKETCH_WHITE)
-        graphics.fill(1, dividerY, width - 1, dividerY + 1, HUD_SKETCH_WHITE)
-    }
-
-    private fun drawRoundedFill(graphics: GuiGraphicsExtractor, x: Int, y: Int, width: Int, height: Int, color: Int) {
-        graphics.fill(x + 4, y, x + width - 4, y + 1, color)
-        graphics.fill(x + 2, y + 1, x + width - 2, y + 2, color)
-        graphics.fill(x + 1, y + 2, x + width - 1, y + 4, color)
-        graphics.fill(x, y + 4, x + width, y + height - 4, color)
-        graphics.fill(x + 1, y + height - 4, x + width - 1, y + height - 2, color)
-        graphics.fill(x + 2, y + height - 2, x + width - 2, y + height - 1, color)
-        graphics.fill(x + 4, y + height - 1, x + width - 4, y + height, color)
-    }
-
-    private fun drawRoundedBorder(graphics: GuiGraphicsExtractor, x: Int, y: Int, width: Int, height: Int, color: Int) {
-        graphics.fill(x + 4, y, x + width - 4, y + 1, color)
-        graphics.fill(x + 2, y + 1, x + 4, y + 2, color)
-        graphics.fill(x + width - 4, y + 1, x + width - 2, y + 2, color)
-        graphics.fill(x + 1, y + 2, x + 2, y + 4, color)
-        graphics.fill(x + width - 2, y + 2, x + width - 1, y + 4, color)
-        graphics.fill(x, y + 4, x + 1, y + height - 4, color)
-        graphics.fill(x + width - 1, y + 4, x + width, y + height - 4, color)
-        graphics.fill(x + 1, y + height - 4, x + 2, y + height - 2, color)
-        graphics.fill(x + width - 2, y + height - 4, x + width - 1, y + height - 2, color)
-        graphics.fill(x + 2, y + height - 2, x + 4, y + height - 1, color)
-        graphics.fill(x + width - 4, y + height - 2, x + width - 2, y + height - 1, color)
-        graphics.fill(x + 4, y + height - 1, x + width - 4, y + height, color)
+        return (normalizedHudLineOrder() + rows.map { it.id }).distinct().mapNotNull { byId[it] }
     }
 
     private fun logRenderState(message: String) {
@@ -2408,6 +2379,7 @@ class DungeonProgressHudFeature(
             runs = state.runs.map { it.copy() }.toMutableList(),
             samples = state.samples.map { it.copy() }.toMutableList(),
             xpIntervals = state.xpIntervals.toMutableList(),
+            classXpSamples = state.classXpSamples.toMutableList(),
             pendingChestClaims = state.pendingChestClaims.toMutableList(),
             importedLogFiles = state.importedLogFiles.toMutableMap(),
             chestProfits = state.chestProfits.map { it.copy(
@@ -2438,37 +2410,14 @@ class DungeonProgressHudFeature(
 
     private fun xpRemaining(currentXp: Long, targetLevel: Int): Long = (targetXp(targetLevel) - currentXp).coerceAtLeast(0)
 
-    private fun targetXp(level: Int): Long {
-        val normalizedLevel = level.coerceAtLeast(1)
-        if (normalizedLevel <= CATACOMBS_LINEAR_LEVEL_START) {
-            return cumulativeCatacombsXp[normalizedLevel - 1]
-        }
-
-        return CATACOMBS_LEVEL_50_XP + (normalizedLevel - CATACOMBS_LINEAR_LEVEL_START) * CATACOMBS_POST_50_XP_PER_LEVEL
-    }
-
     private fun targetLevelValue(): Int = targetLevel.get().toIntOrNull()?.coerceIn(1, 1_000) ?: 50
 
-    private fun currentCataLevel(xp: Long): Int {
-        if (xp >= CATACOMBS_LEVEL_50_XP) {
-            val post50Levels = ((xp - CATACOMBS_LEVEL_50_XP) / CATACOMBS_POST_50_XP_PER_LEVEL)
-                .coerceAtMost((Int.MAX_VALUE - CATACOMBS_LINEAR_LEVEL_START).toLong())
-                .toInt()
-            return CATACOMBS_LINEAR_LEVEL_START + post50Levels
-        }
-
-        return cumulativeCatacombsXp.indexOfLast { xp >= it }.let { it + 1 }
+    private fun floorValue(): String = detectedFloorLabel.ifBlank {
+        ownedRuns().maxByOrNull { it.timestamp }?.floorLabel ?: "N/A"
     }
 
-    private fun levelProgressPercent(xp: Long): String {
-        val current = currentCataLevel(xp)
-        val previousXp = if (current <= 0) 0L else targetXp(current)
-        val nextXp = targetXp(current + 1)
-        val progress = ((xp - previousXp).toDouble() / (nextXp - previousXp).toDouble()).coerceIn(0.0, 1.0)
-        return "%.1f".format(Locale.US, progress * 100.0)
-    }
-
-    private fun floorValue(): String = detectedFloorLabel.ifBlank { "N/A" }
+    private fun dungeonClassValue(): String? = detectedDungeonClass ?: data?.selectedDungeonClass
+        ?: DungeonClasses.key(ownedRuns().maxByOrNull { it.timestamp }?.dungeonClass)
 
     private fun xpModeValue(): String = xpMode.options.getOrElse(xpMode.get()) { xpMode.options.first() }
 
@@ -2529,14 +2478,17 @@ class DungeonProgressHudFeature(
         }.trim()
     }
 
-    private fun xpPerHourSuffix(): String {
+    private fun isSessionScope(): Boolean = state.chestProfitWindowMillis == 0L && trackerModeValue() != "Total"
+
+    private fun xpPerHourText(): String {
+        if (!isSessionScope()) return HistoryQueries.xpPerRunHour(scopedRuns())?.formatCompact() ?: "N/A"
         val recordedXp = sessionRecordedXp()
-        if (recordedXp.isEmpty()) return ""
+        if (recordedXp.isEmpty()) return "N/A"
         val perHour = SessionRates.xpPerHour(
             recordedXp,
             sessionTracker.elapsedMillis(System.currentTimeMillis()),
-        ) ?: return ""
-        return "(${perHour.formatCompact()}/h session)"
+        ) ?: return "N/A"
+        return perHour.formatCompact()
     }
 
     /** Completion chat is preferred, while profile deltas cover runs whose completion chat was missed. */
@@ -2582,17 +2534,6 @@ class DungeonProgressHudFeature(
     private fun log(message: String) {
         DungeonProgressHudAddon.debug(message)
     }
-
-    private val cumulativeCatacombsXp = listOf(
-        50L, 125L, 235L, 395L, 625L, 955L, 1425L, 2095L, 3045L, 4385L,
-        6275L, 8940L, 12700L, 17960L, 25340L, 35640L, 50040L, 70040L, 97640L, 135640L,
-        188140L, 259640L, 356640L, 488640L, 668640L, 911640L, 1239640L, 1683640L, 2284640L, 3084640L,
-        4149640L, 5559640L, 7459640L, 9959640L, 13259640L, 17559640L, 23159640L, 30359640L, 39559640L, 51559640L,
-        66559640L, 85559640L, 109559640L, 139559640L, 177559640L, 225559640L, 285559640L, 360559640L, 453559640L, 569809640L,
-    )
-    private val CATACOMBS_LINEAR_LEVEL_START = 50
-    private val CATACOMBS_POST_50_XP_PER_LEVEL = 200_000_000L
-    private val CATACOMBS_LEVEL_50_XP = cumulativeCatacombsXp[CATACOMBS_LINEAR_LEVEL_START - 1]
 
     private val chestNames = setOf("Wood", "Gold", "Diamond", "Emerald", "Obsidian", "Bedrock")
     private val runChestRegex = "^(?:Master )?Catacombs - Floor [IV]+$".toRegex()

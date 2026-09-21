@@ -7,6 +7,44 @@ import kotlin.test.assertTrue
 
 class SkyBlockPriceServiceTest {
     @Test
+    fun `empty Bazaar markets resolve saved book claims while unknown items stay pending`() {
+        val ids = listOf("ENCHANTMENT_ULTIMATE_BANK_1", "ENCHANTMENT_FEATHER_FALLING_6")
+        val products = ids.joinToString(",") { "\"$it\":{\"quick_status\":{\"buyPrice\":0.0,\"sellPrice\":0.0}}" }
+        val feed = PriceFeedParser.bazaar(com.google.gson.JsonParser.parseString(
+            "{\"success\":true,\"products\":{$products}}").asJsonObject)
+        val prices = SkyBlockPriceService(FakeProvider(bazaar = feed), devonianPrice = { error("Feed is already loaded") })
+        for (mode in BazaarValuation.entries) {
+            val service = SkyBlockPriceService(FakeProvider(bazaar = feed), { PricingOptions(bazaarValuation = mode) },
+                devonianPrice = { error("Feed is already loaded") })
+            for (id in ids) {
+                assertTrue(service.quote(id).available)
+                assertEquals(0.0, service.quote(id).unitPrice)
+            }
+            assertFalse(service.quote("UNKNOWN_REWARD").available)
+        }
+
+        val state = RunState()
+        for ((index, id) in (ids + "UNKNOWN_REWARD").withIndex()) {
+            val candidate = ChestProfitCandidate("Diamond", 250_000, 0, 2, 54,
+                listOf(PricedChestItem(id, 1), PricedChestItem("KNOWN_REWARD", 1, 400_000.0, 400_000, PriceSource.BAZAAR_BUY, true)),
+                listOf(id))
+            ChestRecorder.record(state, candidate, ClaimContext("claim$index", "a", "p", "Peach", "M7"),
+                "server-chat", 100L + index, MissingPriceBehavior.MARK_INCOMPLETE, false)
+        }
+        val gson = com.google.gson.Gson()
+        val saved = gson.fromJson(gson.toJson(state), RunState::class.java)
+        assertEquals(2, ChestRecorder.retryPending(saved, prices))
+        assertEquals(300_000, saved.totalChestProfit)
+        assertEquals(listOf(100L, 101L), saved.chestProfits.map { it.timestamp })
+        assertTrue(saved.chestProfits.all { it.pricingComplete && it.accountId == "a" && it.profileId == "p" })
+        assertEquals(listOf("UNKNOWN_REWARD"), saved.pendingChestClaims.single().candidate.missingItemIds)
+        assertEquals(0, ChestRecorder.retryPending(saved, prices))
+        assertEquals(2, saved.totalChestsOpened)
+        assertFalse(PriceQuote("INVALID", Double.NaN, PriceSource.BAZAAR_BUY).available)
+        assertFalse(PriceQuote("INVALID", -1.0, PriceSource.BAZAAR_BUY).available)
+    }
+
+    @Test
     fun `bazaar is preferred and supports both instant modes`() {
         val provider = FakeProvider(
             bazaar = mapOf("ITEM" to BazaarPrice(120.0, 95.0)),
@@ -50,6 +88,12 @@ class SkyBlockPriceServiceTest {
     @Test
     fun `normalization covers aliases and ultimate enchanted books`() {
         assertEquals("WITHER_SHIELD_SCROLL", normalizeSkyBlockId("wither_shield"))
+        val dyeService = SkyBlockPriceService(
+            provider = FakeProvider(auction = mapOf("DYE_NECRON" to AuctionPrice(20_000_000.0, 21_000_000.0, 22_000_000.0))),
+            devonianPrice = { 0.0 },
+        )
+        assertEquals("DYE_NECRON", dyeService.quote("NECRON_DYE").itemId)
+        assertEquals(21_000_000.0, dyeService.quote("NECRON_DYE").unitPrice)
         val service = SkyBlockPriceService(
             provider = FakeProvider(auction = mapOf("ENCHANTMENT_ULTIMATE_WISE_5" to AuctionPrice(10.0, 10.0, 10.0))),
             devonianPrice = { 0.0 },

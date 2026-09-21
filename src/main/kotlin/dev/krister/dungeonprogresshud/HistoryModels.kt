@@ -14,6 +14,8 @@ data class RunState(
     var averagingResetAt: Long = 0,
     var lastProfileId: String = "",
     var lastCatacombsXp: Long = 0,
+    var lastClassExperience: Map<String, Long> = emptyMap(),
+    var classXpSamples: MutableList<ClassXpSample> = mutableListOf(),
     var lastPlayerUuid: String = "",
     var runs: MutableList<DungeonRunRecord> = mutableListOf(),
     var chestProfits: MutableList<ChestProfitSample> = mutableListOf(),
@@ -55,6 +57,19 @@ data class DungeonRunRecord(
     var normalizedCataXp: Long = 0,
     var accountId: String = "",
     var profileId: String = "",
+    var dungeonClass: String = "",
+    var classExperience: Map<String, Long> = emptyMap(),
+    var partyClasses: Set<String> = emptySet(),
+)
+
+data class ClassXpSample(
+    val timestamp: Long = 0,
+    val accountId: String = "",
+    val profileId: String = "",
+    val floorLabel: String = "",
+    val dungeonClass: String = "",
+    val runs: Int = 0,
+    val experience: Map<String, Long> = emptyMap(),
 )
 
 data class ChestProfitSample(
@@ -132,6 +147,8 @@ data class ProfileData(
     val profileName: String,
     val catacombsExperience: Long,
     val profileId: String,
+    val classExperience: Map<String, Long> = emptyMap(),
+    val selectedDungeonClass: String? = null,
 )
 
 data class ProfileRequest(

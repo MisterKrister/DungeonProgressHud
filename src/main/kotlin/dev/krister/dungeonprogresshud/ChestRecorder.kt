@@ -1,5 +1,6 @@
 package dev.krister.dungeonprogresshud
 
+import java.util.UUID
 import kotlin.math.roundToLong
 
 data class ClaimContext(val id: String, val accountId: String, val profileId: String, val profileName: String, val floor: String)
@@ -11,8 +12,38 @@ internal sealed interface ClaimResult {
     data object Duplicate : ClaimResult
 }
 
-/** Validate and prepare everything before changing the ledger. Call only for confirmed or explicit fake claims. */
+/** Validate and prepare everything before changing the ledger. Manual entries are explicit user commands. */
 internal object ChestRecorder {
+    const val MAX_MANUAL_ITEM_COUNT = 1_000
+
+    fun recordManualItems(state: RunState, item: TrackedDropDefinition, count: Int, chestCoinCost: Long,
+                          prices: PriceService, context: ClaimContext, now: Long): ChestProfitCandidate {
+        require(count in 1..MAX_MANUAL_ITEM_COUNT) { "Count must be between 1 and $MAX_MANUAL_ITEM_COUNT." }
+        require(chestCoinCost >= 0) { "Chest cost cannot be negative." }
+        require(context.accountId.isNotBlank() && context.profileId.isNotBlank()) { "Join SkyBlock and wait for your profile to load, then try again." }
+        require(context.floor == "M7") { "Manual tracked items use M7 history." }
+        prices.beginCalculation()
+        val calculation = ChestProfitCalculator(prices).calculate(
+            ChestCalculationInput("Manual item", listOf(ParsedChestReward(item.key)), chestCoinCost),
+        )
+        require(calculation.pricingComplete && calculation.pricedItems.all {
+            it.unitPrice.isFinite() && it.unitPrice > 0 && it.unitPrice < Long.MAX_VALUE.toDouble()
+        }) { "Price for ${item.displayName} is unavailable. Nothing added; wait for prices and try again. See /dph prices." }
+        val candidate = ChestProfitCandidate("Manual item", chestCoinCost, 0, 1, 0,
+            calculation.pricedItems, emptyList(), listOf(TrackedDrop(item.key, item.displayName)))
+        // Check the entire batch before recording anything, including totals used in the confirmation.
+        Math.multiplyExact(candidate.grossValue, count.toLong())
+        Math.multiplyExact(chestCoinCost, count.toLong())
+        Math.addExact(state.totalChestProfit, Math.multiplyExact(candidate.profit, count.toLong()))
+        Math.addExact(state.totalChestsOpened, count)
+        val batchId = "manual:${UUID.randomUUID()}"
+        repeat(count) { index ->
+            record(state, candidate, context.copy(id = "$batchId:$index"), "manual", now,
+                MissingPriceBehavior.MARK_INCOMPLETE, includeKismet = false)
+        }
+        return candidate
+    }
+
     fun record(state: RunState, candidate: ChestProfitCandidate, context: ClaimContext, source: String,
                now: Long, missingPolicy: MissingPriceBehavior, includeKismet: Boolean): ClaimResult {
         if (state.chestProfits.any { it.claimId == context.id }) return ClaimResult.Duplicate
@@ -23,7 +54,7 @@ internal object ChestRecorder {
         if ((!candidate.pricingComplete || missing.isNotEmpty()) && missingPolicy == MissingPriceBehavior.MARK_INCOMPLETE) {
             if (!wasPending) {
                 state.pendingChestClaims.add(PendingChestClaim(candidate, context, source, now, includeKismet))
-                if (state.croesusUnclaimedCount > 0) state.croesusUnclaimedCount--
+                if (source != "manual" && state.croesusUnclaimedCount > 0) state.croesusUnclaimedCount--
             }
             return ClaimResult.Incomplete(missing)
         }
@@ -51,7 +82,7 @@ internal object ChestRecorder {
         state.lastChestName = state.chestProfits.last().chestName
         state.lastChestProfit = state.chestProfits.last().profit
         state.lastMissingItemIds = missing.toMutableList()
-        if (!wasPending && state.croesusUnclaimedCount > 0) state.croesusUnclaimedCount--
+        if (source != "manual" && !wasPending && state.croesusUnclaimedCount > 0) state.croesusUnclaimedCount--
         return ClaimResult.Recorded(sample)
     }
 

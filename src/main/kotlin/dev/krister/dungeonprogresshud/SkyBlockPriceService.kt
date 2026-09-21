@@ -22,7 +22,7 @@ data class PriceQuote(
     val itemId: String,
     val unitPrice: Double?,
     val source: PriceSource,
-    val available: Boolean = unitPrice != null && unitPrice > 0.0,
+    val available: Boolean = unitPrice != null && unitPrice.isFinite() && unitPrice >= 0.0,
     val quotedAt: Long = System.currentTimeMillis(),
 )
 
@@ -114,6 +114,7 @@ internal object PriceFeedParser {
         require(json["success"]?.asBoolean == true) { "Bazaar feed unsuccessful" }
         return json.getAsJsonObject("products").entrySet().associate { (id, product) ->
             val status = product.asJsonObject.getAsJsonObject("quick_status")
+            require(status.has("buyPrice") && status.has("sellPrice")) { "Missing Bazaar prices for $id" }
             id to BazaarPrice(number(status, "buyPrice"), number(status, "sellPrice"))
         }.also { require(it.isNotEmpty()) { "Empty Bazaar feed" } }
     }
@@ -145,7 +146,8 @@ class SkyBlockPriceService(
         val bazaar = provider.bazaar(id)
         val bazaarValue = bazaar?.let {
             if (settings.bazaarValuation == BazaarValuation.INSTANT_BUY) it.instantBuy else it.instantSell
-        }?.positiveOrNull()
+        // A known product with no orders has an explicit zero, not a missing price.
+        }?.takeIf { it.isFinite() && it >= 0.0 }
         val quote = bazaarValue?.let {
             PriceQuote(id, it, if (settings.bazaarValuation == BazaarValuation.INSTANT_BUY) PriceSource.BAZAAR_BUY else PriceSource.BAZAAR_SELL)
         } ?: provider.auction(id)?.let { auction ->
@@ -196,6 +198,7 @@ private val SKYBLOCK_ID_ALIASES = mapOf(
     "WARPED_STONE" to "AOTE_STONE",
     "SPIRIT_STONE" to "SPIRIT_DECOY",
     "NECRONS_HANDLE" to "NECRON_HANDLE",
+    "NECRON_DYE" to "DYE_NECRON",
 )
 
 internal fun normalizeSkyBlockId(itemId: String): String {

@@ -6,7 +6,7 @@ plugins {
     kotlin("plugin.serialization") version "2.3.20"
 }
 
-version = "1.0.14"
+version = "1.0.15"
 group = "dev.krister"
 
 base {
@@ -37,7 +37,7 @@ dependencies {
     implementation("net.fabricmc:fabric-loader:0.19.3")
     implementation("net.fabricmc.fabric-api:fabric-api:0.150.0+26.1.2")
     implementation("net.fabricmc:fabric-language-kotlin:1.13.10+kotlin.2.3.20")
-    implementation(files("libs/devonian-1.31.9.jar"))
+    implementation(files("libs/devonian-1.32.9.jar"))
     implementation("tech.thatgravyboat:skyblock-api:4.2.19") {
         exclude(group = "me.djtheredstoner", module = "DevAuth-fabric")
         capabilities {
@@ -57,13 +57,13 @@ tasks.test {
 }
 
 val verifyDevonian by tasks.registering {
-    val dependencyJar = layout.projectDirectory.file("libs/devonian-1.31.9.jar")
+    val dependencyJar = layout.projectDirectory.file("libs/devonian-1.32.9.jar")
     inputs.file(dependencyJar)
     doLast {
         val digest = MessageDigest.getInstance("SHA-256")
             .digest(dependencyJar.asFile.readBytes()).joinToString("") { "%02x".format(it) }
-        check(digest == "17ebb41ee38738c0e69aa03db16f40d774265880ca8a51f701b7c132f4ca31cd") {
-            "Devonian dependency checksum mismatch; use the repository-supplied 1.31.9 jar."
+        check(digest == "7313a02aff8930441862487cb7feb50f548d105b0647f236166e1fd66563b857") {
+            "Devonian dependency checksum mismatch; use the repository-supplied 1.32.9 jar."
         }
     }
 }

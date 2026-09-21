@@ -3,7 +3,6 @@
   "package": "dev.krister.dungeonprogresshud.mixin",
   "compatibilityLevel": "JAVA_21",
   "mixins": [
-    "ChatComponentMixin",
     "ClientPacketListenerMixin",
     "DevonianMixin",
     "GuiMixin",

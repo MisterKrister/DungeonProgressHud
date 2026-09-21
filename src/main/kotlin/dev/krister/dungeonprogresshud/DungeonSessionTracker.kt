@@ -98,7 +98,15 @@ internal object DungeonActivityDetector {
 
     fun detectFloor(area: String?, subarea: String?, scoreboard: String, tabList: List<String>): String? {
         // Network HUD data updates before location metadata during world transitions, so prefer it.
-        return listOf(scoreboard, tabList.joinToString("\n"), subarea.orEmpty(), area.orEmpty())
+        detectFloorInText(scoreboard)?.let { return it }
+        if (scoreboard.contains("dungeon hub", ignoreCase = true)) return null
+        val tabAreas = tabList.filter { it.replace(Regex("§."), "").trim().startsWith("Area:", ignoreCase = true) }
+        tabAreas.firstNotNullOfOrNull(::detectFloorInText)?.let { return it }
+        if (tabAreas.isNotEmpty() && tabAreas.none { isActiveDungeon(it, null, "", emptyList()) }) return null
+        // Outside dungeons, the RNG meter also shows "Catacombs Floor VII"; only trust the tab's area.
+        val floorTab = if (isActiveDungeon(area, subarea, scoreboard, tabList)) tabList
+            else emptyList()
+        return listOf(floorTab.joinToString("\n"), subarea.orEmpty(), area.orEmpty())
             .firstNotNullOfOrNull(::detectFloorInText)
     }
 
@@ -107,7 +115,7 @@ internal object DungeonActivityDetector {
         dungeonFloorRegex.find(clean)?.let {
             val value = it.groupValues[1].uppercase()
             if (value.startsWith("M") || value.startsWith("F")) return value
-            return romanFloor(if (it.value.startsWith("master", true)) "M" else "F", value)
+            return romanFloor(if (it.value.startsWith("master", true) || it.value.contains("[MM]", true)) "M" else "F", value)
         }
         shortFloorRegex.matchEntire(clean.trim())?.let { return "${it.groupValues[1].uppercase()}${it.groupValues[2]}" }
         return null
