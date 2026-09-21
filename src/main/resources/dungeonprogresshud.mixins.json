@@ -4,8 +4,6 @@
   "compatibilityLevel": "JAVA_21",
   "mixins": [
     "ClientPacketListenerMixin",
-    "DevonianMixin",
-    "GuiMixin",
     "MultiPlayerGameModeMixin",
     "MouseHandlerMixin",
     "ContainerScreenMixin",

@@ -1,6 +1,6 @@
 package dev.krister.dungeonprogresshud
 
-import com.github.synnerz.devonian.api.SkyblockPrices
+import com.github.noamm9.init.NetworkLoop
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import java.net.URI
@@ -32,7 +32,8 @@ enum class PriceSource {
     AUCTION_LOWEST,
     AUCTION_MEDIAN,
     AUCTION_MEAN,
-    DEVONIAN_FALLBACK,
+    DEVONIAN_FALLBACK, // Retained for previously saved chest history.
+    NOAMM_FALLBACK,
     HARDCODED,
     UNAVAILABLE,
 }
@@ -44,7 +45,7 @@ enum class MissingPriceBehavior { MARK_INCOMPLETE, COUNT_AS_ZERO }
 data class PricingOptions(
     val bazaarValuation: BazaarValuation = BazaarValuation.INSTANT_BUY,
     val auctionValuation: AuctionValuation = AuctionValuation.MEDIAN,
-    val allowDevonianWhileLoading: Boolean = true,
+    val allowNoammWhileLoading: Boolean = true,
 )
 
 data class BazaarPrice(val instantBuy: Double, val instantSell: Double)
@@ -133,7 +134,11 @@ class SkyBlockPriceService(
     private val provider: PriceDataProvider = SkyBlockApiPriceDataProvider,
     private val options: () -> PricingOptions = { PricingOptions() },
     private val hardcodedPrices: Map<String, Double> = emptyMap(),
-    private val devonianPrice: (String) -> Double = { SkyblockPrices.buyPrice(it).toDouble() },
+    private val noammPrice: (String, BazaarValuation) -> Double = { id, mode ->
+        val bazaar = NetworkLoop.getBazaarPrice(id)
+        (bazaar?.let { if (mode == BazaarValuation.INSTANT_BUY) it.buy else it.sell }
+            ?: NetworkLoop.getLowestBin(id) ?: 0L).toDouble()
+    },
 ) : PriceService {
     private var lastQuote: PriceQuote? = null
     private var fallbackActive = false
@@ -166,7 +171,7 @@ class SkyBlockPriceService(
             ?: hardcodedPrices[id]?.positiveOrNull()?.let { PriceQuote(id, it, PriceSource.HARDCODED) }
             ?: PriceQuote(id, null, PriceSource.UNAVAILABLE, available = false)
 
-        fallbackActive = fallbackActive || quote.source == PriceSource.DEVONIAN_FALLBACK
+        fallbackActive = fallbackActive || quote.source == PriceSource.NOAMM_FALLBACK
         if (quote.available) lastQuote = quote
         return quote
     }
@@ -179,9 +184,9 @@ class SkyBlockPriceService(
     )
 
     private fun loadingFallback(id: String, settings: PricingOptions): PriceQuote? {
-        if (!settings.allowDevonianWhileLoading) return null
+        if (!settings.allowNoammWhileLoading) return null
         if (provider.bazaarItemCount() > 0 && provider.auctionItemCount() > 0) return null
-        return devonianPrice(id).positiveOrNull()?.let { PriceQuote(id, it, PriceSource.DEVONIAN_FALLBACK) }
+        return noammPrice(id, settings.bazaarValuation).positiveOrNull()?.let { PriceQuote(id, it, PriceSource.NOAMM_FALLBACK) }
     }
 }
 

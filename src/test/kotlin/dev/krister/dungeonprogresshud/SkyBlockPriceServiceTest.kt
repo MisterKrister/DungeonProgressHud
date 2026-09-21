@@ -12,10 +12,10 @@ class SkyBlockPriceServiceTest {
         val products = ids.joinToString(",") { "\"$it\":{\"quick_status\":{\"buyPrice\":0.0,\"sellPrice\":0.0}}" }
         val feed = PriceFeedParser.bazaar(com.google.gson.JsonParser.parseString(
             "{\"success\":true,\"products\":{$products}}").asJsonObject)
-        val prices = SkyBlockPriceService(FakeProvider(bazaar = feed), devonianPrice = { error("Feed is already loaded") })
+        val prices = SkyBlockPriceService(FakeProvider(bazaar = feed), noammPrice = { _, _ -> error("Feed is already loaded") })
         for (mode in BazaarValuation.entries) {
             val service = SkyBlockPriceService(FakeProvider(bazaar = feed), { PricingOptions(bazaarValuation = mode) },
-                devonianPrice = { error("Feed is already loaded") })
+                noammPrice = { _, _ -> error("Feed is already loaded") })
             for (id in ids) {
                 assertTrue(service.quote(id).available)
                 assertEquals(0.0, service.quote(id).unitPrice)
@@ -51,7 +51,7 @@ class SkyBlockPriceServiceTest {
             auction = mapOf("ITEM" to AuctionPrice(500.0, 600.0, 700.0)),
         )
         var options = PricingOptions()
-        val service = SkyBlockPriceService(provider, { options }, devonianPrice = { 0.0 })
+        val service = SkyBlockPriceService(provider, { options }, noammPrice = { _, _ -> 0.0 })
 
         assertEquals(120.0, service.quote("item").unitPrice)
         assertEquals(PriceSource.BAZAAR_BUY, service.quote("ITEM").source)
@@ -64,7 +64,7 @@ class SkyBlockPriceServiceTest {
     fun `auction fallback supports lowest median and mean`() {
         val provider = FakeProvider(auction = mapOf("ITEM" to AuctionPrice(500.0, 600.0, 700.0)))
         var options = PricingOptions()
-        val service = SkyBlockPriceService(provider, { options }, devonianPrice = { 0.0 })
+        val service = SkyBlockPriceService(provider, { options }, noammPrice = { _, _ -> 0.0 })
 
         assertEquals(600.0, service.quote("ITEM").unitPrice)
         options = options.copy(auctionValuation = AuctionValuation.LOWEST_BIN)
@@ -74,13 +74,13 @@ class SkyBlockPriceServiceTest {
     }
 
     @Test
-    fun `Devonian is loading-only and hardcoded handles unsupported ids`() {
+    fun `NoammAddons is loading-only and hardcoded handles unsupported ids`() {
         val loading = FakeProvider(bazaarCount = 0, auctionCount = 0)
-        val service = SkyBlockPriceService(loading, hardcodedPrices = mapOf("SPECIAL" to 42.0), devonianPrice = { 99.0 })
-        assertEquals(PriceSource.DEVONIAN_FALLBACK, service.quote("SPECIAL").source)
+        val service = SkyBlockPriceService(loading, hardcodedPrices = mapOf("SPECIAL" to 42.0), noammPrice = { _, _ -> 99.0 })
+        assertEquals(PriceSource.NOAMM_FALLBACK, service.quote("SPECIAL").source)
 
         val loaded = FakeProvider(bazaarCount = 1, auctionCount = 1)
-        val loadedService = SkyBlockPriceService(loaded, hardcodedPrices = mapOf("SPECIAL" to 42.0), devonianPrice = { 99.0 })
+        val loadedService = SkyBlockPriceService(loaded, hardcodedPrices = mapOf("SPECIAL" to 42.0), noammPrice = { _, _ -> 99.0 })
         assertEquals(PriceSource.HARDCODED, loadedService.quote("SPECIAL").source)
         assertFalse(loadedService.quote("MISSING").available)
     }
@@ -90,20 +90,20 @@ class SkyBlockPriceServiceTest {
         assertEquals("WITHER_SHIELD_SCROLL", normalizeSkyBlockId("wither_shield"))
         val dyeService = SkyBlockPriceService(
             provider = FakeProvider(auction = mapOf("DYE_NECRON" to AuctionPrice(20_000_000.0, 21_000_000.0, 22_000_000.0))),
-            devonianPrice = { 0.0 },
+            noammPrice = { _, _ -> 0.0 },
         )
         assertEquals("DYE_NECRON", dyeService.quote("NECRON_DYE").itemId)
         assertEquals(21_000_000.0, dyeService.quote("NECRON_DYE").unitPrice)
         val service = SkyBlockPriceService(
             provider = FakeProvider(auction = mapOf("ENCHANTMENT_ULTIMATE_WISE_5" to AuctionPrice(10.0, 10.0, 10.0))),
-            devonianPrice = { 0.0 },
+            noammPrice = { _, _ -> 0.0 },
         )
         assertEquals("ENCHANTMENT_ULTIMATE_WISE_5", resolveEnchantedBookId("Ultimate Wise", 5, service))
     }
 
     @Test
     fun `book identity does not depend on prices being available`() {
-        val service = SkyBlockPriceService(FakeProvider(), devonianPrice = { 0.0 })
+        val service = SkyBlockPriceService(FakeProvider(), noammPrice = { _, _ -> 0.0 })
         assertEquals("ENCHANTMENT_SHARPNESS_5", resolveEnchantedBookId("Sharpness", 5, service))
         assertEquals("ENCHANTMENT_ULTIMATE_WISE_5", resolveEnchantedBookId("Ultimate Wise", 5, service))
     }
@@ -111,8 +111,20 @@ class SkyBlockPriceServiceTest {
     @Test
     fun `disabled loading fallback never supplies a quote`() {
         val service = SkyBlockPriceService(FakeProvider(bazaarCount = 0, auctionCount = 0),
-            { PricingOptions(allowDevonianWhileLoading = false) }, devonianPrice = { error("Fallback must not be called") })
+            { PricingOptions(allowNoammWhileLoading = false) }, noammPrice = { _, _ -> error("Fallback must not be called") })
         assertFalse(service.quote("ITEM").available)
+    }
+
+    @Test fun `NoammAddons loading fallback receives the selected Bazaar side`() {
+        var options = PricingOptions()
+        val service = SkyBlockPriceService(FakeProvider(bazaarCount = 0, auctionCount = 0), { options },
+            noammPrice = { _, side -> if (side == BazaarValuation.INSTANT_BUY) 120.0 else 95.0 })
+        assertEquals(120.0, service.quote("ITEM").unitPrice)
+        assertTrue(service.health().fallbackActive)
+        options = options.copy(bazaarValuation = BazaarValuation.INSTANT_SELL)
+        assertEquals(95.0, service.quote("ITEM").unitPrice)
+        service.beginCalculation()
+        assertFalse(service.health().fallbackActive)
     }
 
     private class FakeProvider(
